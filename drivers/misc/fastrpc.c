@@ -35,6 +35,8 @@
 #define FASTRPC_MAX_FDLIST	16
 #define FASTRPC_MAX_CRCLIST	64
 #define FASTRPC_PHYS(p)	((p) & 0xffffffff)
+#define FASTRPC_SDSP_IOVA_BASE	0x80000000ULL
+#define FASTRPC_SDSP_IOVA_SIZE	0x78000000ULL
 #define FASTRPC_CTX_MAX (256)
 #define FASTRPC_INIT_HANDLE	1
 #define FASTRPC_DSP_UTILITIES_HANDLE	2
@@ -198,6 +200,7 @@ struct fastrpc_buf {
 	struct device *dev;
 	void *virt;
 	u64 phys;
+	dma_addr_t dma_addr;
 	u64 size;
 	/* Lock for dma buf attachments */
 	struct mutex lock;
@@ -395,7 +398,7 @@ static int fastrpc_map_lookup(struct fastrpc_user *fl, int fd,
 static void fastrpc_buf_free(struct fastrpc_buf *buf)
 {
 	dma_free_coherent(buf->dev, buf->size, buf->virt,
-			  FASTRPC_PHYS(buf->phys));
+			  buf->dma_addr);
 	kfree(buf);
 }
 
@@ -419,13 +422,14 @@ static int __fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
 	buf->dev = dev;
 	buf->raddr = 0;
 
-	buf->virt = dma_alloc_coherent(dev, buf->size, (dma_addr_t *)&buf->phys,
+	buf->virt = dma_alloc_coherent(dev, buf->size, &buf->dma_addr,
 				       GFP_KERNEL);
 	if (!buf->virt) {
 		mutex_destroy(&buf->lock);
 		kfree(buf);
 		return -ENOMEM;
 	}
+	buf->phys = buf->dma_addr;
 
 	*obuf = buf;
 
@@ -444,8 +448,11 @@ static int fastrpc_buf_alloc(struct fastrpc_user *fl, struct device *dev,
 
 	buf = *obuf;
 
-	if (fl->sctx && fl->sctx->sid)
+	if (fl->sctx && fl->sctx->sid &&
+	    fl->cctx->domain_id != SDSP_DOMAIN_ID)
 		buf->phys += ((u64)fl->sctx->sid << 32);
+	dev_dbg(dev, "allocated buffer DMA=%pad DSP=%#llx size=%#llx\n",
+		&buf->dma_addr, buf->phys, buf->size);
 
 	return 0;
 }
@@ -690,7 +697,7 @@ static int fastrpc_dma_buf_attach(struct dma_buf *dmabuf,
 		return -ENOMEM;
 
 	ret = dma_get_sgtable(buffer->dev, &a->sgt, buffer->virt,
-			      FASTRPC_PHYS(buffer->phys), buffer->size);
+			      buffer->dma_addr, buffer->size);
 	if (ret < 0) {
 		dev_err(buffer->dev, "failed to get scatterlist from DMA API\n");
 		kfree(a);
@@ -739,7 +746,7 @@ static int fastrpc_mmap(struct dma_buf *dmabuf,
 	dma_resv_assert_held(dmabuf->resv);
 
 	return dma_mmap_coherent(buf->dev, vma, buf->virt,
-				 FASTRPC_PHYS(buf->phys), size);
+				 buf->dma_addr, size);
 }
 
 static const struct dma_buf_ops fastrpc_dma_buf_ops = {
@@ -796,11 +803,14 @@ static int fastrpc_map_create(struct fastrpc_user *fl, int fd,
 		map->phys = sg_phys(map->table->sgl);
 	} else {
 		map->phys = sg_dma_address(map->table->sgl);
-		map->phys += ((u64)fl->sctx->sid << 32);
+		if (fl->cctx->domain_id != SDSP_DOMAIN_ID)
+			map->phys += ((u64)fl->sctx->sid << 32);
 	}
 	map->size = len;
 	map->va = sg_virt(map->table->sgl);
 	map->len = len;
+	dev_dbg(sess->dev, "mapped fd=%d DSP=%#llx size=%#llx\n",
+		map->fd, map->phys, map->size);
 
 	if (attr & FASTRPC_ATTR_SECUREMAP) {
 		/*
@@ -2184,9 +2194,27 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	rc = dma_set_mask(dev, DMA_BIT_MASK(32));
+	if (cctx->domain_id == SDSP_DOMAIN_ID) {
+		u64 iova_start;
+
+		if (sess->sid < 1 || sess->sid > 3) {
+			dev_err(dev, "invalid SDSP context bank ID %d\n", sess->sid);
+			return -EINVAL;
+		}
+
+		/*
+		 * SDM8150 SDSP context banks encode the low two SID bits in
+		 * IOVA bits 33:32. Keep allocations in the matching downstream
+		 * window instead of reporting a high alias for a 32-bit mapping.
+		 */
+		iova_start = FASTRPC_SDSP_IOVA_BASE + ((u64)sess->sid << 32);
+		dev->bus_dma_limit = iova_start + FASTRPC_SDSP_IOVA_SIZE - 1;
+		rc = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(34));
+	} else {
+		rc = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	}
 	if (rc) {
-		dev_err(dev, "32-bit DMA enable failed\n");
+		dev_err(dev, "DMA mask setup failed: %d\n", rc);
 		return rc;
 	}
 

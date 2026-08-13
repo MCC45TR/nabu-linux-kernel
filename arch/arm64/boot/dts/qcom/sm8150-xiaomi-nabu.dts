@@ -504,6 +504,7 @@
 
 &i2c7 {
 	status = "okay";
+	clock-frequency = <400000>;
 
 	cs35l41_br: cs35l41@40 {
 		compatible = "cirrus,cs35l41";
@@ -587,6 +588,7 @@
 		vddio-supply = <&vreg_l14a_1p8>;
 		reset-gpios = <&tlmm 6 GPIO_ACTIVE_LOW>;
 		backlight = <&backlight>;
+		rotation = <90>;
 
 		ports {
 			#address-cells = <1>;
@@ -784,6 +786,12 @@
 &remoteproc_mpss {
 	status = "okay";
 	firmware-name = "qcom/sm8150/xiaomi/nabu/modem.mbn";
+};
+
+&remoteproc_slpi {
+	compatible = "qcom,sm8150-nabu-slpi-pas";
+	status = "okay";
+	firmware-name = "qcom/sm8150/xiaomi/nabu/slpi_nb.mbn";
 };
 
 &sound {
