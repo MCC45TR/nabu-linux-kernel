@@ -36,12 +36,12 @@ struct sm8150_snd_data {
 static unsigned int tdm_slot_offset[8] = {0, 4, 8, 12, 16, 20, 24, 28};
 
 static const struct {
-	unsigned int rx[1];
+	unsigned int rx[2];
 } cs35l41_tdm_channel_map[] = {
-	{.rx = {6}}, /* BR */
-	{.rx = {7}}, /* TR */
-	{.rx = {6}}, /* BL */
-	{.rx = {7}}, /* TL */
+	{.rx = {4, 5}}, /* BR */
+	{.rx = {4, 5}}, /* TR */
+	{.rx = {4, 5}}, /* BL */
+	{.rx = {4, 5}}, /* TL */
 };
 
 static int sm8150_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
@@ -54,7 +54,7 @@ static int sm8150_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
 
 	rate->min = rate->max = 48000;
-	channels->min = channels->max = 2;
+	channels->min = channels->max = 4;
 	snd_mask_none(fmt);
 	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S24_LE);
 
@@ -122,7 +122,12 @@ static int sm8150_tdm_snd_hw_params(struct snd_pcm_substream *substream,
 	}
 
 	channels = params_channels(params);
-	slot_mask = 0x44;// 0x0000FFFF >> (16-channels);
+	/* Android clocks an eight-slot frame but derives the AFE active-slot
+	 * mask from the channel offsets before sending it to the DSP.  This
+	 * mainline path passes that active mask directly: four channels at
+	 * offsets 0, 4, 8 and 12 bytes occupy slots 0 through 3.
+	 */
+	slot_mask = GENMASK(channels - 1, 0);
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		ret = snd_soc_dai_set_tdm_slot(cpu_dai, 0, slot_mask,
 				8, slot_width);

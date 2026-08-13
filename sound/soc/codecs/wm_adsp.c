@@ -775,6 +775,54 @@ static int wm_adsp_request_firmware_file(struct wm_adsp *dsp,
 	return ret;
 }
 
+/*
+ * Some device firmware packages use the component prefix to select the
+ * per-speaker tuning, for example BR-cs35l41-dsp1-spk-prot.bin.  This is the
+ * naming convention used by the Nabu CS35L41 coefficient files.  Keep the
+ * generic and system-specific names as the preferred ABI, then use this as a
+ * compatibility fallback when a component prefix is available.
+ */
+static int wm_adsp_request_prefixed_coeff_file(struct wm_adsp *dsp,
+					       const struct firmware **firmware,
+					       char **filename, const char *dir,
+					       const char *prefix)
+{
+	const char *fwf = dsp->fwf_name ?: dsp->cs_dsp.name;
+	char *s;
+	int ret;
+
+	if (!prefix)
+		return -ENOENT;
+
+	*filename = kasprintf(GFP_KERNEL, "%s%s-%s-%s-%s.bin", dir, prefix,
+			       dsp->part, fwf, wm_adsp_fw[dsp->fw].file);
+	if (!*filename)
+		return -ENOMEM;
+
+	/* Preserve the component prefix, but normalize the firmware stem. */
+	s = *filename + strlen(dir) + strlen(prefix) + 1;
+	while (*s) {
+		char c = *s;
+
+		if (isalnum(c))
+			*s = tolower(c);
+		else if (c != '.')
+			*s = '-';
+		s++;
+	}
+
+	ret = firmware_request_nowarn(firmware, *filename, dsp->cs_dsp.dev);
+	if (ret) {
+		adsp_dbg(dsp, "Failed to request '%s'\n", *filename);
+		kfree(*filename);
+		*filename = NULL;
+	} else {
+		adsp_dbg(dsp, "Found prefix-specific tuning '%s'\n", *filename);
+	}
+
+	return ret;
+}
+
 static const char * const cirrus_dir = "cirrus/";
 static int wm_adsp_request_firmware_files(struct wm_adsp *dsp,
 					  const struct firmware **wmfw_firmware,
@@ -845,8 +893,15 @@ static int wm_adsp_request_firmware_files(struct wm_adsp *dsp,
 	ret = wm_adsp_request_firmware_file(dsp, wmfw_firmware, wmfw_filename,
 					    cirrus_dir, NULL, NULL, "wmfw");
 	if (!ret || dsp->wmfw_optional) {
-		wm_adsp_request_firmware_file(dsp, coeff_firmware, coeff_filename,
-					      cirrus_dir, NULL, NULL, "bin");
+		if (suffix)
+			wm_adsp_request_prefixed_coeff_file(dsp, coeff_firmware,
+							    coeff_filename,
+							    cirrus_dir, suffix);
+
+		if (!*coeff_firmware)
+			wm_adsp_request_firmware_file(dsp, coeff_firmware,
+						      coeff_filename, cirrus_dir,
+						      NULL, NULL, "bin");
 		return 0;
 	}
 
