@@ -34,6 +34,7 @@ struct backlight_device;
 struct dentry;
 struct device_node;
 struct drm_connector;
+struct drm_display_mode;
 struct drm_panel_follower;
 struct drm_panel;
 struct display_timing;
@@ -106,6 +107,19 @@ struct drm_panel_funcs {
 	 * This function is optional.
 	 */
 	int (*unprepare)(struct drm_panel *panel);
+
+	/**
+	 * @mode_set:
+	 *
+	 * Notify the panel of the mode selected by the display controller.
+	 * The callback runs after the old mode has been disabled and before the
+	 * panel is prepared for the new mode. Panels that require mode-specific
+	 * command sequences can cache the mode here and apply them in prepare().
+	 *
+	 * This function is optional.
+	 */
+	void (*mode_set)(struct drm_panel *panel,
+			 const struct drm_display_mode *mode);
 
 	/**
 	 * @get_modes:
