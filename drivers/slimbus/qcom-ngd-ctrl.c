@@ -160,6 +160,7 @@ struct qcom_slim_ngd_ctrl {
 	struct work_struct m_work;
 	struct work_struct ngd_up_work;
 	struct workqueue_struct *mwq;
+	bool ngd_ready;
 	struct completion qmi_up;
 	spinlock_t tx_buf_lock;
 	struct mutex tx_lock;
@@ -1467,6 +1468,15 @@ static void qcom_slim_ngd_up_worker(struct work_struct *work)
 static int qcom_slim_ngd_ssr_pdr_notify(struct qcom_slim_ngd_ctrl *ctrl,
 					unsigned long action)
 {
+	/*
+	 * Both SSR and PDR may report the already-running audio service while
+	 * the controller's child device is still probing.  The old ordering
+	 * queued ngd_up_work before INIT_WORK(), corrupting the work-list entry
+	 * and triggering __queue_work() on every Nabu boot.
+	 */
+	if (!READ_ONCE(ctrl->ngd_ready))
+		return NOTIFY_OK;
+
 	switch (action) {
 	case QCOM_SSR_BEFORE_SHUTDOWN:
 	case SERVREG_SERVICE_STATE_DOWN:
@@ -1588,13 +1598,16 @@ static int qcom_slim_ngd_probe(struct platform_device *pdev)
 	}
 
 	INIT_WORK(&ctrl->m_work, qcom_slim_ngd_master_worker);
-	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
 	ctrl->mwq = create_singlethread_workqueue("ngd_master");
 	if (!ctrl->mwq) {
 		dev_err(&pdev->dev, "Failed to start master worker\n");
 		ret = -ENOMEM;
 		goto wq_err;
 	}
+
+	WRITE_ONCE(ctrl->ngd_ready, true);
+	/* Reconcile an UP notification which may have arrived during probe. */
+	schedule_work(&ctrl->ngd_up_work);
 
 	return 0;
 wq_err:
@@ -1617,6 +1630,7 @@ static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dev_set_drvdata(dev, ctrl);
+	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
 
 	ctrl->base = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
 	if (IS_ERR(ctrl->base))
@@ -1690,6 +1704,8 @@ static void qcom_slim_ngd_remove(struct platform_device *pdev)
 {
 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
 
+	WRITE_ONCE(ctrl->ngd_ready, false);
+	cancel_work_sync(&ctrl->ngd_up_work);
 	pm_runtime_disable(&pdev->dev);
 	pdr_handle_release(ctrl->pdr);
 	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);

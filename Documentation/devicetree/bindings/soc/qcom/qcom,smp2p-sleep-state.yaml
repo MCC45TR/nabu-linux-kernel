@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/qcom/qcom,smp2p-sleep-state.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm SMP2P application processor sleep state
+
+maintainers:
+  - MCC45TR <mursitcancihan@gmail.com>
+
+description:
+  Publishes application-processor awake state to Qualcomm remote firmware and
+  receives the corresponding state-change interrupt. Some downstream sensor
+  firmware requires this handshake around system suspend.
+
+properties:
+  compatible:
+    const: qcom,smp2p-sleep-state
+
+  qcom,smem-states:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 1
+
+  interrupt-parent: true
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    const: state-change
+
+required:
+  - compatible
+  - qcom,smem-states
+  - interrupts
+  - interrupt-names
+
+additionalProperties: false
+
+examples:
+  - |
+    sleep-state {
+        compatible = "qcom,smp2p-sleep-state";
+        qcom,smem-states = <&sleepstate_out 0>;
+        interrupt-parent = <&sleepstate_in>;
+        interrupts = <0 1>;
+        interrupt-names = "state-change";
+    };

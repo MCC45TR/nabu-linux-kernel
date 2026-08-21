@@ -4,19 +4,29 @@ This branch carries the Linux kernel changes used by the Nabu Linux project.
 It is based on the SM8150 mainline kernel at commit
 `c340f8ec4fa41eb94b82f233ddcce15fd0aaec17`.
 
+## Branches
+
+- `6.17.0`: hardware-tested SENEMOS Nabu kernel used by the Fedora Rawhide
+  v1.37 test release.
+- The 7.2 port is maintained separately and must retain its real upstream
+  version. Do not label a 7.2.0 tree as 7.2.9 without the corresponding
+  upstream stable release.
+
 ## Hardware status
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Display | Validated | 60 Hz and 120 Hz modes are available. |
-| Touchscreen | Validated | Touch scan mode follows 60/120 Hz display changes. |
+| Display | Validated | Native 60, 90 and 120 Hz modes are available; seamless transitions were physically tested on v1.37. |
+| Touchscreen | Validated | Touch scan mode follows the native display modes and remains active after rotation. |
 | Rotation sensor | Validated | Automatic rotation works in the Plasma session. |
-| Ambient light sensor | Experimental | Sensor data is available; userspace calibration and dimming behavior still need work. |
+| Ambient light sensor | Validated | Automatic brightness is exposed and enabled in the Plasma session. |
 | Internal speakers | Experimental | Four-channel routing is under development. Do not assume balanced or distortion-free output. |
 
-The panel firmware command sequence currently supports only 60 Hz and 120 Hz.
-A 90 Hz mode is intentionally not exposed without a verified panel and touch
-controller sequence.
+The v1.37 release preserves the vblank-synchronised 60/90/120 Hz transition
+path. It also fixes an early SLIMbus workqueue initialisation warning and
+removes an unused CDSP secure-memory reservation that overlapped EFI memory.
+Framebuffer console rotation and the Terminus 16x32 font are enabled for a
+readable landscape boot console.
 
 ## Build
 

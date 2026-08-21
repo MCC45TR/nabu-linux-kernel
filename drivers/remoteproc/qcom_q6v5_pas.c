@@ -1232,17 +1232,16 @@ static const struct qcom_pas_data sdm845_slpi_resource_init = {
 };
 
 /*
- * Nabu's downstream SLPI firmware has not yet been qualified for automatic
- * startup with the mainline remoteproc stack.  Keep the remote processor
- * registered so userspace can start it after networking and persistent logs
- * are available, but do not make an SLPI fault take the whole boot out of
- * reach.
+ * Nabu needs SLPI before the graphical session starts so the IIO sensor
+ * devices are available deterministically.  Keep the suspend handshake in
+ * the device tree disabled until its downstream power protocol is qualified;
+ * this only moves the already-tested firmware start into remoteproc probe.
  */
 static const struct qcom_pas_data sm8150_nabu_slpi_resource = {
 	.crash_reason_smem = 424,
 	.firmware_name = "slpi.mdt",
 	.pas_id = 12,
-	.auto_boot = false,
+	.auto_boot = true,
 	.proxy_pd_names = (char*[]){
 		"lcx",
 		"lmx",
@@ -1499,7 +1498,7 @@ static const struct of_device_id qcom_pas_of_match[] = {
 	{ .compatible = "qcom,sm8150-adsp-pas", .data = &sm8150_adsp_resource},
 	{ .compatible = "qcom,sm8150-cdsp-pas", .data = &sm8150_cdsp_resource},
 	{ .compatible = "qcom,sm8150-mpss-pas", .data = &mpss_resource_init},
-	{ .compatible = "qcom,sm8150-nabu-slpi-pas", .data = &sm8150_nabu_slpi_resource },
+	{ .compatible = "qcom,sm8150-nabu-slpi-pas", .data = &sm8150_nabu_slpi_resource},
 	{ .compatible = "qcom,sm8150-slpi-pas", .data = &sdm845_slpi_resource_init},
 	{ .compatible = "qcom,sm8250-adsp-pas", .data = &sm8250_adsp_resource},
 	{ .compatible = "qcom,sm8250-cdsp-pas", .data = &sm8250_cdsp_resource},

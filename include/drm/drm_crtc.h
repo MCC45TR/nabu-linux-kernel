@@ -300,6 +300,15 @@ struct drm_crtc_state {
 	bool vrr_enabled;
 
 	/**
+	 * @seamless_dfps:
+	 *
+	 * Driver-internal marker for a constant-clock refresh-rate update where
+	 * only vertical front porch/vtotal changes.  Atomic helpers must keep the
+	 * active display link and panel powered while applying this transition.
+	 */
+	bool seamless_dfps;
+
+	/**
 	 * @self_refresh_active:
 	 *
 	 * Used by the self refresh helpers to denote when a self refresh

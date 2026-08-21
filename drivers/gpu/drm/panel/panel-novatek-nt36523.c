@@ -1125,21 +1125,7 @@ static const struct drm_display_mode elish_csot_modes[] = {
 
 static const struct drm_display_mode nabu_csot_modes[] = {
 	{
-		/*
-		 * The downstream driver keeps the 120 Hz pixel clock and lowers
-		 * the refresh rate by extending VFP from 26 to 2784 lines.
-		 */
-		.clock = (1600 + 88 + 40 + 40) * (2560 + 2784 + 4 + 168) * 60 / 1000,
-		.hdisplay = 1600,
-		.hsync_start = 1600 + 88,
-		.hsync_end = 1600 + 88 + 40,
-		.htotal = 1600 + 88 + 40 + 40,
-		.vdisplay = 2560,
-		.vsync_start = 2560 + 2784,
-		.vsync_end = 2560 + 2784 + 4,
-		.vtotal = 2560 + 2784 + 4 + 168,
-	},
-	{
+		/* Native mode first: boot and compositor hand-off stay at 120 Hz. */
 		.clock = (1600 + 88 + 40 + 40) * (2560 + 26 + 4 + 168) * 120 / 1000,
 		.hdisplay = 1600,
 		.hsync_start = 1600 + 88,
@@ -1149,6 +1135,30 @@ static const struct drm_display_mode nabu_csot_modes[] = {
 		.vsync_start = 2560 + 26,
 		.vsync_end = 2560 + 26 + 4,
 		.vtotal = 2560 + 26 + 4 + 168,
+	},
+	{
+		/* 90.01 Hz: same link clock, VFP-only dynamic-FPS timing. */
+		.clock = (1600 + 88 + 40 + 40) * (2560 + 26 + 4 + 168) * 120 / 1000,
+		.hdisplay = 1600,
+		.hsync_start = 1600 + 88,
+		.hsync_end = 1600 + 88 + 40,
+		.htotal = 1600 + 88 + 40 + 40,
+		.vdisplay = 2560,
+		.vsync_start = 2560 + 945,
+		.vsync_end = 2560 + 945 + 4,
+		.vtotal = 2560 + 945 + 4 + 168,
+	},
+	{
+		/* Stock 60 Hz DFPS mode: preserve clock, extend VFP to 2784. */
+		.clock = (1600 + 88 + 40 + 40) * (2560 + 26 + 4 + 168) * 120 / 1000,
+		.hdisplay = 1600,
+		.hsync_start = 1600 + 88,
+		.hsync_end = 1600 + 88 + 40,
+		.htotal = 1600 + 88 + 40 + 40,
+		.vdisplay = 2560,
+		.vsync_start = 2560 + 2784,
+		.vsync_end = 2560 + 2784 + 4,
+		.vtotal = 2560 + 2784 + 4 + 168,
 	},
 };
 
@@ -1255,13 +1265,15 @@ static int nt36523_sync_pen_fps(struct panel_info *pinfo)
 	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = NULL };
 
-	if (pinfo->refresh_rate != 60 && pinfo->refresh_rate != 120)
+	if (pinfo->refresh_rate != 60 && pinfo->refresh_rate != 90 &&
+	    pinfo->refresh_rate != 120)
 		return dev_err_probe(pinfo->panel.dev, -EINVAL,
 				     "no pen synchronization command for %u Hz\n",
 				     pinfo->refresh_rate);
 
 	/* Xiaomi's downstream panel commands synchronize the TDDI scan rate. */
 	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
+	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
 	if (pinfo->refresh_rate == 60)
 		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
 						  0x23, 0x0c);
@@ -1288,6 +1300,17 @@ static void nt36523_mode_set(struct drm_panel *panel,
 	struct panel_info *pinfo = to_panel_info(panel);
 
 	pinfo->refresh_rate = drm_mode_vrefresh(mode);
+
+	/*
+	 * Do not insert vendor TDDI DCS commands into an active dual-DSI video
+	 * stream.  The MSM host cannot complete those transfers at the live
+	 * video boundary on nabu: all four commands time out and the stalled
+	 * stream repeats scanlines, most visibly when switching to 60 Hz.
+	 *
+	 * The host and DPU VFP update remains seamless.  nt36523_prepare()
+	 * still programs the TDDI scan band after panel initialization, where
+	 * command transfer is reliable and cannot corrupt active scanout.
+	 */
 }
 
 static int nt36523_prepare(struct drm_panel *panel)

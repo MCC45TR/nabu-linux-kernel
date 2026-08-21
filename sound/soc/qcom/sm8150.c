@@ -36,12 +36,12 @@ struct sm8150_snd_data {
 static unsigned int tdm_slot_offset[8] = {0, 4, 8, 12, 16, 20, 24, 28};
 
 static const struct {
-	unsigned int rx[2];
+	unsigned int rx[1];
 } cs35l41_tdm_channel_map[] = {
-	{.rx = {4, 5}}, /* BR */
-	{.rx = {4, 5}}, /* TR */
-	{.rx = {4, 5}}, /* BL */
-	{.rx = {4, 5}}, /* TL */
+	{.rx = {5}}, /* BR: right ASP channel */
+	{.rx = {5}}, /* TR: right ASP channel */
+	{.rx = {4}}, /* BL: left ASP channel */
+	{.rx = {4}}, /* TL: left ASP channel */
 };
 
 static int sm8150_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
@@ -122,10 +122,10 @@ static int sm8150_tdm_snd_hw_params(struct snd_pcm_substream *substream,
 	}
 
 	channels = params_channels(params);
-	/* Android clocks an eight-slot frame but derives the AFE active-slot
-	 * mask from the channel offsets before sending it to the DSP.  This
-	 * mainline path passes that active mask directly: four channels at
-	 * offsets 0, 4, 8 and 12 bytes occupy slots 0 through 3.
+	/* Keep the four-channel AFE format accepted by the Nabu ADSP.  Split the
+	 * amplifiers between ASP slot positions 4 and 5 so the direct-ASP route
+	 * can identify the two physical speaker pairs without the Android-only
+	 * protection DSP Channel Swap control.
 	 */
 	slot_mask = GENMASK(channels - 1, 0);
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {

@@ -904,6 +904,17 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
+		slpi_sleepstate_out: sleepstate-out {
+			qcom,entry-name = "sleepstate";
+			#qcom,smem-state-cells = <1>;
+		};
+
+		slpi_sleepstate_in: sleepstate-in {
+			qcom,entry-name = "sleepstate_see";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
 	};
 
 	soc: soc@0 {
@@ -2232,7 +2243,7 @@
 				qcom,remote-pid = <3>;
 				mboxes = <&apss_shared 24>;
 
-				fastrpc {
+				slpi_fastrpc: fastrpc {
 					compatible = "qcom,fastrpc";
 					qcom,glink-channels = "fastrpcglink-apps-dsp";
 					label = "sdsp";
@@ -4459,7 +4470,7 @@
 					};
 				};
 
-				fastrpc {
+				adsp_fastrpc: fastrpc {
 					compatible = "qcom,fastrpc";
 					qcom,glink-channels = "fastrpcglink-apps-dsp";
 					label = "adsp";

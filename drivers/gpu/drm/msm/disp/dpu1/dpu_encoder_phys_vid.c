@@ -330,6 +330,24 @@ static void dpu_encoder_phys_vid_setup_timing_engine(
 	programmable_fetch_config(phys_enc, &timing_params);
 }
 
+static bool dpu_encoder_phys_vid_needs_single_flush(
+		struct dpu_encoder_phys *phys_enc);
+
+static void dpu_encoder_phys_vid_seamless_mode_set(
+		struct dpu_encoder_phys *phys_enc)
+{
+	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
+
+	dpu_encoder_phys_vid_setup_timing_engine(phys_enc);
+
+	/* The bonded slave shares the master's CTL flush on older hardware. */
+	if (dpu_encoder_phys_vid_needs_single_flush(phys_enc) &&
+	    !dpu_encoder_phys_vid_is_master(phys_enc))
+		return;
+
+	ctl->ops.update_pending_flush_intf(ctl, phys_enc->hw_intf->idx);
+}
+
 static void dpu_encoder_phys_vid_vblank_irq(void *arg)
 {
 	struct dpu_encoder_phys *phys_enc = arg;
@@ -738,6 +756,7 @@ static void dpu_encoder_phys_vid_init_ops(struct dpu_encoder_phys_ops *ops)
 {
 	ops->is_master = dpu_encoder_phys_vid_is_master;
 	ops->atomic_mode_set = dpu_encoder_phys_vid_atomic_mode_set;
+	ops->seamless_mode_set = dpu_encoder_phys_vid_seamless_mode_set;
 	ops->enable = dpu_encoder_phys_vid_enable;
 	ops->disable = dpu_encoder_phys_vid_disable;
 	ops->control_vblank_irq = dpu_encoder_phys_vid_control_vblank_irq;
