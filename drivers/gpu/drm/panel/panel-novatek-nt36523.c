@@ -1259,7 +1259,7 @@ static void nt36523_reset(struct panel_info *pinfo)
 	usleep_range(12000, 13000);
 }
 
-static int nt36523_sync_pen_fps(struct panel_info *pinfo)
+static int nt36523_sync_pen_fps(struct panel_info *pinfo, bool panel_init)
 {
 	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
 	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
@@ -1273,7 +1273,10 @@ static int nt36523_sync_pen_fps(struct panel_info *pinfo)
 
 	/* Xiaomi's downstream panel commands synchronize the TDDI scan rate. */
 	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
-	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xfb, 0x01);
+	/* The vendor's live sync sequence omits the page-unlock write. */
+	if (panel_init)
+		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+						  0xfb, 0x01);
 	if (pinfo->refresh_rate == 60)
 		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
 						  0x23, 0x0c);
@@ -1298,19 +1301,25 @@ static void nt36523_mode_set(struct drm_panel *panel,
 			     const struct drm_display_mode *mode)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
+	int ret;
 
 	pinfo->refresh_rate = drm_mode_vrefresh(mode);
 
 	/*
-	 * Do not insert vendor TDDI DCS commands into an active dual-DSI video
-	 * stream.  The MSM host cannot complete those transfers at the live
-	 * video boundary on nabu: all four commands time out and the stalled
-	 * stream repeats scanlines, most visibly when switching to 60 Hz.
-	 *
-	 * The host and DPU VFP update remains seamless.  nt36523_prepare()
-	 * still programs the TDDI scan band after panel initialization, where
-	 * command transfer is reliable and cannot corrupt active scanout.
+	 * The MSM atomic path calls the downstream panel bridge only after both
+	 * DSI timing databases have latched the new porch and a real CRTC vblank
+	 * has elapsed.  Synchronize the integrated touch/pen scan band at that
+	 * point.  On DSI 6G the command DMA is held outside the active frame by
+	 * BLOCK_DMA_WITHIN_FRAME, avoiding the VIDEO_DONE timeout and scanline
+	 * repetition seen when this sequence was issued before the timing latch.
 	 */
+	if (panel->prepared && pinfo->desc->sync_pen_fps) {
+		ret = nt36523_sync_pen_fps(pinfo, false);
+		if (ret < 0)
+			dev_err(pinfo->panel.dev,
+				"failed live pen synchronization for %u Hz: %d\n",
+				pinfo->refresh_rate, ret);
+	}
 }
 
 static int nt36523_prepare(struct drm_panel *panel)
@@ -1334,7 +1343,7 @@ static int nt36523_prepare(struct drm_panel *panel)
 	}
 
 	if (pinfo->desc->sync_pen_fps) {
-		ret = nt36523_sync_pen_fps(pinfo);
+		ret = nt36523_sync_pen_fps(pinfo, true);
 		if (ret < 0) {
 			regulator_disable(pinfo->vddio);
 			return ret;

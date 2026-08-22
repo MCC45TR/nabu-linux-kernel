@@ -459,8 +459,14 @@ void msm_atomic_commit_tail(struct drm_atomic_state *state)
 	msm_atomic_mask_seamless_modesets(state, true);
 	drm_atomic_helper_commit_modeset_disables(dev, state);
 	msm_atomic_mask_seamless_modesets(state, false);
-	msm_atomic_commit_seamless_modesets(state);
 	drm_atomic_helper_commit_planes(dev, state, 0);
+	/*
+	 * dpu_crtc_atomic_begin(), called by commit_planes(), clears the CTL
+	 * pending-flush mask before programming the planes.  Program seamless
+	 * interface timing afterwards so its INTF flush bit survives until
+	 * dpu_kms_flush_commit() latches the new DPU frame period.
+	 */
+	msm_atomic_commit_seamless_modesets(state);
 	msm_atomic_mask_seamless_modesets(state, true);
 	drm_atomic_helper_commit_modeset_enables(dev, state);
 	msm_atomic_mask_seamless_modesets(state, false);
