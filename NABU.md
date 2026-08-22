@@ -17,13 +17,16 @@ It is based on the SM8150 mainline kernel at commit
 | Area | Status | Notes |
 | --- | --- | --- |
 | Display | Validated | Native 60, 90 and 120 Hz modes are available; seamless transitions were physically tested on v1.37. |
-| Touchscreen | Validated | Touch scan mode follows the native display modes and remains active after rotation. |
+| Touchscreen | Pending HIL | 60 and 120 Hz are validated. The 90 Hz scan-band fix is source/build validated and awaits physical testing. |
 | Rotation sensor | Validated | Automatic rotation works in the Plasma session. |
 | Ambient light sensor | Validated | Automatic brightness is exposed and enabled in the Plasma session. |
 | Internal speakers | Experimental | Four-channel routing is under development. Do not assume balanced or distortion-free output. |
 
-The v1.37 release preserves the vblank-synchronised 60/90/120 Hz transition
-path. It also fixes an early SLIMbus workqueue initialisation warning and
+The v1.4.0.4 candidate preserves the vblank-synchronised 60/90/120 Hz
+transition path, assigns the vendor low TDDI scan band to the additional
+90 Hz mode, and defers optional XHCI probing until userspace so a failed pogo
+keyboard enumeration cannot hold the kernel before `/init`. It also fixes an
+early SLIMbus workqueue initialisation warning and
 removes an unused CDSP secure-memory reservation that overlapped EFI memory.
 Framebuffer console rotation and the Terminus 16x32 font are enabled for a
 readable landscape boot console.
