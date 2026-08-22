@@ -993,4 +993,14 @@ config INPUT_STPMIC1_ONKEY
 	  To compile this driver as a module, choose M here: the
 	  module will be called stpmic1_onkey.
 
+config INPUT_XIAOMI_NABU_TABLET_MODE
+	bool "Xiaomi Pad 5 permanent tablet-mode switch"
+	depends on ARCH_QCOM
+	help
+	  Report the Xiaomi Pad 5 as permanently operating in tablet mode.
+	  Desktop environments otherwise disable automatic rotation whenever a
+	  USB pointer is present, including the SENEMOS recovery bridge mouse.
+
+	  Say Y when building a kernel for Xiaomi Pad 5 (nabu).
+
 endif
