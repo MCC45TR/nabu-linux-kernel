@@ -890,6 +890,8 @@
 
 		novatek,pen-support;
 		novatek,wgp-stylus;
+		wakeup-source;
+		novatek,double-tap-to-wake;
 
 		/* 523 */
 		novatek,swrst-n8-addr = <0x03F0FE>;

@@ -169,6 +169,8 @@ struct nvt_ts_data {
 	int panel_index;
 	uint32_t spi_max_freq;
 	int db_wakeup;
+	bool wakeup_source;
+	bool irq_wake_enabled;
 	uint8_t debug_flag;
 	bool fw_debug;
 	bool dev_pm_suspend;
