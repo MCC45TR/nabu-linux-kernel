@@ -11,6 +11,7 @@
 #include <linux/debugfs.h>
 #include <linux/ktime.h>
 #include <linux/bits.h>
+#include <linux/of.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_blend.h>
@@ -1423,7 +1424,13 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	/*
+	 * Nabu's Night Light uses the CRTC CTM property.  Reserve one DSPP per
+	 * layer mixer from the initial modeset onward so later CTM enable/bypass
+	 * commits do not require a panel-blanking resource reallocation.
+	 */
+	if (crtc_state->ctm || crtc_state->gamma_lut ||
+	    of_machine_is_compatible("xiaomi,nabu"))
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
