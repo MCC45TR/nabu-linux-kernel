@@ -1,13 +1,18 @@
-# SPDX-License-Identifier: GPL-2.0
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 %YAML 1.2
 ---
 $id: http://devicetree.org/schemas/power/supply/idt,p9418.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: IDT P9418 Wireless Power Charger
+title: IDT P9418 wireless power transmitter
 
 maintainers:
-  - Viola Guerrera <viooo@anche.no>
+  - MCC45TR <mcc45tr@users.noreply.github.com>
+
+description: |
+  IDT P9418 transmitter used by Xiaomi Pad 5 for stylus detection, reverse
+  wireless charging, charge-state monitoring and stylus Bluetooth MAC
+  reporting.
 
 properties:
   compatible:
@@ -15,44 +20,30 @@ properties:
 
   reg:
     maxItems: 1
-    description: I2C address of the device
 
-  irq-gpios:
+  idt,irq-gpios:
     maxItems: 1
-    description: |
-      GPIO used as the interrupt line from the chip to the host.
 
-  pen-det-active-high-gpios:
+  idt,hall3-gpios:
     maxItems: 1
-    description: |
-      GPIO used to detect pen presence (active high).
 
-  pen-det-active-low-gpios:
+  idt,hall4-gpios:
     maxItems: 1
-    description: |
-      GPIO used to detect pen presence (active low).
 
-  enable-gpios:
+  idt,reverse-enable-gpios:
     maxItems: 1
-    description: |
-      GPIO used to enable or disable the wireless power transmitter chip.
 
-  boost-enable-gpios:
+  idt,reverse-boost-enable-gpios:
     maxItems: 1
-    description: |
-      GPIO used to enable the boost converter for reverse charging.
-
-  '#address-cells':
-    const: 1
-
-  '#size-cells':
-    const: 0
 
 required:
   - compatible
   - reg
-  - enable-gpios
-  - boost-enable-gpios
+  - idt,irq-gpios
+  - idt,hall3-gpios
+  - idt,hall4-gpios
+  - idt,reverse-enable-gpios
+  - idt,reverse-boost-enable-gpios
 
 additionalProperties: false
 
@@ -60,18 +51,17 @@ examples:
   - |
     #include <dt-bindings/gpio/gpio.h>
 
-    i2c17: i2c@17 {
-        status = "okay";
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
 
-        idtp9418: idtp9418@3b {
+        wireless-power@3b {
             compatible = "idt,p9418";
             reg = <0x3b>;
-            status = "okay";
-            irq-gpios = <&tlmm 95 GPIO_ACTIVE_LOW>;
-            pen-det-active-high-gpios = <&tlmm 101 GPIO_ACTIVE_HIGH>;
-            pen-det-active-low-gpios = <&tlmm 134 GPIO_ACTIVE_HIGH>;
-            enable-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
-            boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
+            idt,irq-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
+            idt,hall3-gpios = <&tlmm 101 GPIO_ACTIVE_HIGH>;
+            idt,hall4-gpios = <&tlmm 134 GPIO_ACTIVE_HIGH>;
+            idt,reverse-enable-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
+            idt,reverse-boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
         };
     };
-...
