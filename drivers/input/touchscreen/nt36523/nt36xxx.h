@@ -20,6 +20,7 @@
 #define		_LINUX_NVT_TOUCH_H
 
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/input.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
@@ -141,7 +142,7 @@ struct nvt_ts_data {
 	uint8_t max_touch_num;
 	uint8_t max_button_num;
 	uint32_t int_trigger_type;
-	int32_t irq_gpio;
+	struct gpio_desc *irq_gpio;
 	uint32_t irq_flags;
 	int32_t reset_gpio;
 	uint32_t reset_flags;

@@ -1283,18 +1283,18 @@ static int nt36523_sync_pen_fps(struct panel_info *pinfo, bool panel_init)
 	}
 
 	/* Xiaomi's downstream panel commands synchronize the TDDI scan rate. */
-	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
+	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
 	/* The vendor's live sync sequence omits the page-unlock write. */
 	if (panel_init)
-		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
 						  0xfb, 0x01);
 	if (pinfo->refresh_rate == 60)
-		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
 						  0x23, 0x0c);
 	else
-		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+		mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1,
 						  0x23, 0x0d);
-	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x10);
+	mipi_dsi_dual_dcs_write_seq_multi(&dsi_ctx, dsi0, dsi1, 0xff, 0x10);
 
 	if (dsi_ctx.accum_err)
 		dev_err(pinfo->panel.dev,
