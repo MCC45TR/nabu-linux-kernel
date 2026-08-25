@@ -1,5 +1,6 @@
-#ifndef __IDTP9148_H__
-#define __IDTP9148_H__
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef __IDTP9418_H__
+#define __IDTP9418_H__
 
 #define IDT_DRIVER_NAME "idtp9418"
 #define IDT_I2C_ADDR 0x3b
@@ -58,13 +59,13 @@
 #define INT_START_DPING (1 << 1)
 #define INT_EPT_TYPE (1 << 0)
 
-#define TX_TOGGLE BIT(6)   // toggle work mode(148K or 190K)
-#define TX_FOD_EN BIT(5)   // enable FOD
-#define TX_WD BIT(4)       // enable WD
+#define TX_TOGGLE BIT(6) // toggle work mode(148K or 190K)
+#define TX_FOD_EN BIT(5) // enable FOD
+#define TX_WD BIT(4) // enable WD
 #define TX_SEND_FSK BIT(3) // SEND_FSK
-#define TX_DIS BIT(2)      // disable tx
-#define TX_CLRINT BIT(1)   // clr int
-#define TX_EN BIT(0)       // enable tx mode
+#define TX_DIS BIT(2) // disable tx
+#define TX_CLRINT BIT(1) // clr int
+#define TX_EN BIT(0) // enable tx mode
 
 /* used registers define */
 #define REG_CHIP_ID_L 0x0000
@@ -73,8 +74,8 @@
 #define REG_CTM_ID 0x0003
 #define REG_OTPFWVER_ADDR 0x0004 // OTP firmware version
 #define REG_EPRFWVER_ADDR 0x001c // EEPROM firmware version
-#define REG_SYS_INT_CLR 0x0028   // int clear
-#define REG_SYS_INT 0x0030       // interrupt
+#define REG_SYS_INT_CLR 0x0028 // int clear
+#define REG_SYS_INT 0x0030 // interrupt
 #define REG_STATUS_L 0x0034
 #define REG_STATUS_H 0x0035
 #define REG_INTR_L 0x0036
@@ -90,26 +91,30 @@
 #define REG_RX_LOUT_L 0x0044
 #define REG_RX_LOUT_H 0x0045
 #define REG_RX_DIE_TEMP 0x0046
-#define REG_FREQ_ADDR 0x0048 // Operating Frequency, Fop(KHz) = 64 * 6000 /value * 256)
+#define REG_FREQ_ADDR \
+	0x0048 // Operating Frequency, Fop(KHz) = 64 * 6000 /value * 256)
 #define REG_ILIM_SET 0x004A
 #define REG_SIGNAL_STRENGTH 0x004B
 #define REG_WPC_MODE 0x004D
 #define REG_SSCMND 0x004e // Command Register, COM (0x4E)
 #define REG_RX_RESET 0x004F
-#define REG_PROPPKT 0x0050      // Proprietary Packet Header Register, PPP_Header (0x50)
-#define REG_PPPDATA 0x0051      // PPP Data Value Register(0X51, 0x52, 0x53, 0x54, 0x55)
-#define REG_SSINTCLR 0x0056     // Interrupt Clear Registers, INT_Clear_L (0x56)
-#define REG_BCHEADER 0x0058     // Back Channel Packet Register (0x58)
-#define REG_BCDATA 0x0059       // Back Channel Packet Register (0x59, 0x5A, 0x5B, 0x5C)
+#define REG_PROPPKT \
+	0x0050 // Proprietary Packet Header Register, PPP_Header (0x50)
+#define REG_PPPDATA \
+	0x0051 // PPP Data Value Register(0X51, 0x52, 0x53, 0x54, 0x55)
+#define REG_SSINTCLR 0x0056 // Interrupt Clear Registers, INT_Clear_L (0x56)
+#define REG_BCHEADER 0x0058 // Back Channel Packet Register (0x58)
+#define REG_BCDATA \
+	0x0059 // Back Channel Packet Register (0x59, 0x5A, 0x5B, 0x5C)
 #define REG_FC_VOLTAGE_L 0x0078 // Fast Charging Voltage Register
 #define REG_FC_VOLTAGE_H 0x0079
 #define REG_REGULATOR_L 0x000C
 #define REG_REGULATOR_H 0x000d
 #define REG_POWER_MAX 0x0084 // Get the TX power on EPP mode.
-#define REG_TX_TYPE 0x00A2   // Get the TX type.
-#define REG_BLE_FLAG 0x00A4  // Get the rx ble flag.
-#define REG_CEP 0x00A5       // Get the CEP.
-#define REG_RPP 0x00A6       // Get the RPP.
+#define REG_TX_TYPE 0x00A2 // Get the TX type.
+#define REG_BLE_FLAG 0x00A4 // Get the rx ble flag.
+#define REG_CEP 0x00A5 // Get the CEP.
+#define REG_RPP 0x00A6 // Get the RPP.
 #define REG_MAX_POWER 0x008E
 #define REG_OCP_CONFIG 0x00F1
 #define REG_TEMPTER 0x00F2
@@ -204,5 +209,14 @@
 #define SENDPROPP BIT(0) //  SEND RX Data
 
 #define SEND_DEVICE_AUTH BIT(2)
+
+#define REVERSE_DPING_CHECK_DELAY_MS 1000
+#define REVERSE_CHG_CHECK_DELAY_MS 1000
+#define CHARGE_MONITOR_INTERVAL (2 * HZ)
+#define IDTP9418_STATE_ATTACHING 1
+#define IDTP9418_STATE_COMPLETE  2
+#define IDTP_KFIFO_SIZE 128
+#define LIMIT_SOC 85
+#define MAC_LEN 6
 
 #endif

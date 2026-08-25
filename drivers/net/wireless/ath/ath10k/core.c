@@ -2990,6 +2990,17 @@ int ath10k_core_start(struct ath10k *ar, enum ath10k_firmware_mode mode,
 
 	ar->running_fw = fw;
 
+	/*
+	 * WCN3990 HL firmware reports one channel-info event per scanned
+	 * channel and finishes with a frequency-zero marker, while some shipped
+	 * firmware-5.bin metadata omits the matching feature bit.  Select the
+	 * unpaired handler explicitly to avoid treating that marker as a channel
+	 * array index ("frequency 0 / idx out of bounds").
+	 */
+	if (QCA_REV_WCN3990(ar))
+		set_bit(ATH10K_FW_FEATURE_SINGLE_CHAN_INFO_PER_CHANNEL,
+			ar->normal_mode_fw.fw_file.fw_features);
+
 	if (!test_bit(ATH10K_FW_FEATURE_NON_BMI,
 		      ar->running_fw->fw_file.fw_features)) {
 		ath10k_bmi_start(ar);

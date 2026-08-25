@@ -93,3 +93,4 @@ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
 obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
 obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
 obj-$(CONFIG_INPUT_XIAOMI_NABU_TABLET_MODE) += xiaomi-nabu-tablet-mode.o
+obj-$(CONFIG_INPUT_XIAOMI_NABU_KEYBOARD) += xiaomi-nabu-keyboard.o

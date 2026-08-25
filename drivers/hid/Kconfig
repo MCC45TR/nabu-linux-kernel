@@ -534,7 +534,8 @@ config HID_XIAOMI
 	tristate "Xiaomi"
 	help
 	  Adds support for side buttons of Xiaomi Mi Dual Mode Wireless
-	  Mouse Silent Edition.
+	  Mouse Silent Edition and filters the phantom pointer interface of
+	  the Xiaomi Pad 5 keyboard-cover controller.
 
 config HID_GYRATION
 	tristate "Gyration remote control"
