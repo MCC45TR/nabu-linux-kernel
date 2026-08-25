@@ -23,6 +23,11 @@
 
 #define DSI_NUM_MIN 1
 
+static bool expose_nabu_90hz;
+module_param(expose_nabu_90hz, bool, 0444);
+MODULE_PARM_DESC(expose_nabu_90hz,
+		 "Expose Xiaomi Nabu experimental 90 Hz mode");
+
 #define mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, cmd, seq...)	\
 		do {								\
 			dsi_ctx.dsi = dsi0;					\
@@ -1409,11 +1414,21 @@ static int nt36523_get_modes(struct drm_panel *panel,
 			       struct drm_connector *connector)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
-	int i;
+	int i, num_modes = 0;
 
 	for (i = 0; i < pinfo->desc->num_modes; i++) {
 		const struct drm_display_mode *m = &pinfo->desc->modes[i];
 		struct drm_display_mode *mode;
+
+		/*
+		 * Xiaomi's Nabu vendor panel data advertises only 60 and 120 Hz.
+		 * Keep the experimental 90 Hz timing compiled for diagnostics, but
+		 * do not expose it to KMS clients until the dual-DSI scanout fault is
+		 * resolved and physically validated.
+		 */
+		if (pinfo->desc == &nabu_csot_desc &&
+		    drm_mode_vrefresh(m) == 90 && !expose_nabu_90hz)
+			continue;
 
 		mode = drm_mode_duplicate(connector->dev, m);
 		if (!mode) {
@@ -1423,18 +1438,19 @@ static int nt36523_get_modes(struct drm_panel *panel,
 		}
 
 		mode->type = DRM_MODE_TYPE_DRIVER;
-		if (i == 0)
+		if (!num_modes)
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 
 		drm_mode_set_name(mode);
 		drm_mode_probed_add(connector, mode);
+		num_modes++;
 	}
 
 	connector->display_info.width_mm = pinfo->desc->width_mm;
 	connector->display_info.height_mm = pinfo->desc->height_mm;
 	connector->display_info.bpc = pinfo->desc->bpc;
 
-	return pinfo->desc->num_modes;
+	return num_modes;
 }
 
 static enum drm_panel_orientation nt36523_get_orientation(struct drm_panel *panel)

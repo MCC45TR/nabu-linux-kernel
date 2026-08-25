@@ -9,6 +9,8 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_vblank.h>
 
+#include <linux/of.h>
+
 #include "msm_atomic_trace.h"
 #include "msm_drv.h"
 #include "msm_gem.h"
@@ -405,6 +407,14 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_state *state)
 				      new_crtc_state, i) {
 		if ((old_crtc_state->ctm && !new_crtc_state->ctm) ||
 		    (!old_crtc_state->ctm && new_crtc_state->ctm)) {
+			/*
+			 * Nabu reserves DSPP resources at every modeset.  Its CTM can
+			 * therefore be enabled or bypassed through the normal atomic
+			 * color-management flush without blanking the dual-DSI panel.
+			 */
+			if (of_machine_is_compatible("xiaomi,nabu"))
+				continue;
+
 			new_crtc_state->mode_changed = true;
 			state->allow_modeset = true;
 		}

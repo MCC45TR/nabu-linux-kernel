@@ -16,15 +16,17 @@ It is based on the SM8150 mainline kernel at commit
 
 | Area | Status | Notes |
 | --- | --- | --- |
-| Display | Validated | Native 60, 90 and 120 Hz modes are available; seamless transitions were physically tested on v1.37. |
-| Touchscreen | Pending HIL | 60 and 120 Hz are validated. The 90 Hz scan-band fix is source/build validated and awaits physical testing. |
+| Display | Partially validated | Native 60 and 120 Hz modes and their transitions are physically validated. The experimental 90 Hz timing is hidden by default after a physical dual-DSI scanout failure. |
+| Touchscreen | Partially validated | 60 and 120 Hz are validated. The retained 90 Hz timing and scan-band path remain disabled pending display and long-duration touch validation. |
 | Rotation sensor | Validated | Automatic rotation works in the Plasma session. |
 | Ambient light sensor | Validated | Automatic brightness is exposed and enabled in the Plasma session. |
 | Internal speakers | Experimental | Four-channel routing is under development. Do not assume balanced or distortion-free output. |
 
-The v1.4.0.4 candidate preserves the vblank-synchronised 60/90/120 Hz
-transition path, assigns the vendor low TDDI scan band to the additional
-90 Hz mode, and defers optional XHCI probing until userspace so a failed pogo
+The v1.4.0.6 candidate preserves the vblank-synchronised 60/120 Hz transition
+path and keeps the experimental 90 Hz timing compiled but hidden by default.
+It also keeps Nabu DSPP resources reserved so CRTC color-temperature changes
+do not force a full dual-DSI modeset, and defers optional XHCI probing until
+userspace so a failed pogo
 keyboard enumeration cannot hold the kernel before `/init`. It also fixes an
 early SLIMbus workqueue initialisation warning and
 removes an unused CDSP secure-memory reservation that overlapped EFI memory.
