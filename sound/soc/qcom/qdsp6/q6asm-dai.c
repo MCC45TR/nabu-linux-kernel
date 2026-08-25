@@ -3,6 +3,7 @@
 // Copyright (c) 2018, Linaro Limited
 
 #include <dt-bindings/sound/qcom,q6asm.h>
+#include <linux/completion.h>
 #include <linux/init.h>
 #include <linux/err.h>
 #include <linux/module.h>
@@ -71,6 +72,7 @@ struct q6asm_dai_rtd {
 	uint32_t stream_id;
 	uint16_t session_id;
 	enum stream_state state;
+	struct completion eos_done;
 	uint32_t initial_samples_drop;
 	uint32_t trailing_samples_drop;
 	bool notify_on_drain;
@@ -186,6 +188,8 @@ static void event_handler(uint32_t opcode, uint32_t token,
 	case ASM_CLIENT_EVENT_CMD_RUN_DONE:
 		break;
 	case ASM_CLIENT_EVENT_CMD_EOS_DONE:
+		prtd->state = Q6ASM_STREAM_STOPPED;
+		complete_all(&prtd->eos_done);
 		break;
 	case ASM_CLIENT_EVENT_DATA_WRITE_DONE:
 		snd_pcm_period_elapsed(substream);
@@ -347,8 +351,17 @@ static int q6asm_dai_trigger(struct snd_soc_component *component,
 				       0, 0, 0);
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
-		ret = q6asm_cmd_nowait(prtd->audio_client, prtd->stream_id,
-				       CMD_EOS);
+		prtd->state = Q6ASM_STREAM_STOPPED;
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+			reinit_completion(&prtd->eos_done);
+			ret = q6asm_cmd_nowait(prtd->audio_client,
+					       prtd->stream_id, CMD_EOS);
+			if (ret < 0)
+				complete_all(&prtd->eos_done);
+		} else {
+			ret = q6asm_cmd_nowait(prtd->audio_client,
+					       prtd->stream_id, CMD_PAUSE);
+		}
 		break;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
@@ -388,6 +401,7 @@ static int q6asm_dai_open(struct snd_soc_component *component,
 		return -ENOMEM;
 
 	prtd->substream = substream;
+	init_completion(&prtd->eos_done);
 	prtd->audio_client = q6asm_audio_client_alloc(dev,
 				(q6asm_cb)event_handler, prtd, stream_id,
 				LEGACY_PCM_MODE);
@@ -462,7 +476,14 @@ static int q6asm_dai_close(struct snd_soc_component *component,
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 
 	if (prtd->audio_client) {
-		if (prtd->state == Q6ASM_STREAM_RUNNING) {
+		if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+		    prtd->state == Q6ASM_STREAM_STOPPED &&
+		    !wait_for_completion_timeout(&prtd->eos_done,
+					 msecs_to_jiffies(1000)))
+			dev_warn(component->dev,
+				 "rendered EOS timed out before stream close\n");
+
+		if (prtd->state != Q6ASM_STREAM_IDLE) {
 			q6asm_cmd(prtd->audio_client, prtd->stream_id,
 				  CMD_CLOSE);
 			q6asm_unmap_memory_regions(substream->stream,

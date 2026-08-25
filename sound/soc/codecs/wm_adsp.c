@@ -801,6 +801,57 @@ static int wm_adsp_request_firmware_file(struct wm_adsp *dsp,
 	return 0;
 }
 
+/*
+ * Nabu firmware packages use the component prefix to select per-speaker
+ * tuning, for example BR-cs35l41-dsp1-spk-prot.bin.  Preserve the upstream
+ * generic lookup order and use this device convention only as a fallback.
+ */
+static int wm_adsp_request_prefixed_coeff_file(struct wm_adsp *dsp,
+					       struct wm_adsp_fw_file *fw,
+					       const char *dir,
+					       const char *prefix)
+{
+	const char *fwf = dsp->fwf_name ?: dsp->cs_dsp.name;
+	char *s;
+	int ret;
+
+	if (!prefix)
+		return 0;
+
+	fw->filename = kasprintf(GFP_KERNEL, "%s%s-%s-%s-%s.bin", dir,
+				prefix, dsp->part, fwf, wm_adsp_fw[dsp->fw].file);
+	if (!fw->filename)
+		return -ENOMEM;
+
+	/* Keep the component prefix while normalizing the firmware stem. */
+	s = fw->filename + strlen(dir) + strlen(prefix) + 1;
+	while (*s) {
+		char c = *s;
+
+		if (isalnum(c))
+			*s = tolower(c);
+		else if (c != '.')
+			*s = '-';
+		s++;
+	}
+
+	ret = wm_adsp_firmware_request(&fw->firmware, fw->filename,
+				       dsp->cs_dsp.dev);
+	if (ret < 0) {
+		adsp_dbg(dsp, "Failed to request '%s': %d\n", fw->filename,
+			 ret);
+		kfree(fw->filename);
+		fw->filename = NULL;
+		if (ret != -ENOENT)
+			return ret;
+	} else {
+		adsp_dbg(dsp, "Found prefix-specific tuning '%s'\n",
+			 fw->filename);
+	}
+
+	return 0;
+}
+
 static const char * const cirrus_dir = "cirrus/";
 VISIBLE_IF_KUNIT int wm_adsp_request_firmware_files(struct wm_adsp *dsp,
 						    struct wm_adsp_fw_files *fw)
@@ -876,10 +927,18 @@ VISIBLE_IF_KUNIT int wm_adsp_request_firmware_files(struct wm_adsp *dsp,
 		goto err;
 
 	if (fw->wmfw.firmware || dsp->wmfw_optional) {
-		ret = wm_adsp_request_firmware_file(dsp, &fw->coeff,
-						    cirrus_dir, NULL, NULL, "bin");
+		ret = wm_adsp_request_prefixed_coeff_file(dsp, &fw->coeff,
+						     cirrus_dir, suffix);
 		if (ret < 0)
 			goto err;
+
+		if (!fw->coeff.firmware) {
+			ret = wm_adsp_request_firmware_file(dsp, &fw->coeff,
+							    cirrus_dir, NULL, NULL,
+							    "bin");
+			if (ret < 0)
+				goto err;
+		}
 
 		return 0;
 	}

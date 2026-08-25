@@ -530,7 +530,9 @@ int q6asm_map_memory_regions(unsigned int dir, struct audio_client *ac,
 
 	rc = __q6asm_memory_map_regions(ac, dir, period_sz, periods, 1);
 	if (rc < 0) {
-		dev_err(ac->dev, "Memory_map_regions failed\n");
+		dev_err(ac->dev,
+			"Memory_map_regions failed: rc=%d dir=%u phys=%pa period=%zu periods=%u\n",
+			rc, dir, &phys, period_sz, periods);
 		q6asm_audio_client_free_buf(ac, &ac->port[dir]);
 	}
 
@@ -636,6 +638,7 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			client_event = ASM_CLIENT_EVENT_CMD_OUT_FLUSH_DONE;
 			break;
 		case ASM_STREAM_CMD_OPEN_WRITE_V3:
+		case ASM_DATA_CMD_WRITE_V2:
 		case ASM_STREAM_CMD_OPEN_READ_V3:
 		case ASM_STREAM_CMD_OPEN_READWRITE_V2:
 		case ASM_STREAM_CMD_SET_ENCDEC_PARAM:
@@ -654,9 +657,8 @@ static int32_t q6asm_stream_callback(struct apr_device *adev,
 			break;
 		case ASM_DATA_CMD_EOS:
 		case ASM_DATA_CMD_READ_V2:
-		case ASM_DATA_CMD_WRITE_V2:
-			/* response as result of close stream */
-			goto done;
+			/* Responses generated while a stream is being closed. */
+			break;
 		default:
 			dev_err(ac->dev, "command[0x%x] not expecting rsp\n",
 				result->opcode);
