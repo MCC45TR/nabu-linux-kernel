@@ -1070,6 +1070,11 @@
 	};
 };
 
+&venus {
+	firmware-name = "qcom/sm8150/xiaomi/nabu/venus.mbn";
+	status = "okay";
+};
+
 &ufs_mem_hc {
 	status = "okay";
 

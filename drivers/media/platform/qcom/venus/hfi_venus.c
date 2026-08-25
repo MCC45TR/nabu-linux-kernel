@@ -499,6 +499,11 @@ static int venus_boot_core(struct venus_hfi_device *hdev)
 	}
 
 	if (count >= max_tries)
+		dev_err(dev,
+			"diagnostic: Venus CPU boot timed out, ctrl_status=%#x\n",
+			ctrl_status);
+
+	if (count >= max_tries)
 		ret = -ETIMEDOUT;
 
 	if (IS_IRIS2(hdev->core) || IS_IRIS2_1(hdev->core) || IS_AR50_LITE(hdev->core)) {
@@ -665,19 +670,24 @@ static int venus_power_off(struct venus_hfi_device *hdev)
 
 static int venus_power_on(struct venus_hfi_device *hdev)
 {
+	struct device *dev = hdev->core->dev;
 	int ret;
 
 	if (hdev->power_enabled)
 		return 0;
 
+	dev_info(dev, "diagnostic: requesting secure hardware resume\n");
 	ret = venus_set_hw_state_resume(hdev->core);
 	if (ret)
 		goto err;
 
+	dev_info(dev, "diagnostic: secure hardware resume returned 0\n");
+	dev_info(dev, "diagnostic: programming HFI queues and starting CPU\n");
 	ret = venus_run(hdev);
 	if (ret)
 		goto err_suspend;
 
+	dev_info(dev, "diagnostic: Venus CPU started\n");
 	hdev->power_enabled = true;
 
 	return 0;

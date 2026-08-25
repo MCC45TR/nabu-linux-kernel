@@ -226,19 +226,26 @@ int venus_boot(struct venus_core *core)
 	if (ret)
 		fwpath = core->res->fwname;
 
+	dev_info(dev, "diagnostic: loading firmware '%s'\n", fwpath);
 	ret = venus_load_fw(core, fwpath, &mem_phys, &mem_size);
 	if (ret) {
-		dev_err(dev, "fail to load video firmware\n");
+		dev_err(dev, "diagnostic: firmware load failed: %d\n", ret);
 		return -EINVAL;
 	}
 
 	core->fw.mem_size = mem_size;
 	core->fw.mem_phys = mem_phys;
+	dev_info(dev, "diagnostic: firmware loaded at %pa, size %zu\n",
+		 &mem_phys, mem_size);
 
-	if (core->use_tz)
+	if (core->use_tz) {
+		dev_info(dev, "diagnostic: starting PAS authentication (id %u)\n",
+			 VENUS_PAS_ID);
 		ret = qcom_scm_pas_auth_and_reset(VENUS_PAS_ID);
-	else
+		dev_info(dev, "diagnostic: PAS authentication returned %d\n", ret);
+	} else {
 		ret = venus_boot_no_tz(core, mem_phys, mem_size);
+	}
 
 	if (ret)
 		return ret;
@@ -254,6 +261,7 @@ int venus_boot(struct venus_core *core)
 		 * cp_nonpixel_start = venus_sec_non_pixel/virtual-addr-pool[0]
 		 * cp_nonpixel_size = venus_sec_non_pixel/virtual-addr-pool[1]
 		 */
+		dev_info(dev, "diagnostic: configuring secure video ranges\n");
 		ret = qcom_scm_mem_protect_video_var(res->cp_start,
 						     res->cp_size,
 						     res->cp_nonpixel_start,
