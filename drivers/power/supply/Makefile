@@ -124,3 +124,4 @@ obj-$(CONFIG_BATTERY_QCOM_FG)	+= qcom_fg.o
 obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
 obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
 obj-$(CONFIG_CHARGER_IDTP9418)	+= idtp9418.o
+obj-$(CONFIG_CHARGER_LN8000)	+= ln8000_charger.o

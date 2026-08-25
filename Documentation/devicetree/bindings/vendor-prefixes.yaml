@@ -883,6 +883,8 @@ patternProperties:
     description: Linux-specific binding
   "^linx,.*":
     description: Linx Technologies
+  "^lionsemi,.*":
+    description: Lion Semiconductor Inc.
   "^liontron,.*":
     description: Shenzhen Liontron Technology Co., Ltd
   "^liteon,.*":

@@ -1092,4 +1092,15 @@ config CHARGER_IDTP9418
 	  charging in used in some Xiaomi tablet devices for recharging
 	  the stylus.
 
+config CHARGER_LN8000
+	tristate "Lion Semiconductor LN8000 direct charger"
+	depends on I2C
+	depends on POWER_SUPPLY
+	select REGMAP_I2C
+	help
+	  Enable support for the Lion Semiconductor LN8000 2:1 direct
+	  charger. The driver exposes voltage, current, die-temperature and
+	  protection state through the power-supply class and coordinates
+	  switching with a referenced USB Type-C/TCPM power supply.
+
 endif # POWER_SUPPLY
