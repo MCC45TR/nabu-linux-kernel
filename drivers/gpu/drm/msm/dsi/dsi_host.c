@@ -100,6 +100,7 @@ static int dsi_get_version(const void __iomem *base, u32 *major, u32 *minor)
 		 DSI_CLK_CTRL_FORCE_ON_DYN_AHBM_HCLK)
 
 /* DSI 6G v2.x timing shadow database used for porch-only DFPS updates. */
+#define REG_DSI_TIMING_DB_TRIGGER		0x01e4
 #define REG_DSI_TIMING_DB_MODE			0x01e8
 
 struct msm_dsi_host {
@@ -1219,9 +1220,24 @@ static void dsi_wait4video_done(struct msm_dsi_host *msm_host)
 
 static void dsi_wait4video_eng_busy(struct msm_dsi_host *msm_host)
 {
+	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	u32 data;
 
 	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
+		return;
+
+	/*
+	 * DSI 6G v1.2 and newer can hold a command DMA trigger until the
+	 * active video frame has finished.  dsi_host_config() enables that
+	 * behaviour with DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME.  Waiting for a
+	 * VIDEO_DONE interrupt in software as well is both redundant and
+	 * unreliable during a porch-only timing database switch: the interrupt
+	 * can belong to the frame which latched the new timing and be observed
+	 * before this waiter is armed.  Let the hardware place the command in
+	 * the following blanking interval instead.
+	 */
+	if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
+	    cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2)
 		return;
 
 	data = dsi_read(msm_host, REG_DSI_STATUS0);
@@ -2691,6 +2707,15 @@ int msm_dsi_host_stage_seamless(struct mipi_dsi_host *host,
 	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 1);
 	dsi_timing_setup(msm_host, is_bonded_dsi);
 	msm_host->mode = active_mode;
+
+	/*
+	 * Enabling the timing database only redirects timing writes to the
+	 * shadow bank.  DSI 6G requires a separate trigger at 0x1e4 to arm
+	 * those values for the next video frame boundary.  Without this write
+	 * DRM reports the new mode while scanout remains at the old refresh.
+	 */
+	wmb();
+	dsi_write(msm_host, REG_DSI_TIMING_DB_TRIGGER, 1);
 	wmb();
 	msm_host->seamless_staged = true;
 
