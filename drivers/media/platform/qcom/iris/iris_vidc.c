@@ -3,15 +3,20 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
+#include <linux/dma-buf.h>
+#include <linux/dma-fence.h>
+#include <linux/dma-resv.h>
 #include <linux/pm_runtime.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "iris_common.h"
 #include "iris_vidc.h"
 #include "iris_instance.h"
 #include "iris_vdec.h"
+#include "iris_venc.h"
 #include "iris_vb2.h"
 #include "iris_vpu_buffer.h"
 #include "iris_platform_common.h"
@@ -21,9 +26,160 @@
 #define STEP_WIDTH 1
 #define STEP_HEIGHT 1
 
+static bool allow_fw_boot;
+module_param(allow_fw_boot, bool, 0644);
+MODULE_PARM_DESC(allow_fw_boot,
+		 "Allow opening the video node to boot Iris firmware");
+
+static inline struct iris_inst *iris_get_inst(struct file *filp, void *fh)
+{
+	return container_of(filp->private_data, struct iris_inst, fh);
+}
+
+struct iris_surface_fence {
+	struct dma_fence base;
+	spinlock_t lock; /* protects dma_fence signaling state */
+	struct list_head list;
+	u64 token;
+};
+
+static const char *iris_surface_fence_get_name(struct dma_fence *fence)
+{
+	return "qcom-iris-cpu-copy";
+}
+
+static void iris_surface_fence_release(struct dma_fence *fence)
+{
+	struct iris_surface_fence *surface_fence =
+		container_of(fence, struct iris_surface_fence, base);
+
+	kfree(surface_fence);
+}
+
+static const struct dma_fence_ops iris_surface_fence_ops = {
+	.get_driver_name = iris_surface_fence_get_name,
+	.get_timeline_name = iris_surface_fence_get_name,
+	.release = iris_surface_fence_release,
+};
+
+static void iris_surface_fence_complete(struct iris_surface_fence *surface_fence)
+{
+	bool cookie;
+
+	cookie = dma_fence_begin_signalling();
+	dma_fence_signal(&surface_fence->base);
+	dma_fence_end_signalling(cookie);
+	dma_fence_put(&surface_fence->base);
+}
+
+static int iris_surface_fence_attach(struct iris_inst *inst,
+				     const struct iris_surface_fence_cmd *cmd)
+{
+	struct iris_surface_fence *surface_fence, *pending;
+	struct dma_buf *dmabuf;
+	int ret;
+
+	if (cmd->dmabuf_fd < 0 || !cmd->token)
+		return -EINVAL;
+
+	list_for_each_entry(pending, &inst->surface_fences, list)
+		if (pending->token == cmd->token)
+			return -EEXIST;
+
+	dmabuf = dma_buf_get(cmd->dmabuf_fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
+
+	surface_fence = kzalloc(sizeof(*surface_fence), GFP_KERNEL);
+	if (!surface_fence) {
+		ret = -ENOMEM;
+		goto put_dmabuf;
+	}
+
+	spin_lock_init(&surface_fence->lock);
+	surface_fence->token = cmd->token;
+	dma_fence_init(&surface_fence->base, &iris_surface_fence_ops,
+		       &surface_fence->lock, inst->surface_fence_context,
+		       ++inst->surface_fence_seqno);
+
+	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
+	if (ret)
+		goto put_fence;
+	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
+	if (!ret)
+		dma_resv_add_fence(dmabuf->resv, &surface_fence->base,
+				   DMA_RESV_USAGE_WRITE);
+	dma_resv_unlock(dmabuf->resv);
+	if (ret)
+		goto put_fence;
+
+	list_add_tail(&surface_fence->list, &inst->surface_fences);
+	dma_buf_put(dmabuf);
+	return 0;
+
+put_fence:
+	dma_fence_put(&surface_fence->base);
+put_dmabuf:
+	dma_buf_put(dmabuf);
+	return ret;
+}
+
+static int iris_surface_fence_signal(struct iris_inst *inst, u64 token)
+{
+	struct iris_surface_fence *surface_fence;
+
+	list_for_each_entry(surface_fence, &inst->surface_fences, list) {
+		if (surface_fence->token != token)
+			continue;
+		list_del(&surface_fence->list);
+		iris_surface_fence_complete(surface_fence);
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+static void iris_surface_fence_signal_all(struct iris_inst *inst)
+{
+	struct iris_surface_fence *surface_fence, *next;
+
+	list_for_each_entry_safe(surface_fence, next,
+				 &inst->surface_fences, list) {
+		list_del(&surface_fence->list);
+		iris_surface_fence_complete(surface_fence);
+	}
+}
+
+static long iris_vidioc_default(struct file *file, void *fh, bool valid_prio,
+				unsigned int cmd, void *arg)
+{
+	struct iris_surface_fence_cmd *fence_cmd = arg;
+	struct iris_inst *inst = iris_get_inst(file, fh);
+	int ret;
+
+	if (cmd != VIDIOC_IRIS_SURFACE_FENCE || inst->domain != DECODER)
+		return -ENOTTY;
+	if (!valid_prio)
+		return -EBUSY;
+
+	mutex_lock(&inst->lock);
+	if (fence_cmd->op == IRIS_SURFACE_FENCE_ATTACH)
+		ret = iris_surface_fence_attach(inst, fence_cmd);
+	else if (fence_cmd->op == IRIS_SURFACE_FENCE_SIGNAL)
+		ret = iris_surface_fence_signal(inst, fence_cmd->token);
+	else
+		ret = -EINVAL;
+	mutex_unlock(&inst->lock);
+
+	return ret;
+}
+
 static void iris_v4l2_fh_init(struct iris_inst *inst)
 {
-	v4l2_fh_init(&inst->fh, inst->core->vdev_dec);
+	if (inst->domain == ENCODER)
+		v4l2_fh_init(&inst->fh, inst->core->vdev_enc);
+	else if (inst->domain == DECODER)
+		v4l2_fh_init(&inst->fh, inst->core->vdev_dec);
 	inst->fh.ctrl_handler = &inst->ctrl_handler;
 	v4l2_fh_add(&inst->fh);
 }
@@ -38,38 +194,19 @@ static void iris_v4l2_fh_deinit(struct iris_inst *inst)
 static void iris_add_session(struct iris_inst *inst)
 {
 	struct iris_core *core = inst->core;
-	struct iris_inst *iter;
-	u32 count = 0;
 
 	mutex_lock(&core->lock);
-
-	list_for_each_entry(iter, &core->instances, list)
-		count++;
-
-	if (count < core->iris_platform_data->max_session_count)
-		list_add_tail(&inst->list, &core->instances);
-
+	list_add_tail(&inst->list, &core->instances);
 	mutex_unlock(&core->lock);
 }
 
 static void iris_remove_session(struct iris_inst *inst)
 {
 	struct iris_core *core = inst->core;
-	struct iris_inst *iter, *temp;
 
 	mutex_lock(&core->lock);
-	list_for_each_entry_safe(iter, temp, &core->instances, list) {
-		if (iter->session_id == inst->session_id) {
-			list_del_init(&iter->list);
-			break;
-		}
-	}
+	list_del_init(&inst->list);
 	mutex_unlock(&core->lock);
-}
-
-static inline struct iris_inst *iris_get_inst(struct file *filp, void *fh)
-{
-	return container_of(filp->private_data, struct iris_inst, fh);
 }
 
 static void iris_m2m_device_run(void *priv)
@@ -126,8 +263,21 @@ iris_m2m_queue_init(void *priv, struct vb2_queue *src_vq, struct vb2_queue *dst_
 int iris_open(struct file *filp)
 {
 	struct iris_core *core = video_drvdata(filp);
+	struct video_device *vdev;
 	struct iris_inst *inst;
+	u32 session_type;
 	int ret;
+
+	if (!READ_ONCE(allow_fw_boot))
+		return -EACCES;
+
+	vdev = video_devdata(filp);
+	if (strcmp(vdev->name, "qcom-iris-decoder") == 0)
+		session_type = DECODER;
+	else if (strcmp(vdev->name, "qcom-iris-encoder") == 0)
+		session_type = ENCODER;
+	else
+		return -EINVAL;
 
 	ret = pm_runtime_resume_and_get(core->dev);
 	if (ret < 0)
@@ -147,8 +297,12 @@ int iris_open(struct file *filp)
 		return -ENOMEM;
 
 	inst->core = core;
+	inst->domain = session_type;
 	inst->session_id = hash32_ptr(inst);
 	inst->state = IRIS_INST_DEINIT;
+	INIT_LIST_HEAD(&inst->list);
+	INIT_LIST_HEAD(&inst->surface_fences);
+	inst->surface_fence_context = dma_fence_context_alloc(1);
 
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
@@ -161,6 +315,8 @@ int iris_open(struct file *filp)
 	INIT_LIST_HEAD(&inst->buffers[BUF_DPB].list);
 	INIT_LIST_HEAD(&inst->buffers[BUF_PERSIST].list);
 	INIT_LIST_HEAD(&inst->buffers[BUF_SCRATCH_1].list);
+	INIT_LIST_HEAD(&inst->buffers[BUF_SCRATCH_2].list);
+	INIT_LIST_HEAD(&inst->buffers[BUF_VPSS].list);
 	init_completion(&inst->completion);
 	init_completion(&inst->flush_completion);
 
@@ -178,7 +334,10 @@ int iris_open(struct file *filp)
 		goto fail_m2m_release;
 	}
 
-	ret = iris_vdec_inst_init(inst);
+	if (inst->domain == DECODER)
+		ret = iris_vdec_inst_init(inst);
+	else if (inst->domain == ENCODER)
+		ret = iris_venc_inst_init(inst);
 	if (ret)
 		goto fail_m2m_ctx_release;
 
@@ -202,25 +361,6 @@ fail_v4l2_fh_deinit:
 	return ret;
 }
 
-static void iris_session_close(struct iris_inst *inst)
-{
-	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
-	bool wait_for_response = true;
-	int ret;
-
-	if (inst->state == IRIS_INST_DEINIT)
-		return;
-
-	reinit_completion(&inst->completion);
-
-	ret = hfi_ops->session_close(inst);
-	if (ret)
-		wait_for_response = false;
-
-	if (wait_for_response)
-		iris_wait_for_session_response(inst, false);
-}
-
 static void iris_check_num_queued_internal_buffers(struct iris_inst *inst, u32 plane)
 {
 	const struct iris_platform_data *platform_data = inst->core->iris_platform_data;
@@ -240,25 +380,40 @@ static void iris_check_num_queued_internal_buffers(struct iris_inst *inst, u32 p
 
 	for (i = 0; i < internal_buffer_count; i++) {
 		buffers = &inst->buffers[internal_buf_type[i]];
+		count = 0;
 		list_for_each_entry_safe(buf, next, &buffers->list, list)
 			count++;
 		if (count)
 			dev_err(inst->core->dev, "%d buffer of type %d not released",
 				count, internal_buf_type[i]);
 	}
+
+	if (inst->domain == DECODER)
+		buffers = &inst->buffers[BUF_PERSIST];
+	else
+		buffers = &inst->buffers[BUF_ARP];
+
+	count = 0;
+	list_for_each_entry_safe(buf, next, &buffers->list, list)
+		count++;
+	if (count)
+		dev_err(inst->core->dev, "%d buffer of type %d not released",
+			count, inst->domain == DECODER ? BUF_PERSIST : BUF_ARP);
 }
 
 int iris_close(struct file *filp)
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
 
+	mutex_lock(&inst->lock);
+	iris_surface_fence_signal_all(inst);
+	mutex_unlock(&inst->lock);
+
 	v4l2_ctrl_handler_free(&inst->ctrl_handler);
 	v4l2_m2m_ctx_release(inst->m2m_ctx);
 	v4l2_m2m_release(inst->m2m_dev);
 	mutex_lock(&inst->lock);
-	iris_vdec_inst_deinit(inst);
-	iris_session_close(inst);
-	iris_inst_change_state(inst, IRIS_INST_DEINIT);
+	iris_hfi_session_close(inst);
 	iris_v4l2_fh_deinit(inst);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
@@ -266,6 +421,10 @@ int iris_close(struct file *filp)
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	iris_remove_session(inst);
 	mutex_unlock(&inst->lock);
+	if (inst->domain == DECODER)
+		iris_vdec_inst_deinit(inst);
+	else if (inst->domain == ENCODER)
+		iris_venc_inst_deinit(inst);
 	mutex_destroy(&inst->ctx_q_lock);
 	mutex_destroy(&inst->lock);
 	kfree(inst);
@@ -278,16 +437,26 @@ static int iris_enum_fmt(struct file *filp, void *fh, struct v4l2_fmtdesc *f)
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
 
-	return iris_vdec_enum_fmt(inst, f);
+	if (inst->domain == DECODER)
+		return iris_vdec_enum_fmt(inst, f);
+	else if (inst->domain == ENCODER)
+		return iris_venc_enum_fmt(inst, f);
+	else
+		return -EINVAL;
 }
 
 static int iris_try_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format *f)
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&inst->lock);
-	ret = iris_vdec_try_fmt(inst, f);
+
+	if (inst->domain == DECODER)
+		ret = iris_vdec_try_fmt(inst, f);
+	else if (inst->domain == ENCODER)
+		ret = iris_venc_try_fmt(inst, f);
+
 	mutex_unlock(&inst->lock);
 
 	return ret;
@@ -296,10 +465,15 @@ static int iris_try_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_form
 static int iris_s_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format *f)
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
-	int ret;
+	int ret = 0;
 
 	mutex_lock(&inst->lock);
-	ret = iris_vdec_s_fmt(inst, f);
+
+	if (inst->domain == DECODER)
+		ret = iris_vdec_s_fmt(inst, f);
+	else if (inst->domain == ENCODER)
+		ret = iris_venc_s_fmt(inst, f);
+
 	mutex_unlock(&inst->lock);
 
 	return ret;
@@ -328,13 +502,18 @@ static int iris_enum_framesizes(struct file *filp, void *fh,
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
 	struct platform_inst_caps *caps;
+	int ret = 0;
 
 	if (fsize->index)
 		return -EINVAL;
 
-	if (fsize->pixel_format != V4L2_PIX_FMT_H264 &&
-	    fsize->pixel_format != V4L2_PIX_FMT_NV12)
-		return -EINVAL;
+	if (inst->domain == DECODER)
+		ret = iris_vdec_validate_format(inst, fsize->pixel_format);
+	else
+		ret = iris_venc_validate_format(inst, fsize->pixel_format);
+
+	if (ret)
+		return ret;
 
 	caps = inst->core->iris_platform_data->inst_caps;
 
@@ -346,13 +525,64 @@ static int iris_enum_framesizes(struct file *filp, void *fh,
 	fsize->stepwise.max_height = caps->max_frame_height;
 	fsize->stepwise.step_height = STEP_HEIGHT;
 
+	return ret;
+}
+
+static int iris_enum_frameintervals(struct file *filp, void *fh,
+				    struct v4l2_frmivalenum *fival)
+
+{
+	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_core *core = inst->core;
+	struct platform_inst_caps *caps;
+	u32 fps, mbpf;
+	int ret = 0;
+
+	if (inst->domain == DECODER)
+		return -ENOTTY;
+
+	if (fival->index)
+		return -EINVAL;
+
+	ret = iris_venc_validate_format(inst, fival->pixel_format);
+	if (ret)
+		return ret;
+
+	if (!fival->width || !fival->height)
+		return -EINVAL;
+
+	caps = inst->core->iris_platform_data->inst_caps;
+	if (fival->width > caps->max_frame_width ||
+	    fival->width < caps->min_frame_width ||
+	    fival->height > caps->max_frame_height ||
+	    fival->height < caps->min_frame_height)
+		return -EINVAL;
+
+	mbpf = NUM_MBS_PER_FRAME(fival->height, fival->width);
+	fps = DIV_ROUND_UP(core->iris_platform_data->max_core_mbps, mbpf);
+
+	fival->type = V4L2_FRMIVAL_TYPE_STEPWISE;
+	fival->stepwise.min.numerator = 1;
+	fival->stepwise.min.denominator =
+			min_t(u32, fps, MAXIMUM_FPS);
+	fival->stepwise.max.numerator = 1;
+	fival->stepwise.max.denominator = 1;
+	fival->stepwise.step.numerator = 1;
+	fival->stepwise.step.denominator = MAXIMUM_FPS;
+
 	return 0;
 }
 
 static int iris_querycap(struct file *filp, void *fh, struct v4l2_capability *cap)
 {
+	struct iris_inst *inst = iris_get_inst(filp, NULL);
+
 	strscpy(cap->driver, IRIS_DRV_NAME, sizeof(cap->driver));
-	strscpy(cap->card, "Iris Decoder", sizeof(cap->card));
+
+	if (inst->domain == DECODER)
+		strscpy(cap->card, "Iris Decoder", sizeof(cap->card));
+	else
+		strscpy(cap->card, "Iris Encoder", sizeof(cap->card));
 
 	return 0;
 }
@@ -361,34 +591,102 @@ static int iris_g_selection(struct file *filp, void *fh, struct v4l2_selection *
 {
 	struct iris_inst *inst = iris_get_inst(filp, NULL);
 
-	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
+	    inst->domain == DECODER)
 		return -EINVAL;
 
-	switch (s->target) {
-	case V4L2_SEL_TGT_CROP_BOUNDS:
-	case V4L2_SEL_TGT_CROP_DEFAULT:
-	case V4L2_SEL_TGT_CROP:
-	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
-	case V4L2_SEL_TGT_COMPOSE_PADDED:
-	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
-	case V4L2_SEL_TGT_COMPOSE:
+	if (s->type != V4L2_BUF_TYPE_VIDEO_OUTPUT &&
+	    inst->domain == ENCODER)
+		return -EINVAL;
+
+	if (inst->domain == DECODER) {
+		switch (s->target) {
+		case V4L2_SEL_TGT_CROP_BOUNDS:
+		case V4L2_SEL_TGT_CROP_DEFAULT:
+		case V4L2_SEL_TGT_CROP:
+		case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+		case V4L2_SEL_TGT_COMPOSE_PADDED:
+		case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+		case V4L2_SEL_TGT_COMPOSE:
+			s->r.left = inst->crop.left;
+			s->r.top = inst->crop.top;
+			s->r.width = inst->crop.width;
+			s->r.height = inst->crop.height;
+			break;
+		default:
+			return -EINVAL;
+		}
+	} else if (inst->domain == ENCODER) {
+		switch (s->target) {
+		case V4L2_SEL_TGT_CROP_BOUNDS:
+		case V4L2_SEL_TGT_CROP_DEFAULT:
+			s->r.width = inst->fmt_src->fmt.pix_mp.width;
+			s->r.height = inst->fmt_src->fmt.pix_mp.height;
+			break;
+		case V4L2_SEL_TGT_CROP:
+			s->r.width = inst->crop.width;
+			s->r.height = inst->crop.height;
+			break;
+		default:
+			return -EINVAL;
+		}
 		s->r.left = inst->crop.left;
 		s->r.top = inst->crop.top;
-		s->r.width = inst->crop.width;
-		s->r.height = inst->crop.height;
-		break;
-	default:
-		return -EINVAL;
 	}
 
 	return 0;
+}
+
+static int iris_s_selection(struct file *filp, void *fh, struct v4l2_selection *s)
+{
+	struct iris_inst *inst = iris_get_inst(filp, NULL);
+
+	if (inst->domain == DECODER)
+		return -EINVAL;
+	else if (inst->domain == ENCODER)
+		return iris_venc_s_selection(inst, s);
+
+	return -EINVAL;
 }
 
 static int iris_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subscription *sub)
 {
 	struct iris_inst *inst = container_of(fh, struct iris_inst, fh);
 
-	return iris_vdec_subscribe_event(inst, sub);
+	if (inst->domain == DECODER)
+		return iris_vdec_subscribe_event(inst, sub);
+	else if (inst->domain == ENCODER)
+		return iris_venc_subscribe_event(inst, sub);
+
+	return -EINVAL;
+}
+
+static int iris_s_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
+{
+	struct iris_inst *inst = container_of(fh, struct iris_inst, fh);
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+	    a->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		return -EINVAL;
+
+	if (inst->domain == ENCODER)
+		return iris_venc_s_param(inst, a);
+	else
+		return -EINVAL;
+}
+
+static int iris_g_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
+{
+	struct iris_inst *inst = container_of(fh, struct iris_inst, fh);
+
+	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
+	    a->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
+		return -EINVAL;
+
+	if (inst->domain == ENCODER)
+		return iris_venc_g_param(inst, a);
+	else
+		return -EINVAL;
 }
 
 static int iris_dec_cmd(struct file *filp, void *fh,
@@ -399,9 +697,10 @@ static int iris_dec_cmd(struct file *filp, void *fh,
 
 	mutex_lock(&inst->lock);
 
-	ret = v4l2_m2m_ioctl_decoder_cmd(filp, fh, dec);
-	if (ret)
+	if (dec->cmd != V4L2_DEC_CMD_STOP && dec->cmd != V4L2_DEC_CMD_START) {
+		ret = -EINVAL;
 		goto unlock;
+	}
 
 	if (inst->state == IRIS_INST_DEINIT)
 		goto unlock;
@@ -415,6 +714,40 @@ static int iris_dec_cmd(struct file *filp, void *fh,
 		ret = iris_vdec_start_cmd(inst);
 	else if (dec->cmd == V4L2_DEC_CMD_STOP)
 		ret = iris_vdec_stop_cmd(inst);
+	else
+		ret = -EINVAL;
+
+unlock:
+	mutex_unlock(&inst->lock);
+
+	return ret;
+}
+
+static int iris_enc_cmd(struct file *filp, void *fh,
+			struct v4l2_encoder_cmd *enc)
+{
+	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	int ret = 0;
+
+	mutex_lock(&inst->lock);
+
+	if (enc->cmd != V4L2_ENC_CMD_STOP && enc->cmd != V4L2_ENC_CMD_START) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	if (inst->state == IRIS_INST_DEINIT)
+		goto unlock;
+
+	if (!iris_allow_cmd(inst, enc->cmd)) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	if (enc->cmd == V4L2_ENC_CMD_START)
+		ret = iris_venc_start_cmd(inst);
+	else if (enc->cmd == V4L2_ENC_CMD_STOP)
+		ret = iris_venc_stop_cmd(inst);
 	else
 		ret = -EINVAL;
 
@@ -443,7 +776,7 @@ static const struct vb2_ops iris_vb2_ops = {
 	.buf_queue                      = iris_vb2_buf_queue,
 };
 
-static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops = {
+static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops_dec = {
 	.vidioc_enum_fmt_vid_cap        = iris_enum_fmt,
 	.vidioc_enum_fmt_vid_out        = iris_enum_fmt,
 	.vidioc_try_fmt_vid_cap_mplane  = iris_try_fmt_vid_mplane,
@@ -469,11 +802,45 @@ static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops = {
 	.vidioc_streamoff               = v4l2_m2m_ioctl_streamoff,
 	.vidioc_try_decoder_cmd         = v4l2_m2m_ioctl_try_decoder_cmd,
 	.vidioc_decoder_cmd             = iris_dec_cmd,
+	.vidioc_default                 = iris_vidioc_default,
+};
+
+static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops_enc = {
+	.vidioc_enum_fmt_vid_cap        = iris_enum_fmt,
+	.vidioc_enum_fmt_vid_out        = iris_enum_fmt,
+	.vidioc_try_fmt_vid_cap_mplane  = iris_try_fmt_vid_mplane,
+	.vidioc_try_fmt_vid_out_mplane  = iris_try_fmt_vid_mplane,
+	.vidioc_s_fmt_vid_cap_mplane    = iris_s_fmt_vid_mplane,
+	.vidioc_s_fmt_vid_out_mplane    = iris_s_fmt_vid_mplane,
+	.vidioc_g_fmt_vid_cap_mplane    = iris_g_fmt_vid_mplane,
+	.vidioc_g_fmt_vid_out_mplane    = iris_g_fmt_vid_mplane,
+	.vidioc_enum_framesizes         = iris_enum_framesizes,
+	.vidioc_enum_frameintervals     = iris_enum_frameintervals,
+	.vidioc_querycap                = iris_querycap,
+	.vidioc_subscribe_event         = iris_subscribe_event,
+	.vidioc_unsubscribe_event       = v4l2_event_unsubscribe,
+	.vidioc_g_selection             = iris_g_selection,
+	.vidioc_s_selection             = iris_s_selection,
+	.vidioc_s_parm                  = iris_s_parm,
+	.vidioc_g_parm                  = iris_g_parm,
+	.vidioc_streamon                = v4l2_m2m_ioctl_streamon,
+	.vidioc_streamoff               = v4l2_m2m_ioctl_streamoff,
+	.vidioc_reqbufs                 = v4l2_m2m_ioctl_reqbufs,
+	.vidioc_querybuf                = v4l2_m2m_ioctl_querybuf,
+	.vidioc_create_bufs             = v4l2_m2m_ioctl_create_bufs,
+	.vidioc_prepare_buf             = v4l2_m2m_ioctl_prepare_buf,
+	.vidioc_expbuf                  = v4l2_m2m_ioctl_expbuf,
+	.vidioc_qbuf                    = v4l2_m2m_ioctl_qbuf,
+	.vidioc_dqbuf                   = v4l2_m2m_ioctl_dqbuf,
+	.vidioc_remove_bufs             = v4l2_m2m_ioctl_remove_bufs,
+	.vidioc_try_encoder_cmd         = v4l2_m2m_ioctl_try_encoder_cmd,
+	.vidioc_encoder_cmd             = iris_enc_cmd,
 };
 
 void iris_init_ops(struct iris_core *core)
 {
 	core->iris_v4l2_file_ops = &iris_v4l2_file_ops;
 	core->iris_vb2_ops = &iris_vb2_ops;
-	core->iris_v4l2_ioctl_ops = &iris_v4l2_ioctl_ops;
+	core->iris_v4l2_ioctl_ops_dec = &iris_v4l2_ioctl_ops_dec;
+	core->iris_v4l2_ioctl_ops_enc = &iris_v4l2_ioctl_ops_enc;
 }
