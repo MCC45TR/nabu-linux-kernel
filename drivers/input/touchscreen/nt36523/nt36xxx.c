@@ -54,6 +54,10 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
 
+#define GESTURE_DOUBLE_CLICK 15
+#define DATA_PROTOCOL 30
+#define FUNCPAGE_GESTURE 1
+
 uint32_t ENG_RST_ADDR  = 0x7FFF80;
 uint32_t SWRST_N8_ADDR = 0; //read from dtsi
 uint32_t SPI_RD_FAST_ADDR = 0;	//read from dtsi
@@ -686,6 +690,16 @@ static int32_t nvt_parse_dt(struct device *dev)
 	ts->wgp_stylus = of_property_read_bool(np, "novatek,wgp-stylus");
 	NVT_LOG("novatek,wgp-stylus=%d\n", ts->wgp_stylus);
 
+	ts->wakeup_source = of_property_read_bool(np, "wakeup-source");
+	ts->db_wakeup = of_property_read_bool(np,
+					      "novatek,double-tap-to-wake");
+	if (ts->db_wakeup && !ts->wakeup_source) {
+		NVT_ERR("double tap requested without wakeup-source; disabling\n");
+		ts->db_wakeup = 0;
+	}
+	NVT_LOG("double-tap-to-wake=%d, wakeup-source=%d\n",
+		ts->db_wakeup, ts->wakeup_source);
+
 	ret = of_property_read_u32(np, "novatek,swrst-n8-addr", &SWRST_N8_ADDR);
 	if (ret) {
 		NVT_ERR("error reading novatek,swrst-n8-addr. ret=%d\n", ret);
@@ -997,6 +1011,30 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 #if NVT_TOUCH_ESD_PROTECT
 		nvt_esd_check_enable(true);
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
+		goto XFER_ERROR;
+	}
+
+	/*
+	 * In low-power gesture mode the first report byte carries the gesture
+	 * identifier rather than a finger slot.  Nabu firmware reports double
+	 * tap either directly as ID 15 or through protocol page 1.
+	 */
+	if (!bTouchIsAwake && ts->db_wakeup) {
+		uint8_t gesture_id = point_data[1] >> 3;
+
+		if (gesture_id == DATA_PROTOCOL &&
+		    point_data[2] == FUNCPAGE_GESTURE)
+			gesture_id = point_data[3];
+
+		if (gesture_id == GESTURE_DOUBLE_CLICK) {
+			NVT_LOG("Gesture: double tap wakeup\n");
+			pm_wakeup_event(&ts->client->dev, 5000);
+			input_report_key(ts->input_dev, KEY_WAKEUP, 1);
+			input_sync(ts->input_dev);
+			input_report_key(ts->input_dev, KEY_WAKEUP, 0);
+			input_sync(ts->input_dev);
+		}
+
 		goto XFER_ERROR;
 	}
 
@@ -1348,7 +1386,6 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ts->input_dev->keybit[BIT_WORD(BTN_TOUCH)] = BIT_MASK(BTN_TOUCH);
 	ts->input_dev->propbit[0] = BIT(INPUT_PROP_DIRECT);
 
-	ts->db_wakeup = 0;
 	ts->fw_ver = 0;
 	ts->x_num = 32;
 	ts->y_num = 50;
@@ -1390,6 +1427,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ts->input_dev->name = NVT_TS_NAME;
 	ts->input_dev->phys = ts->phys;
 	ts->input_dev->id.bustype = BUS_SPI;
+	input_set_capability(ts->input_dev, EV_KEY, KEY_WAKEUP);
 
 	//---register input device---
 	ret = input_register_device(ts->input_dev);
@@ -1520,6 +1558,13 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	}
 #endif
 
+	ret = device_init_wakeup(&client->dev, ts->wakeup_source);
+	if (ret) {
+		NVT_ERR("failed to initialize wakeup source: %d\n", ret);
+		ts->wakeup_source = false;
+		ts->db_wakeup = 0;
+	}
+
 	bTouchIsAwake = 1;
 	disable_pen_input_device(false);
 	NVT_LOG("end\n");
@@ -1617,6 +1662,9 @@ static void nvt_ts_remove(struct spi_device *client)
 #endif
 
 	nvt_irq_enable(false);
+	if (ts->irq_wake_enabled)
+		disable_irq_wake(client->irq);
+	device_init_wakeup(&client->dev, false);
 	free_irq(client->irq, ts);
 
 	mutex_destroy(&ts->xbuf_lock);
@@ -1649,6 +1697,10 @@ static void nvt_ts_shutdown(struct spi_device *client)
 	NVT_LOG("Shutdown driver...\n");
 
 	nvt_irq_enable(false);
+	if (ts->irq_wake_enabled) {
+		disable_irq_wake(client->irq);
+		ts->irq_wake_enabled = false;
+	}
 
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
@@ -1715,15 +1767,14 @@ static int32_t nvt_ts_suspend(struct device *dev)
 
 	if (ts->db_wakeup) {
 		/*---write command to enter "wakeup gesture mode"---*/
-		/*DoubleClick wakeup CMD was sent by display to meet timing*/
-		/*
 		buf[0] = EVENT_MAP_HOST_CMD;
 		buf[1] = 0x13;
-		CTP_SPI_WRITE(ts->client, buf, 2);
-		*/
-		enable_irq_wake(ts->client->irq);
-
-		NVT_LOG("Enabled touch wakeup gesture\n");
+		if (CTP_SPI_WRITE(ts->client, buf, 2) < 0) {
+			NVT_ERR("failed to enter wakeup gesture mode\n");
+			nvt_irq_enable(false);
+		} else {
+			NVT_LOG("Enabled touch wakeup gesture\n");
+		}
 	} else {
 		/*---write command to enter "deep sleep mode"---*/
 		buf[0] = EVENT_MAP_HOST_CMD;
@@ -1794,7 +1845,7 @@ static int32_t nvt_ts_resume(struct device *dev)
 
 	nvt_check_fw_reset_state(RESET_STATE_REK);
 
-	if (!ts->db_wakeup && !ts->irq_enabled) {
+	if (!ts->irq_enabled) {
 		nvt_irq_enable(true);
 	}
 
@@ -1857,9 +1908,15 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 
 static int nvt_pm_suspend(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->db_wakeup) {
+	int ret;
+
+	if (device_may_wakeup(dev) && ts->db_wakeup &&
+	    !ts->irq_wake_enabled) {
 		NVT_LOG("enable touch irq wake\n");
-		enable_irq_wake(ts->client->irq);
+		ret = enable_irq_wake(ts->client->irq);
+		if (ret)
+			return ret;
+		ts->irq_wake_enabled = true;
 	}
 	ts->dev_pm_suspend = true;
 	reinit_completion(&ts->dev_pm_suspend_completion);
@@ -1869,9 +1926,10 @@ static int nvt_pm_suspend(struct device *dev)
 
 static int nvt_pm_resume(struct device *dev)
 {
-	if (device_may_wakeup(dev) && ts->db_wakeup) {
+	if (ts->irq_wake_enabled) {
 		NVT_LOG("disable touch irq wake\n");
 		disable_irq_wake(ts->client->irq);
+		ts->irq_wake_enabled = false;
 	}
 	ts->dev_pm_suspend = false;
 	complete(&ts->dev_pm_suspend_completion);

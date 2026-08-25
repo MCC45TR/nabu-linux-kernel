@@ -1264,20 +1264,26 @@ static int nt36523_sync_pen_fps(struct panel_info *pinfo, bool panel_init)
 				     "no pen synchronization command for %u Hz\n",
 				     pinfo->refresh_rate);
 
+	/*
+	 * Xiaomi only provides TDDI scan commands for the stock 60 and 120 Hz
+	 * modes.  Writing either vendor value while the additional 90 Hz VFP
+	 * timing is active resets the NVT firmware.  Keep its current scan band
+	 * at 90 Hz; boot initialization is 120 Hz and 60/120 retain the exact
+	 * downstream commands.
+	 */
+	if (pinfo->refresh_rate == 90) {
+		dev_info(pinfo->panel.dev,
+			 "kept existing touch scan band for 90 Hz\n");
+		return 0;
+	}
+
 	/* Xiaomi's downstream panel commands synchronize the TDDI scan rate. */
 	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
 	/* The vendor's live sync sequence omits the page-unlock write. */
 	if (panel_init)
 		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
 						  0xfb, 0x01);
-	/*
-	 * Xiaomi only defines TDDI scan bands for the stock 60 and 120 Hz
-	 * modes.  Nabu's additional 90 Hz VFP mode must use the lower band:
-	 * issuing the 120 Hz value (0x0d) after the 90 Hz timing latch resets
-	 * the NVT touch firmware and leaves the compositor confirmation dialog
-	 * without touch input.
-	 */
-	if (pinfo->refresh_rate == 60 || pinfo->refresh_rate == 90)
+	if (pinfo->refresh_rate == 60)
 		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
 						  0x23, 0x0c);
 	else

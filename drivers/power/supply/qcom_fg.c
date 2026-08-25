@@ -926,9 +926,14 @@ static int qcom_fg_get_property(struct power_supply *psy,
 				val->intval = POWER_SUPPLY_STATUS_UNKNOWN;
 				break;
 			}
-			if (temp < 0)
+			/*
+			 * qcom_fg_get_current() follows the PSY convention:
+			 * positive current charges the battery, negative current
+			 * discharges it.
+			 */
+			if (temp > 0)
 				val->intval = POWER_SUPPLY_STATUS_CHARGING;
-			else if (temp > 0)
+			else if (temp < 0)
 				val->intval = POWER_SUPPLY_STATUS_DISCHARGING;
 			else
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
@@ -1129,10 +1134,11 @@ static int qcom_fg_notifier_call(struct notifier_block *nb, unsigned long val,
 	if (psy == chip->chg_psy) {
 		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS,
 						&propval);
-		if (ret)
+		if (ret) {
 			chip->status = POWER_SUPPLY_STATUS_UNKNOWN;
-
-		chip->status = propval.intval;
+		} else {
+			chip->status = propval.intval;
+		}
 
 		power_supply_changed(chip->batt_psy);
 
@@ -1335,8 +1341,15 @@ static int qcom_fg_probe(struct platform_device *pdev)
 	}
 
 	if (chip->chg_psy) {
+		union power_supply_propval propval;
+
 		INIT_DELAYED_WORK(&chip->status_changed_work,
 				  qcom_fg_status_changed_worker);
+
+		ret = power_supply_get_property(chip->chg_psy,
+						POWER_SUPPLY_PROP_STATUS,
+						&propval);
+		chip->status = ret ? POWER_SUPPLY_STATUS_UNKNOWN : propval.intval;
 
 		chip->nb.notifier_call = qcom_fg_notifier_call;
 		ret = power_supply_reg_notifier(&chip->nb);
