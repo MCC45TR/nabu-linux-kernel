@@ -32,6 +32,7 @@ struct panel_info {
 	struct gpio_desc *reset_gpio;
 	struct backlight_device *backlight;
 	struct regulator *vddio;
+	unsigned int refresh_rate;
 };
 
 struct panel_desc {
@@ -50,6 +51,7 @@ struct panel_desc {
 
 	bool is_dual_dsi;
 	bool has_dcs_backlight;
+	bool sync_pen_fps;
 };
 
 static inline struct panel_info *to_panel_info(struct drm_panel *panel)
@@ -1116,6 +1118,21 @@ static const struct drm_display_mode elish_csot_modes[] = {
 
 static const struct drm_display_mode nabu_csot_modes[] = {
 	{
+		/*
+		 * The downstream driver keeps the 120 Hz pixel clock and lowers
+		 * the refresh rate by extending VFP from 26 to 2784 lines.
+		 */
+		.clock = (1600 + 88 + 40 + 40) * (2560 + 2784 + 4 + 168) * 60 / 1000,
+		.hdisplay = 1600,
+		.hsync_start = 1600 + 88,
+		.hsync_end = 1600 + 88 + 40,
+		.htotal = 1600 + 88 + 40 + 40,
+		.vdisplay = 2560,
+		.vsync_start = 2560 + 2784,
+		.vsync_end = 2560 + 2784 + 4,
+		.vtotal = 2560 + 2784 + 4 + 168,
+	},
+	{
 		.clock = (1600 + 88 + 40 + 40) * (2560 + 26 + 4 + 168) * 120 / 1000,
 		.hdisplay = 1600,
 		.hsync_start = 1600 + 88,
@@ -1196,6 +1213,7 @@ static const struct panel_desc nabu_csot_desc = {
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM,
 	.init_sequence = nabu_csot_init_sequence,
 	.is_dual_dsi = true,
+	.sync_pen_fps = true,
 };
 
 static const struct panel_desc j606f_boe_desc = {
@@ -1224,6 +1242,47 @@ static void nt36523_reset(struct panel_info *pinfo)
 	usleep_range(12000, 13000);
 }
 
+static int nt36523_sync_pen_fps(struct panel_info *pinfo)
+{
+	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
+	struct mipi_dsi_device *dsi1 = pinfo->dsi[1];
+	struct mipi_dsi_multi_context dsi_ctx = { .dsi = NULL };
+
+	if (pinfo->refresh_rate != 60 && pinfo->refresh_rate != 120)
+		return dev_err_probe(pinfo->panel.dev, -EINVAL,
+				     "no pen synchronization command for %u Hz\n",
+				     pinfo->refresh_rate);
+
+	/* Xiaomi's downstream panel commands synchronize the TDDI scan rate. */
+	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x2a);
+	if (pinfo->refresh_rate == 60)
+		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+						  0x23, 0x0c);
+	else
+		mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1,
+						  0x23, 0x0d);
+	mipi_dsi_dual_dcs_write_seq_multi(dsi_ctx, dsi0, dsi1, 0xff, 0x10);
+
+	if (dsi_ctx.accum_err)
+		dev_err(pinfo->panel.dev,
+			"failed to synchronize pen scan rate for %u Hz: %d\n",
+			pinfo->refresh_rate, dsi_ctx.accum_err);
+	else
+		dev_info(pinfo->panel.dev,
+			 "synchronized pen scan rate for %u Hz\n",
+			 pinfo->refresh_rate);
+
+	return dsi_ctx.accum_err;
+}
+
+static void nt36523_mode_set(struct drm_panel *panel,
+			     const struct drm_display_mode *mode)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	pinfo->refresh_rate = drm_mode_vrefresh(mode);
+}
+
 static int nt36523_prepare(struct drm_panel *panel)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
@@ -1242,6 +1301,14 @@ static int nt36523_prepare(struct drm_panel *panel)
 		regulator_disable(pinfo->vddio);
 		dev_err(panel->dev, "failed to initialize panel: %d\n", ret);
 		return ret;
+	}
+
+	if (pinfo->desc->sync_pen_fps) {
+		ret = nt36523_sync_pen_fps(pinfo);
+		if (ret < 0) {
+			regulator_disable(pinfo->vddio);
+			return ret;
+		}
 	}
 
 	return 0;
@@ -1329,6 +1396,7 @@ static const struct drm_panel_funcs nt36523_panel_funcs = {
 	.disable = nt36523_disable,
 	.prepare = nt36523_prepare,
 	.unprepare = nt36523_unprepare,
+	.mode_set = nt36523_mode_set,
 	.get_modes = nt36523_get_modes,
 	.get_orientation = nt36523_get_orientation,
 };
@@ -1412,6 +1480,7 @@ static int nt36523_probe(struct mipi_dsi_device *dsi)
 	pinfo->desc = of_device_get_match_data(dev);
 	if (!pinfo->desc)
 		return -ENODEV;
+	pinfo->refresh_rate = drm_mode_vrefresh(&pinfo->desc->modes[0]);
 
 	/* If the panel is dual dsi, register DSI1 */
 	if (pinfo->desc->is_dual_dsi) {
