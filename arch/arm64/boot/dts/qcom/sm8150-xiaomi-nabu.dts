@@ -507,6 +507,28 @@
 
 &i2c4 {
 	status = "okay";
+	clock-frequency = <400000>;
+
+	ln8000_charger: charger@51 {
+		compatible = "lionsemi,ln8000";
+		reg = <0x51>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <36 IRQ_TYPE_EDGE_FALLING>;
+		wakeup-source;
+
+		input-power-supply = <&pm8150b_typec>;
+		switching-power-supply = <&pm8150b_charger>;
+
+		lionsemi,battery-ovp-microvolt = <4560000>;
+		lionsemi,battery-ovp-alarm-microvolt = <4525000>;
+		lionsemi,input-ovp-microvolt = <13000000>;
+		lionsemi,input-ovp-alarm-microvolt = <11000000>;
+		lionsemi,input-ocp-microamp = <3750000>;
+		lionsemi,input-ocp-alarm-microamp = <3500000>;
+		lionsemi,ntc-alarm-code = <226>;
+		lionsemi,min-input-microvolt = <8000000>;
+	};
 
 	typec-mux@43 {
 		compatible = "fcs,fsa4480";
@@ -720,9 +742,13 @@
 		sink-pdos = <PDO_FIXED(5000, 3000,
 					 PDO_FIXED_DUAL_ROLE |
 					 PDO_FIXED_USB_COMM |
+					 PDO_FIXED_DATA_SWAP)
+			     PDO_FIXED(9000, 3000,
+					 PDO_FIXED_DUAL_ROLE |
+					 PDO_FIXED_USB_COMM |
 					 PDO_FIXED_DATA_SWAP)>;
 
-		op-sink-microwatt = <10000000>;
+		op-sink-microwatt = <27000000>;
 
 		ports {
 			#address-cells = <1>;

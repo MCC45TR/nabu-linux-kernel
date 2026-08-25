@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/lionsemi,ln8000.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lion Semiconductor LN8000 direct charger
+
+maintainers:
+  - SENEMOS Project <senemos@localhost>
+
+description: |
+  The LN8000 is an I2C-controlled 2:1 switched-capacitor direct charger.
+  Its hardware voltage, current, temperature, watchdog and reverse-current
+  protections remain enabled by the Linux driver.
+
+properties:
+  compatible:
+    const: lionsemi,ln8000
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  wakeup-source: true
+
+  input-power-supply:
+    description: TCPM power supply used to observe the negotiated USB-PD input
+
+  switching-power-supply:
+    description: Conventional charger suspended while direct charging is active
+
+  lionsemi,battery-ovp-microvolt:
+    minimum: 4000000
+    maximum: 5000000
+
+  lionsemi,battery-ovp-alarm-microvolt:
+    minimum: 4000000
+    maximum: 5000000
+
+  lionsemi,input-ovp-microvolt:
+    minimum: 6500000
+    maximum: 13000000
+
+  lionsemi,input-ovp-alarm-microvolt:
+    minimum: 6000000
+    maximum: 13000000
+
+  lionsemi,input-ocp-microamp:
+    minimum: 1000000
+    maximum: 6500000
+
+  lionsemi,input-ocp-alarm-microamp:
+    minimum: 1000000
+    maximum: 6500000
+
+  lionsemi,ntc-alarm-code:
+    description: Raw 10-bit NTC alarm threshold used for both bus and battery sensors
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 1023
+
+  lionsemi,min-input-microvolt:
+    minimum: 6500000
+    maximum: 12000000
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - input-power-supply
+  - switching-power-supply
+  - lionsemi,battery-ovp-microvolt
+  - lionsemi,battery-ovp-alarm-microvolt
+  - lionsemi,input-ovp-microvolt
+  - lionsemi,input-ovp-alarm-microvolt
+  - lionsemi,input-ocp-microamp
+  - lionsemi,input-ocp-alarm-microamp
+  - lionsemi,ntc-alarm-code
+  - lionsemi,min-input-microvolt
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/arm-gic.h>
+
+    typec: typec {
+    };
+
+    switching_charger: switching-charger {
+    };
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@51 {
+            compatible = "lionsemi,ln8000";
+            reg = <0x51>;
+            interrupts = <GIC_SPI 36 IRQ_TYPE_EDGE_FALLING>;
+            input-power-supply = <&typec>;
+            switching-power-supply = <&switching_charger>;
+            lionsemi,battery-ovp-microvolt = <4560000>;
+            lionsemi,battery-ovp-alarm-microvolt = <4525000>;
+            lionsemi,input-ovp-microvolt = <13000000>;
+            lionsemi,input-ovp-alarm-microvolt = <11000000>;
+            lionsemi,input-ocp-microamp = <3750000>;
+            lionsemi,input-ocp-alarm-microamp = <3500000>;
+            lionsemi,ntc-alarm-code = <226>;
+            lionsemi,min-input-microvolt = <8000000>;
+        };
+    };
+...
