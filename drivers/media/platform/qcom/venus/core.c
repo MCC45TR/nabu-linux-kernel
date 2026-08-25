@@ -372,6 +372,7 @@ static void venus_remove_dynamic_nodes(struct venus_core *core) {}
 static int venus_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const char *stage = "allocate core";
 	struct venus_core *core;
 	int ret;
 
@@ -381,10 +382,12 @@ static int venus_probe(struct platform_device *pdev)
 
 	core->dev = dev;
 
+	stage = "map registers";
 	core->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(core->base))
 		return PTR_ERR(core->base);
 
+	stage = "get interconnects";
 	core->video_path = devm_of_icc_get(dev, "video-mem");
 	if (IS_ERR(core->video_path))
 		return PTR_ERR(core->video_path);
@@ -407,12 +410,14 @@ static int venus_probe(struct platform_device *pdev)
 	if (!core->pm_ops)
 		return -ENODEV;
 
+	stage = "get clocks, resets and power domains";
 	if (core->pm_ops->core_get) {
 		ret = core->pm_ops->core_get(core);
 		if (ret)
 			return ret;
 	}
 
+	stage = "set DMA mask";
 	ret = dma_set_mask_and_coherent(dev, core->res->dma_mask);
 	if (ret)
 		goto err_core_put;
@@ -444,40 +449,51 @@ static int venus_probe(struct platform_device *pdev)
 
 	pm_runtime_enable(dev);
 
+	stage = "runtime resume";
 	ret = pm_runtime_get_sync(dev);
 	if (ret < 0)
 		goto err_runtime_disable;
 
+	dev_info(dev, "diagnostic: runtime power enabled\n");
+
+	stage = "create child codec nodes";
 	if (core->res->dec_nodename || core->res->enc_nodename) {
 		ret = venus_add_dynamic_nodes(core);
 		if (ret)
 			goto err_runtime_disable;
 	}
 
+	stage = "populate child devices";
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
 	if (ret)
 		goto err_remove_dynamic_nodes;
 
+	stage = "initialize firmware mapping";
 	ret = venus_firmware_init(core);
 	if (ret)
 		goto err_of_depopulate;
 
+	stage = "authenticate and boot firmware";
 	ret = venus_boot(core);
 	if (ret)
 		goto err_firmware_deinit;
 
+	stage = "start HFI hardware";
 	ret = hfi_core_resume(core, true);
 	if (ret)
 		goto err_venus_shutdown;
 
+	stage = "initialize HFI protocol";
 	ret = hfi_core_init(core);
 	if (ret)
 		goto err_venus_shutdown;
 
+	stage = "enumerate decoder codecs";
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_DEC);
 	if (ret)
 		goto err_core_deinit;
 
+	stage = "enumerate encoder codecs";
 	ret = venus_enumerate_codecs(core, VIDC_SESSION_TYPE_ENC);
 	if (ret)
 		goto err_core_deinit;
@@ -512,6 +528,7 @@ err_hfi_destroy:
 err_core_put:
 	if (core->pm_ops->core_put)
 		core->pm_ops->core_put(core);
+	dev_err(dev, "diagnostic: probe failed at '%s': %d\n", stage, ret);
 	return ret;
 }
 
@@ -886,6 +903,53 @@ static const struct venus_resources sdm845_res_v2 = {
 	.enc_nodename = "video-core1",
 };
 
+/*
+ * SM8150 contains the first-generation Iris video block. It uses the HFI
+ * 4xx protocol and the same host register layout as AR50, but has separate
+ * MVSC, MVS0 and MVS1 clock and power domains.
+ */
+static const struct freq_tbl sm8150_freq_table[] = {
+	{ 3916800, 533000000 },	/* 3840x2160@120 */
+	{ 3110400, 444000000 },	/* 4096x2160@90 */
+	{ 2073600, 365000000 },	/* 4096x2160@60 */
+	{  972000, 240000000 },	/* 3840x2160@30 */
+	{  489600, 200000000 },	/* 1920x1080@60 */
+};
+
+static const struct venus_resources sm8150_res = {
+	.freq_tbl = sm8150_freq_table,
+	.freq_tbl_size = ARRAY_SIZE(sm8150_freq_table),
+	.bw_tbl_enc = sdm845_bw_table_enc,
+	.bw_tbl_enc_size = ARRAY_SIZE(sdm845_bw_table_enc),
+	.bw_tbl_dec = sdm845_bw_table_dec,
+	.bw_tbl_dec_size = ARRAY_SIZE(sdm845_bw_table_dec),
+	.clks = { "core", "iface", "bus" },
+	.clks_num = 3,
+	.vcodec0_clks = { "vcodec0_core", "vcodec0_bus" },
+	.vcodec1_clks = { "vcodec1_core", "vcodec1_bus" },
+	.vcodec_clks_num = 2,
+	.vcodec_pmdomains = (const char *[]) { "venus", "vcodec0", "vcodec1" },
+	.vcodec_pmdomains_num = 3,
+	.opp_pmdomain = (const char *[]) { "cx" },
+	.resets = { "bus", "core", "vcodec0_bus", "vcodec1_bus" },
+	.resets_num = 4,
+	.vcodec_num = 2,
+	.max_load = 3916800,
+	.hfi_version = HFI_VERSION_4XX,
+	.vpu_version = VPU_VERSION_IRIS1,
+	.vmem_id = VIDC_RESOURCE_NONE,
+	.vmem_size = 0,
+	.vmem_addr = 0,
+	.dma_mask = 0xe0000000 - 1,
+	.cp_start = 0,
+	.cp_size = 0x25800000,
+	.cp_nonpixel_start = 0x1000000,
+	.cp_nonpixel_size = 0x24800000,
+	.fwname = "qcom/sm8150/venus.mbn",
+	.dec_nodename = "video-core0",
+	.enc_nodename = "video-core1",
+};
+
 static const struct freq_tbl sc7180_freq_table[] = {
 	{  0, 500000000 },
 	{  0, 434000000 },
@@ -1064,6 +1128,7 @@ static const struct of_device_id venus_dt_match[] = {
 	{ .compatible = "qcom,sdm660-venus", .data = &sdm660_res, },
 	{ .compatible = "qcom,sdm845-venus", .data = &sdm845_res, },
 	{ .compatible = "qcom,sdm845-venus-v2", .data = &sdm845_res_v2, },
+	{ .compatible = "qcom,sm8150-venus", .data = &sm8150_res, },
 	{ .compatible = "qcom,sc7180-venus", .data = &sc7180_res, },
 	{ .compatible = "qcom,sc7280-venus", .data = &sc7280_res, },
 	{ .compatible = "qcom,sm8250-venus", .data = &sm8250_res, },

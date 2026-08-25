@@ -19,6 +19,7 @@ int iris_set_icc_bw(struct iris_core *core, unsigned long icc_bw)
 {
 	unsigned long bw_kbps = 0, bw_prev = 0;
 	const struct icc_info *icc_tbl;
+	int video_mem_idx = -1;
 	int ret = 0, i;
 
 	icc_tbl = core->iris_platform_data->icc_tbl;
@@ -31,17 +32,24 @@ int iris_set_icc_bw(struct iris_core *core, unsigned long icc_bw)
 			bw_kbps = clamp_t(typeof(bw_kbps), bw_kbps,
 					  icc_tbl[i].bw_min_kbps, icc_tbl[i].bw_max_kbps);
 
-			if (abs(bw_kbps - bw_prev) < BW_THRESHOLD && bw_prev)
+			if (bw_prev &&
+			    (bw_kbps > bw_prev ? bw_kbps - bw_prev :
+						   bw_prev - bw_kbps) < BW_THRESHOLD)
 				return ret;
 
 			core->icc_tbl[i].avg_bw = bw_kbps;
-
-			core->power.icc_bw = bw_kbps;
+			video_mem_idx = i;
 			break;
 		}
 	}
 
-	return icc_bulk_set_bw(core->icc_count, core->icc_tbl);
+	ret = icc_bulk_set_bw(core->icc_count, core->icc_tbl);
+	if (!ret && video_mem_idx >= 0)
+		core->power.icc_bw = bw_kbps;
+	else if (ret && video_mem_idx >= 0)
+		core->icc_tbl[video_mem_idx].avg_bw = bw_prev;
+
+	return ret;
 }
 
 int iris_unset_icc_bw(struct iris_core *core)
@@ -109,12 +117,18 @@ static struct clk *iris_get_clk_by_type(struct iris_core *core, enum platform_cl
 int iris_prepare_enable_clock(struct iris_core *core, enum platform_clk_type clk_type)
 {
 	struct clk *clock;
+	int ret;
 
 	clock = iris_get_clk_by_type(core, clk_type);
 	if (!clock)
 		return -EINVAL;
 
-	return clk_prepare_enable(clock);
+	ret = clk_prepare_enable(clock);
+	if (!ret)
+		dev_info(core->dev, "clock type %u enabled at %lu Hz\n",
+			 clk_type, clk_get_rate(clock));
+
+	return ret;
 }
 
 int iris_disable_unprepare_clock(struct iris_core *core, enum platform_clk_type clk_type)

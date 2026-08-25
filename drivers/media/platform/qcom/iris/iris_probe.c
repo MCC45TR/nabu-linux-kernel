@@ -146,7 +146,7 @@ static int iris_init_resources(struct iris_core *core)
 	return iris_init_resets(core);
 }
 
-static int iris_register_video_device(struct iris_core *core)
+static int iris_register_video_device(struct iris_core *core, enum domain_type type)
 {
 	struct video_device *vdev;
 	int ret;
@@ -155,19 +155,29 @@ static int iris_register_video_device(struct iris_core *core)
 	if (!vdev)
 		return -ENOMEM;
 
-	strscpy(vdev->name, "qcom-iris-decoder", sizeof(vdev->name));
 	vdev->release = video_device_release;
 	vdev->fops = core->iris_v4l2_file_ops;
-	vdev->ioctl_ops = core->iris_v4l2_ioctl_ops;
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->v4l2_dev = &core->v4l2_dev;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
+
+	if (type == DECODER) {
+		strscpy(vdev->name, "qcom-iris-decoder", sizeof(vdev->name));
+		vdev->ioctl_ops = core->iris_v4l2_ioctl_ops_dec;
+		core->vdev_dec = vdev;
+	} else if (type == ENCODER) {
+		strscpy(vdev->name, "qcom-iris-encoder", sizeof(vdev->name));
+		vdev->ioctl_ops = core->iris_v4l2_ioctl_ops_enc;
+		core->vdev_enc = vdev;
+	} else {
+		ret = -EINVAL;
+		goto err_vdev_release;
+	}
 
 	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
 	if (ret)
 		goto err_vdev_release;
 
-	core->vdev_dec = vdev;
 	video_set_drvdata(vdev, core);
 
 	return 0;
@@ -189,6 +199,7 @@ static void iris_remove(struct platform_device *pdev)
 	iris_core_deinit(core);
 
 	video_unregister_device(core->vdev_dec);
+	video_unregister_device(core->vdev_enc);
 
 	v4l2_device_unregister(&core->v4l2_dev);
 
@@ -258,9 +269,13 @@ static int iris_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = iris_register_video_device(core);
+	ret = iris_register_video_device(core, DECODER);
 	if (ret)
 		goto err_v4l2_unreg;
+
+	ret = iris_register_video_device(core, ENCODER);
+	if (ret)
+		goto err_vdev_unreg_dec;
 
 	platform_set_drvdata(pdev, core);
 
@@ -268,7 +283,7 @@ static int iris_probe(struct platform_device *pdev)
 
 	ret = dma_set_mask_and_coherent(dev, dma_mask);
 	if (ret)
-		goto err_vdev_unreg;
+		goto err_vdev_unreg_enc;
 
 	dma_set_max_seg_size(&pdev->dev, DMA_BIT_MASK(32));
 	dma_set_seg_boundary(&pdev->dev, DMA_BIT_MASK(32));
@@ -277,11 +292,23 @@ static int iris_probe(struct platform_device *pdev)
 	pm_runtime_use_autosuspend(core->dev);
 	ret = devm_pm_runtime_enable(core->dev);
 	if (ret)
-		goto err_vdev_unreg;
+		goto err_vdev_unreg_enc;
+
+	/*
+	 * The legacy VPU5 power-collapse sequence is not implemented yet:
+	 * iris_vpu_prepare_pc() deliberately returns -EAGAIN to keep the
+	 * controller powered.  Do not let runtime PM retry that unsupported
+	 * transition after every autosuspend delay, since it creates a
+	 * permanent workqueue/printk loop while the device is otherwise idle.
+	 */
+	if (core->iris_platform_data->legacy_vpu5)
+		pm_runtime_forbid(core->dev);
 
 	return 0;
 
-err_vdev_unreg:
+err_vdev_unreg_enc:
+	video_unregister_device(core->vdev_enc);
+err_vdev_unreg_dec:
 	video_unregister_device(core->vdev_dec);
 err_v4l2_unreg:
 	v4l2_device_unregister(&core->v4l2_dev);
@@ -339,12 +366,14 @@ static const struct of_device_id iris_dt_match[] = {
 		.compatible = "qcom,qcs8300-iris",
 		.data = &qcs8300_data,
 	},
-#if (!IS_ENABLED(CONFIG_VIDEO_QCOM_VENUS))
 	{
 		.compatible = "qcom,sm8250-venus",
 		.data = &sm8250_data,
 	},
-#endif
+	{
+		.compatible = "qcom,sm8150-iris",
+		.data = &sm8150_data,
+	},
 	{
 		.compatible = "qcom,sm8550-iris",
 		.data = &sm8550_data,
@@ -370,3 +399,4 @@ static struct platform_driver qcom_iris_driver = {
 module_platform_driver(qcom_iris_driver);
 MODULE_DESCRIPTION("Qualcomm iris video driver");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("DMA_BUF");
