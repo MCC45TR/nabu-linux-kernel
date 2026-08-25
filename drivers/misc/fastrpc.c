@@ -285,6 +285,7 @@ struct fastrpc_channel_ctx {
 	bool unsigned_support;
 	u64 dma_mask;
 	const struct fastrpc_soc_data *soc_data;
+	char *accel_mount_matrix;
 };
 
 struct fastrpc_device {
@@ -493,6 +494,7 @@ static void fastrpc_channel_ctx_free(struct kref *ref)
 	cctx = container_of(ref, struct fastrpc_channel_ctx, refcount);
 
 	idr_destroy(&cctx->ctx_idr);
+	kfree(cctx->accel_mount_matrix);
 	kfree(cctx);
 }
 
@@ -2312,6 +2314,22 @@ static struct platform_driver fastrpc_cb_driver = {
 	},
 };
 
+static ssize_t mount_matrix_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct miscdevice *miscdev = dev_get_drvdata(dev);
+	struct fastrpc_device *fdev = miscdev_to_fdevice(miscdev);
+
+	return sysfs_emit(buf, "%s\n", fdev->cctx->accel_mount_matrix);
+}
+static DEVICE_ATTR_RO(mount_matrix);
+
+static struct attribute *fastrpc_sensor_attrs[] = {
+	&dev_attr_mount_matrix.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(fastrpc_sensor);
+
 static int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ctx *cctx,
 				   bool is_secured, const char *domain)
 {
@@ -2326,6 +2344,8 @@ static int fastrpc_device_register(struct device *dev, struct fastrpc_channel_ct
 	fdev->cctx = cctx;
 	fdev->miscdev.minor = MISC_DYNAMIC_MINOR;
 	fdev->miscdev.fops = &fastrpc_fops;
+	if (cctx->accel_mount_matrix)
+		fdev->miscdev.groups = fastrpc_sensor_groups;
 	fdev->miscdev.name = devm_kasprintf(dev, GFP_KERNEL, "fastrpc-%s%s",
 					    domain, is_secured ? "-secure" : "");
 	if (!fdev->miscdev.name)
@@ -2374,8 +2394,9 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct device *rdev = &rpdev->dev;
 	struct fastrpc_channel_ctx *data;
-	int i, err, domain_id = -1, vmcount;
+	int i, err, domain_id = -1, matrix_count, vmcount;
 	const char *domain;
+	const char *matrix[9];
 	bool secure_dsp;
 	unsigned int vmids[FASTRPC_MAX_VMIDS];
 	const struct fastrpc_soc_data *soc_data;
@@ -2408,6 +2429,29 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 	data = kzalloc_obj(*data);
 	if (!data)
 		return -ENOMEM;
+
+	matrix_count = of_property_count_strings(rdev->of_node, "mount-matrix");
+	if (matrix_count != -EINVAL) {
+		if (matrix_count != ARRAY_SIZE(matrix)) {
+			err = dev_err_probe(rdev, -EINVAL,
+					    "mount-matrix must contain nine values\n");
+			goto err_free_data;
+		}
+
+		err = of_property_read_string_array(rdev->of_node, "mount-matrix",
+						    matrix, ARRAY_SIZE(matrix));
+		if (err < 0)
+			goto err_free_data;
+
+		data->accel_mount_matrix = kasprintf(GFP_KERNEL,
+			"%s, %s, %s; %s, %s, %s; %s, %s, %s",
+			matrix[0], matrix[1], matrix[2], matrix[3], matrix[4],
+			matrix[5], matrix[6], matrix[7], matrix[8]);
+		if (!data->accel_mount_matrix) {
+			err = -ENOMEM;
+			goto err_free_data;
+		}
+	}
 
 	if (vmcount) {
 		data->vmcount = vmcount;
@@ -2489,6 +2533,7 @@ err_deregister_fdev:
 		misc_deregister(&data->secure_fdevice->miscdev);
 
 err_free_data:
+	kfree(data->accel_mount_matrix);
 	kfree(data);
 	return err;
 }

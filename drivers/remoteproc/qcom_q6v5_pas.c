@@ -1309,6 +1309,27 @@ static const struct qcom_pas_data sdm845_slpi_resource_init = {
 	.ssctl_id = 0x16,
 };
 
+/*
+ * Nabu needs SLPI before the graphical session starts so the IIO sensor
+ * devices are available deterministically.  Keep the separate compatible so
+ * board-specific startup policy does not change other SM8150 devices.
+ */
+static const struct qcom_pas_data sm8150_nabu_slpi_resource = {
+	.crash_reason_smem = 424,
+	.firmware_name = "slpi.mdt",
+	.pas_id = 12,
+	.auto_boot = true,
+	.proxy_pd_names = (char *[]){
+		"lcx",
+		"lmx",
+		NULL
+	},
+	.load_state = "slpi",
+	.ssr_name = "dsps",
+	.sysmon_name = "slpi",
+	.ssctl_id = 0x16,
+};
+
 static const struct qcom_pas_data wcss_resource_init = {
 	.crash_reason_smem = 421,
 	.firmware_name = "wcnss.mdt",
@@ -1628,6 +1649,7 @@ static const struct of_device_id qcom_pas_of_match[] = {
 	{ .compatible = "qcom,sm8150-adsp-pas", .data = &sm8150_adsp_resource },
 	{ .compatible = "qcom,sm8150-cdsp-pas", .data = &sm8150_cdsp_resource },
 	{ .compatible = "qcom,sm8150-mpss-pas", .data = &mpss_resource_init },
+	{ .compatible = "qcom,sm8150-nabu-slpi-pas", .data = &sm8150_nabu_slpi_resource },
 	{ .compatible = "qcom,sm8150-slpi-pas", .data = &sdm845_slpi_resource_init },
 	{ .compatible = "qcom,sm8250-adsp-pas", .data = &sm8250_adsp_resource },
 	{ .compatible = "qcom,sm8250-cdsp-pas", .data = &sm8250_cdsp_resource },

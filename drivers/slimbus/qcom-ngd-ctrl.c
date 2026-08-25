@@ -160,6 +160,7 @@ struct qcom_slim_ngd_ctrl {
 	struct work_struct m_work;
 	struct work_struct ngd_up_work;
 	struct workqueue_struct *mwq;
+	bool ngd_ready;
 	struct completion qmi_up;
 	spinlock_t tx_buf_lock;
 	struct mutex tx_lock;
@@ -1468,6 +1469,10 @@ static void qcom_slim_ngd_up_worker(struct work_struct *work)
 static int qcom_slim_ngd_ssr_pdr_notify(struct qcom_slim_ngd_ctrl *ctrl,
 					unsigned long action)
 {
+	/* Child probe owns QMI readiness; ignore early SSR/PDR notifications. */
+	if (!READ_ONCE(ctrl->ngd_ready))
+		return NOTIFY_OK;
+
 	switch (action) {
 	case QCOM_SSR_BEFORE_SHUTDOWN:
 	case SERVREG_SERVICE_STATE_DOWN:
@@ -1583,9 +1588,14 @@ static int qcom_slim_ngd_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev, "QMI service registration failed:%d", ret);
 		pm_runtime_dont_use_autosuspend(dev);
 		pm_runtime_disable(dev);
+		return ret;
 	}
 
-	return ret;
+	WRITE_ONCE(ctrl->ngd_ready, true);
+	/* Reconcile an UP notification which may have arrived during probe. */
+	schedule_work(&ctrl->ngd_up_work);
+
+	return 0;
 }
 
 static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
@@ -1696,6 +1706,8 @@ static void qcom_slim_ngd_remove(struct platform_device *pdev)
 {
 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
 
+	WRITE_ONCE(ctrl->ngd_ready, false);
+	cancel_work_sync(&ctrl->ngd_up_work);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	qcom_slim_ngd_enable(ctrl, false);

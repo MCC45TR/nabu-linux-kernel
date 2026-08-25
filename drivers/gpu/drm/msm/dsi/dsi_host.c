@@ -97,7 +97,10 @@ static int dsi_get_version(const void __iomem *base, u32 *major, u32 *minor)
 		(DSI_CLK_CTRL_AHBS_HCLK_ON | DSI_CLK_CTRL_AHBM_SCLK_ON | \
 		DSI_CLK_CTRL_PCLK_ON | DSI_CLK_CTRL_DSICLK_ON | \
 		DSI_CLK_CTRL_BYTECLK_ON | DSI_CLK_CTRL_ESCCLK_ON | \
-		DSI_CLK_CTRL_FORCE_ON_DYN_AHBM_HCLK)
+		 DSI_CLK_CTRL_FORCE_ON_DYN_AHBM_HCLK)
+
+/* DSI 6G v2.x timing shadow database used for porch-only DFPS updates. */
+#define REG_DSI_TIMING_DB_MODE			0x01e8
 
 struct msm_dsi_host {
 	struct mipi_dsi_host base;
@@ -165,6 +168,9 @@ struct msm_dsi_host {
 	struct regmap *sfpb;
 
 	struct drm_display_mode *mode;
+	/* Timing staged in the 6G shadow database, not active on the link yet. */
+	struct drm_display_mode *seamless_mode;
+	bool seamless_staged;
 	struct drm_dsc_config *dsc;
 
 	/* connected device info */
@@ -2590,6 +2596,135 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 	}
 
 	return 0;
+}
+
+int msm_dsi_host_set_display_mode_seamless(struct mipi_dsi_host *host,
+					   const struct drm_display_mode *mode,
+					   bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	struct drm_display_mode *new_mode;
+	struct drm_display_mode *active_mode;
+	int ret = 0;
+
+	new_mode = drm_mode_duplicate(msm_host->dev, mode);
+	if (!new_mode)
+		return -ENOMEM;
+
+	mutex_lock(&msm_host->dev_mutex);
+	active_mode = msm_host->mode;
+	if (!active_mode || active_mode->clock != mode->clock ||
+	    active_mode->hdisplay != mode->hdisplay ||
+	    active_mode->hsync_start != mode->hsync_start ||
+	    active_mode->hsync_end != mode->hsync_end ||
+	    active_mode->htotal != mode->htotal ||
+	    active_mode->vdisplay != mode->vdisplay ||
+	    active_mode->vsync_end - active_mode->vsync_start !=
+		mode->vsync_end - mode->vsync_start ||
+	    active_mode->vtotal - active_mode->vsync_end !=
+		mode->vtotal - mode->vsync_end ||
+	    active_mode->vsync_start == mode->vsync_start) {
+		ret = -EOPNOTSUPP;
+		goto out_destroy;
+	}
+
+	if (msm_host->seamless_mode) {
+		ret = -EBUSY;
+		goto out_destroy;
+	}
+
+	if (!msm_host->power_on || !msm_host->enabled) {
+		ret = -EPIPE;
+		goto out_destroy;
+	}
+
+	/*
+	 * Queue the new timing only. The panel bridge follows this bridge in
+	 * drm_bridge_chain_mode_set() and must still issue its TDDI scan-rate
+	 * DCS commands while the normal video-done interrupt is live. The
+	 * shadow timing database is armed after the complete bridge chain.
+	 */
+	msm_host->seamless_mode = new_mode;
+	mutex_unlock(&msm_host->dev_mutex);
+
+	return 0;
+
+out_destroy:
+	mutex_unlock(&msm_host->dev_mutex);
+	drm_mode_destroy(msm_host->dev, new_mode);
+	return ret;
+}
+
+bool msm_dsi_host_seamless_ready(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	bool ready;
+
+	mutex_lock(&msm_host->dev_mutex);
+	ready = msm_host->power_on && msm_host->enabled &&
+		msm_host->seamless_mode && !msm_host->seamless_staged;
+	mutex_unlock(&msm_host->dev_mutex);
+
+	return ready;
+}
+
+int msm_dsi_host_stage_seamless(struct mipi_dsi_host *host,
+					bool is_bonded_dsi)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	struct drm_display_mode *active_mode;
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on || !msm_host->enabled ||
+	    !msm_host->seamless_mode) {
+		ret = -EPIPE;
+		goto out;
+	}
+	if (msm_host->seamless_staged) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	active_mode = msm_host->mode;
+	msm_host->mode = msm_host->seamless_mode;
+	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 1);
+	dsi_timing_setup(msm_host, is_bonded_dsi);
+	msm_host->mode = active_mode;
+	wmb();
+	msm_host->seamless_staged = true;
+
+out:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
+void msm_dsi_host_complete_seamless(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->power_on && msm_host->seamless_mode &&
+	    msm_host->seamless_staged) {
+		/*
+		 * The atomic commit tail has waited for a real CRTC vblank after
+		 * the DPU flush. Release the DSI timing database at that proven
+		 * frame boundary instead of relying on a refresh-rate-dependent
+		 * fixed delay.
+		 */
+		dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 0);
+		wmb();
+
+		drm_mode_destroy(msm_host->dev, msm_host->mode);
+		msm_host->mode = msm_host->seamless_mode;
+		msm_host->seamless_mode = NULL;
+		msm_host->seamless_staged = false;
+	} else if (msm_host->seamless_mode) {
+		drm_mode_destroy(msm_host->dev, msm_host->seamless_mode);
+		msm_host->seamless_mode = NULL;
+		msm_host->seamless_staged = false;
+	}
+	mutex_unlock(&msm_host->dev_mutex);
 }
 
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,

@@ -41,6 +41,21 @@
 		wifi0 = &wifi;
 	};
 
+	slpi-sleep-state {
+		compatible = "qcom,smp2p-sleep-state";
+		qcom,smem-states = <&slpi_sleepstate_out 0>;
+		interrupt-parent = <&slpi_sleepstate_in>;
+		interrupts = <0 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "state-change";
+		/*
+		 * The downstream SLPI firmware crashes sensor_process when Linux
+		 * toggles the sleepstate bit during system suspend.  Keep the node
+		 * documented but disabled until the complete downstream SLPI power
+		 * lifecycle is available; remoteproc and FastRPC remain enabled.
+		 */
+		status = "disabled";
+	};
+
 	reserved-memory {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -93,11 +108,6 @@
 
 		cdsp_mem: memory@99100000 {
 			reg = <0x0 0x99100000 0x0 0x1400000>;
-			no-map;
-		};
-
-		cdsp_sec_mem: memory@a4c00000 {
-			reg = <0x0 0xa4c00000 0x0 0x3c00000>;
 			no-map;
 		};
 
@@ -753,9 +763,83 @@
 };
 
 &remoteproc_slpi {
-	compatible = "qcom,sm8150-slpi-pas";
+	compatible = "qcom,sm8150-nabu-slpi-pas";
 	status = "okay";
 	firmware-name = "qcom/sm8150/xiaomi/nabu/slpi_nb.mbn";
+};
+
+&adsp_fastrpc {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
+&slpi_fastrpc {
+	mount-matrix = "-1", "0", "0",
+		       "0", "-1", "0",
+		       "0", "0", "1";
+};
+
+&sound {
+	compatible = "qcom,sm8150-sndcard";
+	pinctrl-0 = <&quat_tdm_active
+		&quat_tdm_sd1_active>;
+	pinctrl-names = "default";
+	model = "Xiaomi Pad 5";
+
+	audio-routing =	"RX_BIAS", "MCLK",
+		"AMIC1", "MIC BIAS3",
+		"AMIC3", "MIC BIAS4",
+		"MultiMedia1 Playback", "BR SPK",
+		"MultiMedia1 Playback", "TR SPK",
+		"MultiMedia1 Playback", "BL SPK",
+		"MultiMedia1 Playback", "TL SPK";
+
+	mm1-dai-link {
+		link-name = "MultiMedia1";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA1>;
+		};
+	};
+
+	mm2-dai-link {
+		link-name = "MultiMedia2";
+		cpu {
+			sound-dai = <&q6asmdai MSM_FRONTEND_DAI_MULTIMEDIA2>;
+		};
+	};
+
+	speaker-dai-link {
+		link-name = "Speaker Playback";
+		cpu {
+			sound-dai = <&q6afedai QUATERNARY_TDM_RX_0>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&cs35l41_br 0>, <&cs35l41_tr 0>,
+				<&cs35l41_bl 0>, <&cs35l41_tl 0>;
+		};
+	};
+
+	//Bottom & Top internal microphones
+	slimcap-dai-link {
+		link-name = "SLIM Capture 1";
+		cpu {
+			sound-dai = <&q6afedai SLIMBUS_0_TX>;
+		};
+
+		platform {
+			sound-dai = <&q6routing>;
+		};
+
+		codec {
+			sound-dai = <&wcd9340 1>; /* AIF1_CAP */
+		};
+	};
 };
 
 &spi18 {
@@ -1085,3 +1169,5 @@
                 boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
         };
 };
+
+#include "sm8150-xiaomi-nabu-power-scaffold.dtsi"

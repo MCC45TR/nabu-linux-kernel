@@ -397,9 +397,74 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
 		return;
 
+	{
+		int ret;
+
+		ret = msm_dsi_host_set_display_mode_seamless(host,
+				adjusted_mode, is_bonded_dsi);
+		if (!ret && is_bonded_dsi && other_dsi)
+			ret = msm_dsi_host_set_display_mode_seamless(
+				other_dsi->host, adjusted_mode, is_bonded_dsi);
+
+		if (!ret) {
+			msm_dsi->seamless_dfps_pending = true;
+			return;
+		}
+
+		if (ret != -EOPNOTSUPP && ret != -EPIPE)
+			dev_err(&msm_dsi->pdev->dev,
+				"seamless DFPS timing update failed: %d\n", ret);
+	}
+
 	msm_dsi_host_set_display_mode(host, adjusted_mode);
 	if (is_bonded_dsi && other_dsi)
 		msm_dsi_host_set_display_mode(other_dsi->host, adjusted_mode);
+}
+
+int msm_dsi_manager_stage_seamless_dfps(void)
+{
+	struct msm_dsi *master =
+		dsi_mgr_get_dsi(msm_dsim_glb.master_dsi_link_id);
+	struct msm_dsi *slave = dsi_mgr_get_other_dsi(
+		msm_dsim_glb.master_dsi_link_id);
+	bool is_bonded_dsi = IS_BONDED_DSI();
+	int ret;
+
+	if (!master || !master->seamless_dfps_pending)
+		return 0;
+
+	/* Validate both links before changing either shadow database. */
+	if (!msm_dsi_host_seamless_ready(master->host) ||
+	    (is_bonded_dsi && slave &&
+	     !msm_dsi_host_seamless_ready(slave->host)))
+		return -EPIPE;
+
+	ret = msm_dsi_host_stage_seamless(master->host, is_bonded_dsi);
+	if (ret)
+		return ret;
+
+	if (is_bonded_dsi && slave)
+		ret = msm_dsi_host_stage_seamless(slave->host,
+						  is_bonded_dsi);
+
+	return ret;
+}
+
+void msm_dsi_manager_complete_seamless_dfps(void)
+{
+	struct msm_dsi *master =
+		dsi_mgr_get_dsi(msm_dsim_glb.master_dsi_link_id);
+	struct msm_dsi *slave = dsi_mgr_get_other_dsi(
+		msm_dsim_glb.master_dsi_link_id);
+
+	if (!master || !master->seamless_dfps_pending)
+		return;
+
+	msm_dsi_host_complete_seamless(master->host);
+	if (IS_BONDED_DSI() && slave)
+		msm_dsi_host_complete_seamless(slave->host);
+
+	master->seamless_dfps_pending = false;
 }
 
 static enum drm_mode_status dsi_mgr_bridge_mode_valid(struct drm_bridge *bridge,

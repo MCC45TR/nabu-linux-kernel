@@ -5,12 +5,15 @@
  */
 
 #include <drm/drm_atomic_uapi.h>
+#include <drm/drm_bridge.h>
+#include <drm/drm_connector.h>
 #include <drm/drm_vblank.h>
 
 #include "msm_atomic_trace.h"
 #include "msm_drv.h"
 #include "msm_gem.h"
 #include "msm_kms.h"
+#include "dsi/dsi.h"
 
 /*
  * Helpers to control vblanks while we flush.. basically just to ensure
@@ -181,6 +184,211 @@ static unsigned get_crtc_mask(struct drm_atomic_commit *state)
 	return mask;
 }
 
+static bool msm_dfps_mode_compatible(const struct drm_display_mode *old,
+				     const struct drm_display_mode *new)
+{
+	return old->clock == new->clock &&
+		old->hdisplay == new->hdisplay &&
+		old->hsync_start == new->hsync_start &&
+		old->hsync_end == new->hsync_end &&
+		old->htotal == new->htotal &&
+		old->vdisplay == new->vdisplay &&
+		(old->vsync_end - old->vsync_start) ==
+			(new->vsync_end - new->vsync_start) &&
+		(old->vtotal - old->vsync_end) ==
+			(new->vtotal - new->vsync_end) &&
+		old->vsync_start != new->vsync_start;
+}
+
+static bool msm_crtc_has_dsi_connector(struct drm_atomic_commit *state,
+				       struct drm_crtc *crtc)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_connector *connector;
+	struct drm_connector_list_iter conn_iter;
+	bool found = false;
+
+	drm_connector_list_iter_begin(state->dev, &conn_iter);
+	drm_for_each_connector_iter(connector, &conn_iter) {
+		conn_state = drm_atomic_get_new_connector_state(state, connector);
+		if (!conn_state)
+			conn_state = connector->state;
+		if (conn_state->crtc == crtc &&
+		    connector->connector_type == DRM_MODE_CONNECTOR_DSI) {
+			found = true;
+			break;
+		}
+	}
+	drm_connector_list_iter_end(&conn_iter);
+
+	return found;
+}
+
+static void msm_atomic_mark_seamless_dfps(struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *old_crtc_state, *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_oldnew_crtc_in_state(state, crtc, old_crtc_state,
+				      new_crtc_state, i) {
+		new_crtc_state->seamless_dfps = false;
+		if (!old_crtc_state->active || !new_crtc_state->active ||
+		    !new_crtc_state->mode_changed ||
+		    new_crtc_state->active_changed ||
+		    new_crtc_state->connectors_changed ||
+		    !msm_crtc_has_dsi_connector(state, crtc) ||
+		    !msm_dfps_mode_compatible(&old_crtc_state->adjusted_mode,
+					      &new_crtc_state->adjusted_mode))
+			continue;
+
+		new_crtc_state->seamless_dfps = true;
+	}
+}
+
+static bool msm_atomic_has_seamless_dfps(struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (new_crtc_state->seamless_dfps &&
+		    new_crtc_state->mode_changed)
+			return true;
+	}
+
+	return false;
+}
+
+static void msm_atomic_wait_seamless_dfps_vblank(
+		struct drm_atomic_commit *state)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (new_crtc_state->seamless_dfps &&
+		    new_crtc_state->mode_changed)
+			drm_crtc_wait_one_vblank(crtc);
+	}
+}
+
+static void msm_atomic_mask_seamless_modesets(struct drm_atomic_commit *state,
+					       bool mask)
+{
+	struct drm_crtc_state *new_crtc_state;
+	struct drm_crtc *crtc;
+	int i;
+
+	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
+		if (new_crtc_state->seamless_dfps)
+			new_crtc_state->mode_changed = !mask;
+	}
+}
+
+static void msm_atomic_commit_seamless_modesets(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_connector *connector;
+	struct drm_connector_list_iter conn_iter;
+
+	drm_connector_list_iter_begin(state->dev, &conn_iter);
+	drm_for_each_connector_iter(connector, &conn_iter) {
+		const struct drm_encoder_helper_funcs *funcs;
+		struct drm_bridge *bridge;
+		struct drm_crtc_state *crtc_state;
+		struct drm_encoder *encoder;
+
+		conn_state = drm_atomic_get_new_connector_state(state, connector);
+		if (!conn_state)
+			conn_state = connector->state;
+
+		if (!conn_state->crtc || !conn_state->best_encoder)
+			continue;
+
+		crtc_state = drm_atomic_get_new_crtc_state(state,
+							 conn_state->crtc);
+		if (!crtc_state || !crtc_state->seamless_dfps)
+			continue;
+
+		encoder = conn_state->best_encoder;
+		funcs = encoder->helper_private;
+		if (funcs && funcs->atomic_mode_set)
+			funcs->atomic_mode_set(encoder, crtc_state, conn_state);
+
+		/*
+		 * Program only the MSM DSI bridge here.  The downstream panel
+		 * bridge may send TDDI refresh-rate commands from mode_set().
+		 * Sending those commands before the DSI and DPU vertical timing
+		 * update is committed leaves a dual-DSI video panel temporarily
+		 * running with two different frame periods.  On nabu that can
+		 * corrupt the scanout and force the Novatek touch controller to
+		 * recover its firmware.
+		 */
+		bridge = drm_bridge_chain_get_first_bridge(encoder);
+		if (bridge && bridge->funcs->mode_set)
+			bridge->funcs->mode_set(bridge, &crtc_state->mode,
+						&crtc_state->adjusted_mode);
+	}
+	drm_connector_list_iter_end(&conn_iter);
+
+#if IS_ENABLED(CONFIG_DRM_MSM_DSI)
+	/*
+	 * Stage the new DSI vertical timing after its bridge has queued the
+	 * pending mode.  The DPU interface timing is latched by the following
+	 * atomic flush at the same commit boundary.
+	 */
+	if (msm_dsi_manager_stage_seamless_dfps())
+		DRM_ERROR("failed to stage seamless DSI timing update\n");
+#endif
+}
+
+static void
+msm_atomic_commit_seamless_downstream_modesets(struct drm_atomic_commit *state)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_connector *connector;
+	struct drm_connector_list_iter conn_iter;
+
+	drm_connector_list_iter_begin(state->dev, &conn_iter);
+	drm_for_each_connector_iter(connector, &conn_iter) {
+		struct drm_crtc_state *crtc_state;
+		struct drm_encoder *encoder;
+		struct drm_bridge *bridge;
+
+		conn_state = drm_atomic_get_new_connector_state(state, connector);
+		if (!conn_state)
+			conn_state = connector->state;
+
+		if (!conn_state->crtc || !conn_state->best_encoder)
+			continue;
+
+		crtc_state = drm_atomic_get_new_crtc_state(state,
+							 conn_state->crtc);
+		if (!crtc_state || !crtc_state->seamless_dfps)
+			continue;
+
+		encoder = conn_state->best_encoder;
+		bridge = drm_bridge_chain_get_first_bridge(encoder);
+		if (!bridge ||
+		    list_is_last(&bridge->chain_node, &encoder->bridge_chain))
+			continue;
+
+		/*
+		 * The DSI timing database has now been released on the new frame
+		 * period.  Run panel and any later bridge mode_set callbacks only
+		 * now, so their DCS command insertion observes a live video-done
+		 * boundary for the new mode.
+		 */
+		bridge = list_next_entry(bridge, chain_node);
+		drm_bridge_chain_mode_set(bridge, &crtc_state->mode,
+					  &crtc_state->adjusted_mode);
+	}
+	drm_connector_list_iter_end(&conn_iter);
+}
+
 int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 {
 	struct msm_drm_private *priv = dev->dev_private;
@@ -207,7 +415,11 @@ int msm_atomic_check(struct drm_device *dev, struct drm_atomic_commit *state)
 	if (ret)
 		return ret;
 
-	return drm_atomic_helper_check(dev, state);
+	ret = drm_atomic_helper_check(dev, state);
+	if (!ret)
+		msm_atomic_mark_seamless_dfps(state);
+
+	return ret;
 }
 
 void msm_atomic_commit_tail(struct drm_atomic_commit *state)
@@ -244,9 +456,14 @@ void msm_atomic_commit_tail(struct drm_atomic_commit *state)
 	/*
 	 * Push atomic updates down to hardware:
 	 */
+	msm_atomic_mask_seamless_modesets(state, true);
 	drm_atomic_helper_commit_modeset_disables(dev, state);
+	msm_atomic_mask_seamless_modesets(state, false);
+	msm_atomic_commit_seamless_modesets(state);
 	drm_atomic_helper_commit_planes(dev, state, 0);
+	msm_atomic_mask_seamless_modesets(state, true);
 	drm_atomic_helper_commit_modeset_enables(dev, state);
+	msm_atomic_mask_seamless_modesets(state, false);
 
 	if (async) {
 		struct msm_pending_timer *timer =
@@ -309,6 +526,21 @@ fallback:
 	trace_msm_atomic_wait_flush_start(crtc_mask);
 	kms->funcs->wait_flush(kms, crtc_mask);
 	trace_msm_atomic_wait_flush_finish(crtc_mask);
+
+#if IS_ENABLED(CONFIG_DRM_MSM_DSI)
+	if (msm_atomic_has_seamless_dfps(state)) {
+		/*
+		 * The DPU interface timing is part of the preceding atomic flush,
+		 * while the bonded DSI timing is still held in its shadow database.
+		 * Wait for the actual CRTC frame boundary before releasing both DSI
+		 * links. A fixed microsecond delay is invalid across 60/90/120 Hz and
+		 * can overflow the DPU frame-event queue during repeated DFPS.
+		 */
+		msm_atomic_wait_seamless_dfps_vblank(state);
+		msm_dsi_manager_complete_seamless_dfps();
+		msm_atomic_commit_seamless_downstream_modesets(state);
+	}
+#endif
 
 	vblank_put(kms, crtc_mask);
 
