@@ -3,6 +3,8 @@
  * Copyright (c) 2015, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/workqueue.h>
+
 #include "drm/drm_bridge_connector.h"
 
 #include "msm_kms.h"
@@ -276,6 +278,26 @@ static void dsi_mgr_bridge_power_off(struct drm_bridge *bridge)
 	dsi_mgr_phy_disable(id);
 }
 
+static void dsi_blank_work_fn(struct work_struct *work)
+{
+	enum drm_notifier_data blank = MI_DRM_BLANK_UNBLANK;
+
+	mi_drm_notifier_call_chain(MI_DRM_EVENT_BLANK, &blank);
+}
+
+static DECLARE_WORK(dsi_blank_work, dsi_blank_work_fn);
+
+static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+{
+	/*
+	 * The notifier's NT36523 subscriber flushes its event workqueue.  Do
+	 * not wait for that blocking chain from the atomic commit path: the
+	 * touch work may need resources held until the commit completes.
+	 * Queue the unblank only after the DSI host has started streaming.
+	 */
+	schedule_work(&dsi_blank_work);
+}
+
 static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int id = dsi_mgr_bridge_get_id(bridge);
@@ -284,7 +306,6 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
 	int ret;
-	enum drm_notifier_data notifier_data;
 
 	DBG("id=%d", id);
 
@@ -297,9 +318,6 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
 		return;
 	}
-
-	notifier_data = MI_DRM_BLANK_UNBLANK;
-	mi_drm_notifier_call_chain(MI_DRM_EVENT_BLANK, &notifier_data);
 
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
@@ -521,6 +539,7 @@ static int dsi_mgr_bridge_attach(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.attach = dsi_mgr_bridge_attach,
 	.pre_enable = dsi_mgr_bridge_pre_enable,
+	.enable = dsi_mgr_bridge_enable,
 	.post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,
