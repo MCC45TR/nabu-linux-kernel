@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Xiaomi Pad 5 dynamic tablet-mode input switch.
+ * Xiaomi Pad 5 keyboard-aware tablet-mode input switch.
  *
- * Nabu is a tablet unless its keyboard cover is physically attached. Exposing
- * that state through SW_TABLET_MODE lets desktop environments switch between
- * touch-first tablet mode and keyboard-first computer mode without mistaking
- * an unrelated USB pointer for a convertible keyboard.
+ * Nabu stays in tablet mode unless the keyboard cover is physically attached
+ * and computer mode is explicitly requested. This keeps automatic rotation
+ * active when a cover or an unrelated USB pointer is present.
  */
 
 #include <linux/input.h>
@@ -18,19 +17,24 @@
 static struct input_dev *nabu_tablet_mode_input;
 static DEFINE_MUTEX(nabu_tablet_mode_lock);
 static bool nabu_keyboard_attached;
+static bool nabu_computer_mode;
 
-void xiaomi_nabu_keyboard_set_attached(bool attached)
+void xiaomi_nabu_keyboard_update_mode(bool attached, bool computer_mode)
 {
+	bool tablet_mode;
+
 	mutex_lock(&nabu_tablet_mode_lock);
 	nabu_keyboard_attached = attached;
+	nabu_computer_mode = attached && computer_mode;
+	tablet_mode = !(nabu_keyboard_attached && nabu_computer_mode);
 	if (nabu_tablet_mode_input) {
 		input_report_switch(nabu_tablet_mode_input, SW_TABLET_MODE,
-				    !attached);
+				    tablet_mode);
 		input_sync(nabu_tablet_mode_input);
 	}
 	mutex_unlock(&nabu_tablet_mode_lock);
 }
-EXPORT_SYMBOL_GPL(xiaomi_nabu_keyboard_set_attached);
+EXPORT_SYMBOL_GPL(xiaomi_nabu_keyboard_update_mode);
 
 static int __init nabu_tablet_mode_init(void)
 {
@@ -57,7 +61,8 @@ static int __init nabu_tablet_mode_init(void)
 
 	mutex_lock(&nabu_tablet_mode_lock);
 	nabu_tablet_mode_input = input;
-	input_report_switch(input, SW_TABLET_MODE, !nabu_keyboard_attached);
+	input_report_switch(input, SW_TABLET_MODE,
+			    !(nabu_keyboard_attached && nabu_computer_mode));
 	input_sync(input);
 	mutex_unlock(&nabu_tablet_mode_lock);
 

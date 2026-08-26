@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* Xiaomi Pad 5 pogo keyboard-cover power and presence controller. */
+/* Xiaomi Pad 5 pogo keyboard-cover power, presence and mode controller. */
 
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
@@ -20,29 +21,43 @@ struct nabu_keyboard {
 	struct gpio_desc *reset;
 	struct gpio_desc *detect;
 	struct delayed_work detect_work;
+	struct mutex lock;
 	int irq;
 	bool connected;
+	bool computer_mode;
 	bool wake_enabled;
 };
 
 static void nabu_keyboard_publish_state(struct nabu_keyboard *keyboard,
 					bool connected, bool force)
 {
-	char state[40];
-	char *envp[2];
+	char connected_state[40];
+	char mode_state[40];
+	char *envp[] = { connected_state, mode_state, NULL };
+	bool computer_mode;
 
-	if (!force && keyboard->connected == connected)
+	mutex_lock(&keyboard->lock);
+	if (!force && keyboard->connected == connected) {
+		mutex_unlock(&keyboard->lock);
 		return;
+	}
 
 	keyboard->connected = connected;
-	xiaomi_nabu_keyboard_set_attached(connected);
-	snprintf(state, sizeof(state), "XIAOMI_KEYBOARD_CONNECTED=%u",
-		 connected);
-	envp[0] = state;
-	envp[1] = NULL;
+	if (!connected)
+		keyboard->computer_mode = false;
+	computer_mode = keyboard->computer_mode;
+	xiaomi_nabu_keyboard_update_mode(keyboard->connected,
+					  computer_mode);
+	snprintf(connected_state, sizeof(connected_state),
+		 "XIAOMI_KEYBOARD_CONNECTED=%u", keyboard->connected);
+	snprintf(mode_state, sizeof(mode_state),
+		 "XIAOMI_KEYBOARD_COMPUTER_MODE=%u", computer_mode);
+	mutex_unlock(&keyboard->lock);
+
 	kobject_uevent_env(&keyboard->dev->kobj, KOBJ_CHANGE, envp);
-	dev_info(keyboard->dev, "keyboard cover %s\n",
-		 connected ? "attached" : "detached");
+	dev_info(keyboard->dev, "keyboard cover %s; computer mode %s\n",
+		 connected ? "attached" : "detached",
+		 computer_mode ? "enabled" : "disabled");
 }
 
 static void nabu_keyboard_detect_work(struct work_struct *work)
@@ -77,10 +92,73 @@ static ssize_t connected_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
 	struct nabu_keyboard *keyboard = dev_get_drvdata(dev);
+	bool connected;
 
-	return sysfs_emit(buf, "%u\n", keyboard->connected);
+	mutex_lock(&keyboard->lock);
+	connected = keyboard->connected;
+	mutex_unlock(&keyboard->lock);
+
+	return sysfs_emit(buf, "%u\n", connected);
 }
 static DEVICE_ATTR_RO(connected);
+
+static ssize_t computer_mode_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct nabu_keyboard *keyboard = dev_get_drvdata(dev);
+	bool computer_mode;
+
+	mutex_lock(&keyboard->lock);
+	computer_mode = keyboard->computer_mode;
+	mutex_unlock(&keyboard->lock);
+
+	return sysfs_emit(buf, "%u\n", computer_mode);
+}
+
+static ssize_t computer_mode_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct nabu_keyboard *keyboard = dev_get_drvdata(dev);
+	char mode_state[40];
+	char *envp[] = { mode_state, NULL };
+	bool computer_mode;
+	int ret;
+
+	ret = kstrtobool(buf, &computer_mode);
+	if (ret)
+		return ret;
+
+	mutex_lock(&keyboard->lock);
+	if (computer_mode && !keyboard->connected) {
+		mutex_unlock(&keyboard->lock);
+		return -ENODEV;
+	}
+	if (keyboard->computer_mode == computer_mode) {
+		mutex_unlock(&keyboard->lock);
+		return count;
+	}
+
+	keyboard->computer_mode = computer_mode;
+	xiaomi_nabu_keyboard_update_mode(keyboard->connected,
+					  keyboard->computer_mode);
+	snprintf(mode_state, sizeof(mode_state),
+		 "XIAOMI_KEYBOARD_COMPUTER_MODE=%u", keyboard->computer_mode);
+	mutex_unlock(&keyboard->lock);
+
+	kobject_uevent_env(&keyboard->dev->kobj, KOBJ_CHANGE, envp);
+	dev_info(keyboard->dev, "computer mode %s\n",
+		 computer_mode ? "enabled" : "disabled");
+	return count;
+}
+static DEVICE_ATTR_RW(computer_mode);
+
+static struct attribute *nabu_keyboard_attrs[] = {
+	&dev_attr_connected.attr,
+	&dev_attr_computer_mode.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nabu_keyboard);
 
 static int nabu_keyboard_probe(struct platform_device *pdev)
 {
@@ -94,6 +172,7 @@ static int nabu_keyboard_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	keyboard->dev = dev;
+	mutex_init(&keyboard->lock);
 	keyboard->vdd = devm_gpiod_get(dev, "vdd", GPIOD_OUT_LOW);
 	if (IS_ERR(keyboard->vdd))
 		return dev_err_probe(dev, PTR_ERR(keyboard->vdd),
@@ -132,23 +211,17 @@ static int nabu_keyboard_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_power_off;
 
-	ret = device_create_file(dev, &dev_attr_connected);
-	if (ret)
-		goto err_power_off;
-
 	device_init_wakeup(dev,
 			   of_property_read_bool(dev->of_node, "wakeup-source"));
 	connected = gpiod_get_value_cansleep(keyboard->detect);
 	if (connected < 0) {
 		ret = connected;
-		goto err_remove_file;
+		goto err_power_off;
 	}
 	nabu_keyboard_publish_state(keyboard, connected, true);
 
 	return 0;
 
-err_remove_file:
-	device_remove_file(dev, &dev_attr_connected);
 err_power_off:
 	gpiod_set_value_cansleep(keyboard->reset, 1);
 	gpiod_set_value_cansleep(keyboard->vdd, 0);
@@ -159,7 +232,6 @@ static void nabu_keyboard_remove(struct platform_device *pdev)
 {
 	struct nabu_keyboard *keyboard = platform_get_drvdata(pdev);
 
-	device_remove_file(keyboard->dev, &dev_attr_connected);
 	cancel_delayed_work_sync(&keyboard->detect_work);
 	nabu_keyboard_publish_state(keyboard, false, true);
 	gpiod_set_value_cansleep(keyboard->reset, 1);
@@ -210,6 +282,7 @@ static struct platform_driver nabu_keyboard_driver = {
 		.name = "xiaomi-nabu-keyboard",
 		.of_match_table = nabu_keyboard_of_match,
 		.pm = pm_sleep_ptr(&nabu_keyboard_pm_ops),
+		.dev_groups = nabu_keyboard_groups,
 	},
 };
 module_platform_driver(nabu_keyboard_driver);

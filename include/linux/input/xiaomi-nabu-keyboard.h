@@ -5,9 +5,10 @@
 #include <linux/types.h>
 
 #if IS_ENABLED(CONFIG_INPUT_XIAOMI_NABU_TABLET_MODE)
-void xiaomi_nabu_keyboard_set_attached(bool attached);
+void xiaomi_nabu_keyboard_update_mode(bool attached, bool computer_mode);
 #else
-static inline void xiaomi_nabu_keyboard_set_attached(bool attached) { }
+static inline void xiaomi_nabu_keyboard_update_mode(bool attached,
+					     bool computer_mode) { }
 #endif
 
 #endif
