@@ -39,7 +39,7 @@
 static bool cached_capture;
 module_param(cached_capture, bool, 0444);
 MODULE_PARM_DESC(cached_capture,
-		 "Use cacheable H.264/HEVC CAPTURE MMAP buffers on legacy Iris1");
+		 "Use cacheable H.264/HEVC/VP9 CAPTURE MMAP buffers on legacy Iris1");
 
 static bool iris1_use_cached_capture(struct iris_inst *inst,
 				     struct vb2_queue *q)
@@ -47,7 +47,8 @@ static bool iris1_use_cached_capture(struct iris_inst *inst,
 	return cached_capture &&
 	       inst->core->iris_platform_data->legacy_vpu5 &&
 	       (inst->codec == V4L2_PIX_FMT_H264 ||
-		inst->codec == V4L2_PIX_FMT_HEVC) &&
+		inst->codec == V4L2_PIX_FMT_HEVC ||
+		inst->codec == V4L2_PIX_FMT_VP9) &&
 	       V4L2_TYPE_IS_CAPTURE(q->type) &&
 	       q->memory == VB2_MEMORY_MMAP;
 }
@@ -226,20 +227,21 @@ int iris_vb2_queue_setup(struct vb2_queue *q,
 	 * FFmpeg's v4l2m2m-copy path maps CAPTURE buffers into the CPU and
 	 * uploads every decoded frame to the display API.  Coherent DMA memory
 	 * is expensive to read on SM8150, especially for 4K60 NV12.  For this
-	 * opt-in Iris1/H.264/HEVC path, allocate cacheable streaming DMA memory
+	 * opt-in Iris1 decode path, allocate cacheable streaming DMA memory
 	 * and let vb2_dma_contig perform the required post-DMA cache maintenance
 	 * before each completed frame is returned to userspace.
 	 *
 	 * Keep this limited to MMAP: imported DMABUF ownership and cache policy
-	 * belong to the exporter.  VP9 is deliberately excluded because its IOVA
-	 * placement work depends on the existing allocation lifecycle.
+	 * belong to the exporter.  VP9 keeps its high-IOVA placeholder lifecycle:
+	 * the placeholder is released before these CAPTURE buffers are allocated.
 	 */
 	if (iris1_use_cached_capture(inst, q)) {
 		q->dma_dir = DMA_FROM_DEVICE;
 		q->non_coherent_mem = true;
 		dev_info(core->dev,
-			 "Iris1 v99: using cacheable %s CAPTURE MMAP buffers; dynamic power vote starts at %u fps\n",
-			 inst->codec == V4L2_PIX_FMT_H264 ? "H.264" : "HEVC",
+			 "Iris1 v100: using cacheable %s CAPTURE MMAP buffers; dynamic power vote starts at %u fps\n",
+			 inst->codec == V4L2_PIX_FMT_H264 ? "H.264" :
+			 inst->codec == V4L2_PIX_FMT_HEVC ? "HEVC" : "VP9",
 			 iris_get_operating_fps(inst));
 	}
 
