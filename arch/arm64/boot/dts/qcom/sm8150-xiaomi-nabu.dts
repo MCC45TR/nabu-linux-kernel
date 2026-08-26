@@ -140,6 +140,18 @@
 		voltage-max-design-microvolt = <4480000>;
 	};
 
+	xiaomi_keyboard: keyboard-cover {
+		compatible = "xiaomi,nabu-keyboard";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&keyboard_active>;
+		pinctrl-1 = <&keyboard_suspend>;
+		vdd-gpios = <&tlmm 82 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 49 GPIO_ACTIVE_LOW>;
+		detect-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+		wakeup-source;
+		status = "okay";
+	};
+
 	bl_vddpos_5p5: bl-vddpos-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "bl_vddpos_5p5";
@@ -214,7 +226,7 @@
 };
 
 &apps_rsc {
-	pm8150-rpmh-regulators {
+	regulators-0 {
 		compatible = "qcom,pm8150-rpmh-regulators";
 		qcom,pmic-id = "a";
 
@@ -337,7 +349,7 @@
 		};
 	};
 
-	pm8150l-rpmh-regulators {
+	regulators-1 {
 		compatible = "qcom,pm8150l-rpmh-regulators";
 		qcom,pmic-id = "c";
 
@@ -723,6 +735,8 @@
 };
 
 &pm8150b_vbus {
+	regulator-min-microamp = <500000>;
+	regulator-max-microamp = <3000000>;
 	status = "okay";
 };
 
@@ -857,9 +871,11 @@
 
 &spi18 {
 	status = "okay";
+	/delete-property/ reg-names;
+	/delete-property/ spi-max-frequency;
 
 	touchscreen@0 {
-		compatible = "novatek,NVT-ts-spi";
+		compatible = "novatek,nt36523-spi";
 		reg = <0>;
 
 		spi-max-frequency = <9600000>;
@@ -896,7 +912,37 @@
 		bias-disable;
 	};
 
-	qup_uart13_sleep: qup-uart13-sleep {
+	qup_uart13_default: qup-uart13-default-state {
+		cts-pins {
+			pins = "gpio43";
+			function = "qup13";
+			drive-strength = <2>;
+			bias-bus-hold;
+		};
+
+		rts-pins {
+			pins = "gpio44";
+			function = "qup13";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		tx-pins {
+			pins = "gpio45";
+			function = "qup13";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		rx-pins {
+			pins = "gpio46";
+			function = "qup13";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+	};
+
+	qup_uart13_sleep: qup-uart13-sleep-state {
 		pinmux {
 			pins = "gpio43", "gpio44",
 			       "gpio45", "gpio46";
@@ -944,124 +990,47 @@
 	};
 
 	bl_en_state: bl-default-state {
-		bl-en {
-			pins = "gpio27";
-			function = "gpio";
-
-			drive-strength = <16>;
-			output-high;
-			bias-disable;
-		};
+		pins = "gpio27";
+		function = "gpio";
+		drive-strength = <16>;
+		output-high;
+		bias-disable;
 	};
 
 	keyboard_active: keyboard-active-state {
-		sleep-pins {
+		data-pins {
 			pins = "gpio4";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-up;
 		};
 
-		reset-pins {
-			pins = "gpio49";
+		detect-pins {
+			pins = "gpio41";
 			function = "gpio";
-			drive-strength = <4>;
+			drive-strength = <2>;
 			bias-pull-up;
-			output-high;
-		};
-
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-up;
-			output-high;
+			input-enable;
 		};
 	};
 
 	keyboard_suspend: keyboard-suspend-state {
-		sleep-pins {
+		data-pins {
 			pins = "gpio4";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-down;
 		};
 
-		reset-pins {
-			pins = "gpio49";
+		detect-pins {
+			pins = "gpio41";
 			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
-		};
-
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
+			drive-strength = <2>;
+			bias-pull-up;
+			input-enable;
 		};
 	};
 
-	hall {
-                hall_intr3: hall_intr3 {
-                    mux {
-                        pins = "gpio101";
-                        function = "gpio";
-                    };
-
-                    config {
-                        pins = "gpio101";
-                        drive-strength = <2>;
-                        bias-pull-up;
-                        input-enable;
-                    };
-                };
-
-                hall_intr4: hall_intr4 {
-                    mux {
-                        pins = "gpio134";
-                        function = "gpio";
-                    };
-
-                    config {
-                        pins = "gpio134";
-                        drive-strength = <2>;
-                        bias-pull-up;
-                        input-enable;
-                    };
-                };
-        };
-
-        idt {
-                idt_int: idt_int {
-                    mux {
-                        pins = "gpio95";
-                        function = "gpio";
-                    };
-
-                    config {
-                        pins = "gpio95";
-                        drive-strength = <2>;
-                        bias-pull-up;
-                        input-enable;
-                    };
-                };
-
-                txon_enable: txon_enable {
-                    mux {
-                        pins = "gpio3";
-                        function = "gpio";
-                    };
-
-                    config {
-                        pins = "gpio3";
-                        drive-strength = <16>;
-                        bias-disable;
-                        bias-pull-down;
-                        output-low;
-                    };
-                };
-        };
 };
 
 &uart2 {
@@ -1076,6 +1045,7 @@
 				<&tlmm 46 IRQ_TYPE_EDGE_FALLING>;
 
 	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&qup_uart13_default>;
 	pinctrl-1 = <&qup_uart13_sleep>;
 
 	bluetooth: bluetooth {
@@ -1106,9 +1076,26 @@
 	status = "okay";
 
 	vdda-phy-supply = <&vreg_l5a_0p8>;
-	vdda-phy-max-microamp = <90200>;
 	vdda-pll-supply = <&vreg_l3c_1p2>;
-	vdda-pll-max-microamp = <19000>;
+};
+
+&wcd9340 {
+	reset-gpios = <&tlmm 143 GPIO_ACTIVE_HIGH>;
+	vdd-buck-sido-supply = <&vreg_s4a_1p8>;
+	vdd-buck-supply = <&vreg_s4a_1p8>;
+	vdd-tx-supply = <&vreg_s4a_1p8>;
+	vdd-rx-supply = <&vreg_s4a_1p8>;
+	vdd-io-supply = <&vreg_s4a_1p8>;
+
+	qcom,micbias1-microvolt = <1800000>;
+	qcom,micbias2-microvolt = <2750000>;
+	qcom,micbias3-microvolt = <1800000>;
+	qcom,micbias4-microvolt = <1800000>;
+
+	qcom,mbhc-buttons-vthreshold-microvolt =
+		<75000 150000 237000 500000 500000 500000 500000 500000>;
+	qcom,mbhc-headset-vthreshold-microvolt = <2600000>;
+	qcom,mbhc-headphone-vthreshold-microvolt = <50000>;
 };
 
 &usb_1 {
@@ -1148,9 +1135,6 @@
 	vdda18-supply = <&vreg_l12a_1p8>;
 	vdda33-supply = <&vreg_l2a_3p1>;
 	status = "okay";
-	pinctrl-0 = <&keyboard_active>;
-	pinctrl-1 = <&keyboard_suspend>;
-	pinctrl-names = "default", "sleep";
 };
 
 &usb_2_dwc3 {
@@ -1173,16 +1157,21 @@
 &i2c17 {
 	status = "okay";
 
-        idtp9418: idtp9418@3b {
-                compatible = "idt,p9418";
-                reg = <0x3b>;
-                status = "okay";
-                irq-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
-		pen-det-active-high-gpios = <&tlmm 101 GPIO_ACTIVE_HIGH>;
-		pen-det-active-low-gpios =<&tlmm 134 GPIO_ACTIVE_HIGH>;
-                enable-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
-                boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
-        };
+	idtp9418: wireless-power@3b {
+		compatible = "idt,p9418";
+		reg = <0x3b>;
+		status = "okay";
+		idt,irq-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
+		idt,hall3-gpios = <&tlmm 101 GPIO_ACTIVE_HIGH>;
+		idt,hall4-gpios = <&tlmm 134 GPIO_ACTIVE_HIGH>;
+		idt,reverse-enable-gpios = <&tlmm 3 GPIO_ACTIVE_HIGH>;
+		idt,reverse-boost-enable-gpios = <&tlmm 47 GPIO_ACTIVE_HIGH>;
+	};
 };
 
-#include "sm8150-xiaomi-nabu-power-scaffold.dtsi"
+/*
+ * The high-power charge-pump and board-thermistor scaffold remains in the
+ * source tree for future hardware qualification.  It is deliberately not
+ * included in the production DTB until matching drivers and physical safety
+ * limits have been validated on Nabu.
+ */

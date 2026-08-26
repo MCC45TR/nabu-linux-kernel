@@ -1865,9 +1865,18 @@ static int ath10k_snoc_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_qmi_deinit;
 
+	ret = device_init_wakeup(dev, true);
+	if (ret) {
+		ath10k_warn(ar, "failed to enable wakeup support: %d\n", ret);
+		goto err_modem_deinit;
+	}
+
 	ath10k_dbg(ar, ATH10K_DBG_SNOC, "snoc probe\n");
 
 	return 0;
+
+err_modem_deinit:
+	ath10k_modem_deinit(ar);
 
 err_qmi_deinit:
 	ath10k_qmi_deinit(ar);
@@ -1894,6 +1903,7 @@ static int ath10k_snoc_free_resources(struct ath10k *ar)
 	ath10k_dbg(ar, ATH10K_DBG_SNOC, "snoc free resources\n");
 
 	set_bit(ATH10K_SNOC_FLAG_UNREGISTERING, &ar_snoc->flags);
+	device_init_wakeup(ar->dev, false);
 
 	ath10k_core_unregister(ar);
 	ath10k_fw_deinit(ar);

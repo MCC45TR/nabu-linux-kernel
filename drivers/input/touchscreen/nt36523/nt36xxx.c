@@ -1929,6 +1929,7 @@ MODULE_DEVICE_TABLE(spi, nvt_ts_id);
 
 #ifdef CONFIG_OF
 static struct of_device_id nvt_match_table[] = {
+	{ .compatible = "novatek,nt36523-spi",},
 	{ .compatible = "novatek,NVT-ts-spi",},
 	{ },
 };

@@ -76,8 +76,21 @@ static const __u8 *xiaomi_report_fixup(struct hid_device *hdev, __u8 *rdesc,
 	return rdesc;
 }
 
+static int xiaomi_input_configured(struct hid_device *hdev,
+				   struct hid_input *hidinput)
+{
+	/* The Nabu keyboard controller exposes a non-functional mouse. */
+	if (hdev->vendor == USB_VENDOR_ID_NANO_IC &&
+	    hdev->product == USB_DEVICE_ID_XIAOMI_NABU_KEYBOARD)
+		__clear_bit(EV_REL, hidinput->input->evbit);
+
+	return 0;
+}
+
 static const struct hid_device_id xiaomi_devices[] = {
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_XIAOMI, USB_DEVICE_ID_MI_SILENT_MOUSE) },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_NANO_IC,
+			 USB_DEVICE_ID_XIAOMI_NABU_KEYBOARD) },
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, xiaomi_devices);
@@ -86,6 +99,7 @@ static struct hid_driver xiaomi_driver = {
 	.name = "xiaomi",
 	.id_table = xiaomi_devices,
 	.report_fixup = xiaomi_report_fixup,
+	.input_configured = xiaomi_input_configured,
 };
 module_hid_driver(xiaomi_driver);
 

@@ -1183,6 +1183,14 @@ config FUEL_GAUGE_MM8013
 	  the state of charge, temperature, cycle count, actual and design
 	  capacity, etc.
 
+config CHARGER_IDTP9418
+	tristate "IDT P9418 wireless power transmitter driver"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Say Y or M here to enable the IDT P9418 wireless power transmitter
+	  used by Xiaomi Nabu to charge its active stylus.
+
 config MACSMC_POWER
 	tristate "Apple SMC Battery and Power Driver"
 	depends on MFD_MACSMC

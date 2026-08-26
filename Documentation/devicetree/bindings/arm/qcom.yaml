@@ -1063,6 +1063,7 @@ properties:
               - qcom,sm8150-mtp
               - sony,bahamut-generic
               - sony,griffin-generic
+              - xiaomi,nabu
           - const: qcom,sm8150
 
       - items:

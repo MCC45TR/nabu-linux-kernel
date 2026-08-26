@@ -276,6 +276,18 @@ static void dsi_mgr_bridge_power_off(struct drm_bridge *bridge)
 	dsi_mgr_phy_disable(id);
 }
 
+static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+{
+	enum drm_notifier_data notifier_data = MI_DRM_BLANK_UNBLANK;
+
+	/*
+	 * The panel bridge is enabled before this callback. Notify the touch
+	 * controller only after the complete display pipeline is ready; resuming
+	 * touch from pre_enable() races DSI host/panel bring-up on Nabu.
+	 */
+	mi_drm_notifier_call_chain(MI_DRM_EVENT_BLANK, &notifier_data);
+}
+
 static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int id = dsi_mgr_bridge_get_id(bridge);
@@ -283,7 +295,6 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
 	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
-	enum drm_notifier_data notifier_data;
 	int ret;
 
 	DBG("id=%d", id);
@@ -297,9 +308,6 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 		dev_err(&msm_dsi->pdev->dev, "Power on failed: %d\n", ret);
 		return;
 	}
-
-	notifier_data = MI_DRM_BLANK_UNBLANK;
-	mi_drm_notifier_call_chain(MI_DRM_EVENT_BLANK, &notifier_data);
 
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
@@ -521,6 +529,7 @@ static int dsi_mgr_bridge_attach(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.attach = dsi_mgr_bridge_attach,
 	.pre_enable = dsi_mgr_bridge_pre_enable,
+	.enable = dsi_mgr_bridge_enable,
 	.post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,

@@ -56,6 +56,8 @@
 			compatible = "qcom,pm8150b-vbus-reg";
 			status = "disabled";
 			reg = <0x1100>;
+			regulator-min-microamp = <500000>;
+			regulator-max-microamp = <3000000>;
 		};
 
 		pm8150b_typec: typec@1500 {
