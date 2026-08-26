@@ -171,9 +171,14 @@ int iris_vdec_inst_init(struct iris_inst *inst)
 {
 	struct iris_core *core = inst->core;
 	struct v4l2_format *f;
+	int ret;
 
 	inst->fmt_src  = kzalloc(sizeof(*inst->fmt_src), GFP_KERNEL);
 	inst->fmt_dst  = kzalloc(sizeof(*inst->fmt_dst), GFP_KERNEL);
+	if (!inst->fmt_src || !inst->fmt_dst) {
+		ret = -ENOMEM;
+		goto error_free_formats;
+	}
 
 	inst->fw_min_count = MIN_BUFFERS;
 
@@ -211,7 +216,19 @@ int iris_vdec_inst_init(struct iris_inst *inst)
 	memcpy(&inst->fw_caps[0], &core->inst_fw_caps_dec[0],
 	       INST_FW_CAP_MAX * sizeof(struct platform_inst_fw_cap));
 
-	return iris_ctrls_init(inst);
+	ret = iris_ctrls_init(inst);
+	if (ret)
+		goto error_free_formats;
+
+	return 0;
+
+error_free_formats:
+	kfree(inst->fmt_dst);
+	kfree(inst->fmt_src);
+	inst->fmt_dst = NULL;
+	inst->fmt_src = NULL;
+
+	return ret;
 }
 
 void iris_vdec_inst_deinit(struct iris_inst *inst)
@@ -244,6 +261,14 @@ static bool iris_vdec_p010_supported(struct iris_inst *inst)
 	 * Gen2 still advertises an 8-bit-only BIT_DEPTH capability.
 	 */
 	return !inst->core->iris_platform_data->core_arch;
+}
+
+u32 iris_vdec_raw_stride(u32 width, u32 pixelformat)
+{
+	u32 alignment = pixelformat == V4L2_PIX_FMT_P010 ? 256 : 128;
+	u32 bytes_per_sample = pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
+
+	return ALIGN(width * bytes_per_sample, alignment);
 }
 
 static const struct iris_fmt *
@@ -356,7 +381,7 @@ int iris_vdec_s_fmt(struct iris_inst *inst, struct v4l2_format *f)
 {
 	struct v4l2_format *fmt, *output_fmt;
 	struct vb2_queue *q;
-	u32 codec_align;
+	u32 codec_align, raw_pixfmt;
 
 	q = v4l2_m2m_get_vq(inst->m2m_ctx, f->type);
 	if (!q)
@@ -395,14 +420,13 @@ int iris_vdec_s_fmt(struct iris_inst *inst, struct v4l2_format *f)
 		output_fmt->fmt.pix_mp.xfer_func = f->fmt.pix_mp.xfer_func;
 		output_fmt->fmt.pix_mp.ycbcr_enc = f->fmt.pix_mp.ycbcr_enc;
 		output_fmt->fmt.pix_mp.quantization = f->fmt.pix_mp.quantization;
+		raw_pixfmt = output_fmt->fmt.pix_mp.pixelformat;
 
 		/* Update capture format based on new ip w/h */
 		output_fmt->fmt.pix_mp.width = ALIGN(f->fmt.pix_mp.width, 128);
 		output_fmt->fmt.pix_mp.height = ALIGN(f->fmt.pix_mp.height, 32);
 		output_fmt->fmt.pix_mp.plane_fmt[0].bytesperline =
-			ALIGN(f->fmt.pix_mp.width *
-			      (output_fmt->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1),
-			      128);
+			iris_vdec_raw_stride(f->fmt.pix_mp.width, raw_pixfmt);
 		output_fmt->fmt.pix_mp.plane_fmt[0].sizeimage =
 			iris_get_buffer_size(inst, BUF_OUTPUT);
 		inst->buffers[BUF_OUTPUT].size = iris_get_buffer_size(inst, BUF_OUTPUT);
@@ -420,12 +444,12 @@ int iris_vdec_s_fmt(struct iris_inst *inst, struct v4l2_format *f)
 		     !iris_vdec_p010_supported(inst)))
 			return -EINVAL;
 		fmt->fmt.pix_mp.pixelformat = f->fmt.pix_mp.pixelformat;
+		raw_pixfmt = fmt->fmt.pix_mp.pixelformat;
 		fmt->fmt.pix_mp.width = ALIGN(f->fmt.pix_mp.width, 128);
 		fmt->fmt.pix_mp.height = ALIGN(f->fmt.pix_mp.height, 32);
 		fmt->fmt.pix_mp.num_planes = 1;
 		fmt->fmt.pix_mp.plane_fmt[0].bytesperline =
-			ALIGN(f->fmt.pix_mp.width *
-			      (f->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1), 128);
+			iris_vdec_raw_stride(f->fmt.pix_mp.width, raw_pixfmt);
 		fmt->fmt.pix_mp.plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_OUTPUT);
 		inst->buffers[BUF_OUTPUT].min_count = iris_vpu_buf_count(inst, BUF_OUTPUT);
 		inst->buffers[BUF_OUTPUT].size = fmt->fmt.pix_mp.plane_fmt[0].sizeimage;

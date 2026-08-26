@@ -136,7 +136,7 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 	pixmp_op->width = ALIGN(event.width, 128);
 	pixmp_op->height = ALIGN(event.height, 32);
 	pixmp_op->plane_fmt[0].bytesperline =
-		ALIGN(event.width * (pixmp_op->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1), 128);
+		iris_vdec_raw_stride(event.width, pixmp_op->pixelformat);
 	pixmp_op->plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_OUTPUT);
 
 	matrix_coeff =  FIELD_GET(GENMASK(7, 0), event.colour_space);
