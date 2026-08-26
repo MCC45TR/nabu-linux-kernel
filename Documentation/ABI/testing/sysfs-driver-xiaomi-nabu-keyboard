@@ -1,0 +1,16 @@
+What:		/sys/bus/platform/drivers/xiaomi-nabu-keyboard/*/connected
+Date:		August 2026
+Contact:	MCC45TR <mcc45tr@users.noreply.github.com>
+Description:
+		Read-only physical keyboard-cover presence. The value is 1 when
+		the active-low pogo-cover detect GPIO is asserted and 0 otherwise.
+
+What:		/sys/bus/platform/drivers/xiaomi-nabu-keyboard/*/computer_mode
+Date:		August 2026
+Contact:	MCC45TR <mcc45tr@users.noreply.github.com>
+Description:
+		Read-write boolean policy controlling SW_TABLET_MODE. It defaults
+		to 0, so attaching the keyboard alone keeps the device in tablet
+		mode. Writing 1 is accepted only while the cover is connected and
+		reports computer mode by clearing SW_TABLET_MODE. Cover removal
+		resets the value to 0.

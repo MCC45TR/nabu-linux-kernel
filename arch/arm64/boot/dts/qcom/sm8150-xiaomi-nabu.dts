@@ -140,6 +140,18 @@
 		voltage-max-design-microvolt = <4480000>;
 	};
 
+	xiaomi_keyboard: keyboard-cover {
+		compatible = "xiaomi,nabu-keyboard";
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&keyboard_active>;
+		pinctrl-1 = <&keyboard_suspend>;
+		vdd-gpios = <&tlmm 82 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&tlmm 49 GPIO_ACTIVE_LOW>;
+		detect-gpios = <&tlmm 41 GPIO_ACTIVE_LOW>;
+		wakeup-source;
+		status = "okay";
+	};
+
 	bl_vddpos_5p5: bl-vddpos-regulator {
 		compatible = "regulator-fixed";
 		regulator-name = "bl_vddpos_5p5";
@@ -1004,50 +1016,36 @@
 	};
 
 	keyboard_active: keyboard-active-state {
-		sleep-pins {
+		data-pins {
 			pins = "gpio4";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-up;
 		};
 
-		reset-pins {
-			pins = "gpio49";
+		detect-pins {
+			pins = "gpio41";
 			function = "gpio";
-			drive-strength = <4>;
+			drive-strength = <2>;
 			bias-pull-up;
-			output-high;
-		};
-
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-up;
-			output-high;
+			input-enable;
 		};
 	};
 
 	keyboard_suspend: keyboard-suspend-state {
-		sleep-pins {
+		data-pins {
 			pins = "gpio4";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-down;
 		};
 
-		reset-pins {
-			pins = "gpio49";
+		detect-pins {
+			pins = "gpio41";
 			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
-		};
-
-		vdd-pins {
-			pins = "gpio82";
-			function = "gpio";
-			drive-strength = <4>;
-			bias-pull-down;
+			drive-strength = <2>;
+			bias-pull-up;
+			input-enable;
 		};
 	};
 
@@ -1197,9 +1195,6 @@
 	vdda18-supply = <&vreg_l12a_1p8>;
 	vdda33-supply = <&vreg_l2a_3p1>;
 	status = "okay";
-	pinctrl-0 = <&keyboard_active>;
-	pinctrl-1 = <&keyboard_suspend>;
-	pinctrl-names = "default", "sleep";
 };
 
 &usb_2_dwc3 {

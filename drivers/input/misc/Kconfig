@@ -962,12 +962,22 @@ config INPUT_STPMIC1_ONKEY
 	  module will be called stpmic1_onkey.
 
 config INPUT_XIAOMI_NABU_TABLET_MODE
-	bool "Xiaomi Pad 5 permanent tablet-mode switch"
+	bool "Xiaomi Pad 5 keyboard-aware tablet-mode switch"
 	depends on ARCH_QCOM
 	help
-	  Report the Xiaomi Pad 5 as permanently operating in tablet mode.
-	  Desktop environments otherwise disable automatic rotation whenever a
-	  USB pointer is present, including the SENEMOS recovery bridge mouse.
+	  Report the Xiaomi Pad 5 through the standard SW_TABLET_MODE interface.
+	  The device remains in tablet mode unless computer mode is explicitly
+	  enabled while a keyboard cover is physically attached.
+
+config INPUT_XIAOMI_NABU_KEYBOARD
+	tristate "Xiaomi Pad 5 keyboard-cover controller"
+	depends on ARCH_QCOM && GPIOLIB
+	select INPUT_XIAOMI_NABU_TABLET_MODE
+	help
+	  Control power/reset for the internal pogo-keyboard USB controller,
+	  debounce its physical detect line, publish connection uevents, and
+	  expose an explicit computer-mode policy while preserving tablet mode
+	  by default.
 
 	  Say Y when building a kernel for Xiaomi Pad 5 (nabu).
 
