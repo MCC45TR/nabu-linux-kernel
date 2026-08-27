@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-output_dir=${SENEMOS_OUTPUT_DIR:-/workspace/kernel-builds/linux-nabu-senemos-v7.2.0-linux-7.2}
+output_dir=${SENEMOS_OUTPUT_DIR:-/workspace/kernel-builds/linux-nabu-senemos-mainline-alpha-v7.2.0}
 jobs=${SENEMOS_JOBS:-16}
 
 # Keep the release deterministic. An explicitly set empty LOCALVERSION stops

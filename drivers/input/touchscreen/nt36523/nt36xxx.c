@@ -1923,6 +1923,7 @@ static const struct dev_pm_ops nvt_dev_pm_ops = {
 
 static const struct spi_device_id nvt_ts_id[] = {
 	{ NVT_SPI_NAME, 0 },
+	{ "nt36523-spi", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, nvt_ts_id);

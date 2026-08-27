@@ -2471,8 +2471,14 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 
 			err = qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
 				    data->vmperms, data->vmcount);
-			if (err)
+			if (err &&
+			    !(err == -EINVAL &&
+			      of_property_read_bool(rdev->of_node,
+						    "qcom,vmids-retained-on-restart")))
 				goto err_free_data;
+
+			if (err == -EINVAL)
+				dev_dbg(rdev, "reserved memory VMIDs retained across restart\n");
 		}
 
 	}
