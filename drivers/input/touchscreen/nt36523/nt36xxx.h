@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
 #include <linux/input.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
