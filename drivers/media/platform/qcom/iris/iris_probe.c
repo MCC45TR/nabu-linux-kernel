@@ -355,9 +355,36 @@ exit:
 	return ret;
 }
 
+static int __maybe_unused iris_system_suspend(struct device *dev)
+{
+	struct iris_core *core = dev_get_drvdata(dev);
+
+	/*
+	 * Runtime PM is deliberately forbidden on legacy VPU5 because its
+	 * power-collapse handshake is not implemented.  pm_runtime_force_suspend()
+	 * bypasses that prohibition and invokes iris_pm_suspend() anyway, which
+	 * makes iris_vpu_prepare_pc() return -EAGAIN and aborts every system
+	 * suspend.  Keep the already-active controller state across s2idle until
+	 * the legacy power-collapse sequence is implemented.
+	 */
+	if (core->iris_platform_data->legacy_vpu5)
+		return 0;
+
+	return pm_runtime_force_suspend(dev);
+}
+
+static int __maybe_unused iris_system_resume(struct device *dev)
+{
+	struct iris_core *core = dev_get_drvdata(dev);
+
+	if (core->iris_platform_data->legacy_vpu5)
+		return 0;
+
+	return pm_runtime_force_resume(dev);
+}
+
 static const struct dev_pm_ops iris_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend,
-				pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(iris_system_suspend, iris_system_resume)
 	SET_RUNTIME_PM_OPS(iris_pm_suspend, iris_pm_resume, NULL)
 };
 

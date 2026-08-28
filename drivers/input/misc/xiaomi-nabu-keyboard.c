@@ -82,7 +82,19 @@ static irqreturn_t nabu_keyboard_detect_irq(int irq, void *data)
 {
 	struct nabu_keyboard *keyboard = data;
 
-	pm_wakeup_event(keyboard->dev, 500);
+	/*
+	 * A cover transition while the system is still awake must not leave a
+	 * wakeup event pending.  In particular, an attach/detach event during
+	 * the desktop's pre-suspend screen blank otherwise makes the freezer
+	 * abort the subsequent system suspend.
+	 *
+	 * Once the device PM suspend callback has armed the detect IRQ as a
+	 * wake source, keep the event long enough for userspace to finish the
+	 * resume path.  The IRQ itself remains enabled in both states so cover
+	 * presence reporting is unaffected.
+	 */
+	if (READ_ONCE(keyboard->wake_enabled))
+		pm_wakeup_event(keyboard->dev, 500);
 	mod_delayed_work(system_wq, &keyboard->detect_work,
 			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
 	return IRQ_HANDLED;
@@ -249,7 +261,7 @@ static int nabu_keyboard_suspend(struct device *dev)
 
 	ret = enable_irq_wake(keyboard->irq);
 	if (!ret)
-		keyboard->wake_enabled = true;
+		WRITE_ONCE(keyboard->wake_enabled, true);
 	return ret;
 }
 
@@ -259,7 +271,7 @@ static int nabu_keyboard_resume(struct device *dev)
 
 	if (keyboard->wake_enabled) {
 		disable_irq_wake(keyboard->irq);
-		keyboard->wake_enabled = false;
+		WRITE_ONCE(keyboard->wake_enabled, false);
 	}
 	mod_delayed_work(system_wq, &keyboard->detect_work,
 			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
