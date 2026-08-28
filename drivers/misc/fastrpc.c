@@ -2418,14 +2418,28 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		struct resource res;
 		u64 src_perms;
 
-		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
-		if (!err) {
-			src_perms = BIT(QCOM_SCM_VMID_HLOS);
-
-			qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
-				    data->vmperms, data->vmcount);
+		if (!data->vmcount) {
+			err = dev_err_probe(rdev, -EINVAL,
+					    "SDSP requires qcom,vmids\n");
+			goto err_free_data;
 		}
 
+		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
+		if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to resolve SDSP reserved memory\n");
+			goto err_free_data;
+		}
+
+		src_perms = BIT(QCOM_SCM_VMID_HLOS);
+		err = qcom_scm_assign_mem(res.start, resource_size(&res),
+					  &src_perms, data->vmperms,
+					  data->vmcount);
+		if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to assign SDSP reserved memory\n");
+			goto err_free_data;
+		}
 	}
 
 	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
