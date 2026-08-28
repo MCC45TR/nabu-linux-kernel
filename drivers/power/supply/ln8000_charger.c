@@ -264,6 +264,7 @@ struct ln8000_platform_data {
 	unsigned int
 		ntc_alarm_cfg; /* input/battery NTC voltage threshold code: 0~1023 */
 	unsigned int min_input_uv; /* minimum safe voltage for 2:1 switching */
+	bool input_ntc_unwired; /* board has no thermistor on the TSBUS input */
 };
 
 struct ln8000_info {
@@ -967,14 +968,19 @@ static int ln8000_init_device(struct ln8000_info *info)
 	LN8000_INIT_STEP(ln8000_change_opmode(info, LN8000_OPMODE_STANDBY));
 	LN8000_INIT_STEP(ln8000_enable_vac_ov(info, true));
 
-	/* Keep the hardware watchdog and every ADC-backed protection active. */
+	/* Keep the hardware watchdog and every populated ADC-backed protection active. */
 	LN8000_INIT_STEP(ln8000_update_reg(info, LN8000_REG_TIMER_CTRL,
 					   0x3 << 5,
 					   LN8000_WATCHDOG_40SEC << 5));
 	LN8000_INIT_STEP(ln8000_enable_wdt(info, true));
 	LN8000_INIT_STEP(ln8000_set_adc_hib_delay(info, ADC_HIBERNATE_4S));
 	LN8000_INIT_STEP(ln8000_set_adc_ch(info, LN8000_ADC_CH_ALL, true));
-	LN8000_INIT_STEP(ln8000_enable_tbus_monitor(info, true));
+	if (info->pdata->input_ntc_unwired) {
+		LN8000_INIT_STEP(ln8000_enable_tbus_monitor(info, false));
+		LN8000_INIT_STEP(ln8000_set_adc_ch(info, LN8000_ADC_CH_TSBUS, false));
+	} else {
+		LN8000_INIT_STEP(ln8000_enable_tbus_monitor(info, true));
+	}
 	LN8000_INIT_STEP(ln8000_enable_tbat_monitor(info, true));
 	LN8000_INIT_STEP(ln8000_set_adc_mode(info, ADC_AUTO_HIB_MODE));
 
@@ -984,7 +990,8 @@ static int ln8000_init_device(struct ln8000_info *info)
 		ln8000_write_reg(info, LN8000_REG_THRESHOLD_CTRL, 0x0e));
 
 	ln8000_print_regmap(info);
-	ln_info("initialization complete with all protections enabled\n");
+	ln_info("initialization complete; input NTC %s, all populated protections enabled\n",
+		info->pdata->input_ntc_unwired ? "not populated" : "enabled");
 
 #undef LN8000_INIT_STEP
 	return 0;
@@ -1472,6 +1479,8 @@ static int ln8000_parse_dt(struct ln8000_info *info)
 				       &pdata->min_input_uv);
 	if (ret)
 		return dev_err_probe(dev, ret, "missing minimum input voltage\n");
+	pdata->input_ntc_unwired =
+		device_property_read_bool(dev, "lionsemi,input-ntc-unwired");
 
 	if (pdata->bat_ovp_alarm_th >= pdata->bat_ovp_th ||
 	    pdata->bus_ovp_alarm_th >= pdata->bus_ovp_th ||

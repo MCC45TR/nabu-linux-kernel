@@ -36,12 +36,12 @@ struct sm8150_snd_data {
 static unsigned int tdm_slot_offset[8] = {0, 4, 8, 12, 16, 20, 24, 28};
 
 static const struct {
-	unsigned int rx[1];
+	unsigned int rx[2];
 } cs35l41_tdm_channel_map[] = {
-	{.rx = {5}}, /* BR: right ASP channel */
-	{.rx = {5}}, /* TR: right ASP channel */
-	{.rx = {4}}, /* BL: left ASP channel */
-	{.rx = {4}}, /* TL: left ASP channel */
+	{.rx = {4, 5}}, /* BR: Android-compatible ASPRX1/2 pair */
+	{.rx = {4, 5}}, /* TR: Android-compatible ASPRX1/2 pair */
+	{.rx = {4, 5}}, /* BL: Android-compatible ASPRX1/2 pair */
+	{.rx = {4, 5}}, /* TL: Android-compatible ASPRX1/2 pair */
 };
 
 static int sm8150_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,

@@ -99,6 +99,16 @@ properties:
     minimum: 0
     maximum: 3
 
+  cirrus,allow-missing-pdn-done:
+    description:
+      Allow a platform to complete amplifier power-down when the internal boost
+      PDN_DONE interrupt status does not assert before the timeout. The driver
+      only accepts the timeout after verifying that GLOBAL_EN and AMP_EN are
+      clear and that no amplifier, temperature, or boost protection fault is
+      reported. This is intended only for platforms whose vendor driver also
+      tolerates the missing status indication.
+    type: boolean
+
   cirrus,gpio1-polarity-invert:
     description:
       Boolean which specifies whether the GPIO1

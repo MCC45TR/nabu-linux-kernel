@@ -528,6 +528,7 @@
 		lionsemi,input-ocp-alarm-microamp = <3500000>;
 		lionsemi,ntc-alarm-code = <226>;
 		lionsemi,min-input-microvolt = <8000000>;
+		lionsemi,input-ntc-unwired;
 	};
 
 	typec-mux@43 {
@@ -562,6 +563,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -578,6 +580,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -594,6 +597,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -610,6 +614,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -777,6 +782,15 @@
 		flash-max-microamp = <1000000>;
 		flash-max-timeout-us = <1280000>;
 	};
+
+	led-1 {
+		function = LED_FUNCTION_FLASH;
+		color = <LED_COLOR_ID_YELLOW>;
+		led-sources = <2>;
+		led-max-microamp = <200000>;
+		flash-max-microamp = <1000000>;
+		flash-max-timeout-us = <1280000>;
+	};
 };
 
 &pon_pwrkey {
@@ -865,10 +879,10 @@
 	audio-routing =	"RX_BIAS", "MCLK",
 		"AMIC1", "MIC BIAS3",
 		"AMIC3", "MIC BIAS4",
-		"MultiMedia1 Playback", "BR SPK",
-		"MultiMedia1 Playback", "TR SPK",
-		"MultiMedia1 Playback", "BL SPK",
-		"MultiMedia1 Playback", "TL SPK";
+		"BR SPK", "MultiMedia1 Playback",
+		"TR SPK", "MultiMedia1 Playback",
+		"BL SPK", "MultiMedia1 Playback",
+		"TL SPK", "MultiMedia1 Playback";
 
 	mm1-dai-link {
 		link-name = "MultiMedia1";

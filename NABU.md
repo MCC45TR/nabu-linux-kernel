@@ -20,7 +20,8 @@ It is based on the SM8150 mainline kernel at commit
 | Touchscreen | Partially validated | 60 and 120 Hz are validated. The retained 90 Hz timing and scan-band path remain disabled pending display and long-duration touch validation. |
 | Rotation sensor | Validated | Automatic rotation works in the Plasma session. |
 | Ambient light sensor | Validated | Automatic brightness is exposed and enabled in the Plasma session. |
-| Internal speakers | Experimental | Four-channel routing is under development. Do not assume balanced or distortion-free output. |
+| Internal speakers | Experimental | Four-channel routing is under development. The DAPM routes name each speaker as the sink of the MultiMedia1 playback stream so idle UCM routing does not hold the amplifiers on. CS35L41 power-down tolerates a missing PDN_DONE indication only on Nabu and only after hardware-disable and protection-fault checks. Do not assume balanced or distortion-free output. |
+| Cameras | Foundation only | Rear OV13B10 and front OV8856 identities, 19.2 MHz clocks, CCI0 masters 0/1 and CSIPHY0/1 topology are identified from the Nabu vendor tree. CAMSS and both sensor drivers are built as modules, but no sensor is powered or probed until the SM8150 CAMSS/CCI port and three-rail sequences pass review. |
 
 The v1.4.0.6 candidate preserves the vblank-synchronised 60/120 Hz transition
 path and keeps the experimental 90 Hz timing compiled but hidden by default.
