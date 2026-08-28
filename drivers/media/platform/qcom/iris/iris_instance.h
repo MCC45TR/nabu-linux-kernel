@@ -79,7 +79,7 @@ struct iris_fmt {
  * @input_timestamp_valid: whether last_input_timestamp has been initialized
  * @seek_timestamp_pending: discard old-epoch output until seek_timestamp arrives
  * @corrupt_output_drops: consecutive corrupt legacy output frames recycled
- * @pending_output: legacy output held for one frame to detect a timestamp jump
+ * @pending_output: legacy output held to filter stale or hidden VP9 frames
  * @seek_hold_frames: output frames held after a seek before resuming in-place delivery
  * @display_delay: requested firmware display delay
  * @display_delay_enable: whether the requested display delay is active

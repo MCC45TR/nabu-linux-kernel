@@ -24,7 +24,7 @@
 #define IRIS1_SEEK_HOLD_FRAMES		30
 #define IRIS1_MAX_4K_MBPF		NUM_MBS_PER_FRAME(2176, 4096)
 
-static int iris_vdec_recycle_pending_output(struct iris_inst *inst)
+int iris_vdec_recycle_pending_output(struct iris_inst *inst)
 {
 	struct iris_buffer *buf = inst->pending_output;
 
@@ -33,7 +33,7 @@ static int iris_vdec_recycle_pending_output(struct iris_inst *inst)
 
 	inst->pending_output = NULL;
 	dev_info(inst->core->dev,
-		 "Iris1 v138: recycling pending old-epoch output timestamp %llu ns\n",
+		 "Iris1 v155: recycling pending output timestamp %llu ns\n",
 		 buf->timestamp);
 	buf->data_size = 0;
 	buf->flags = 0;

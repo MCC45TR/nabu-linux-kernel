@@ -23,6 +23,7 @@ int iris_vdec_streamon_output(struct iris_inst *inst);
 u32 iris_vdec_get_admission_fps(struct iris_inst *inst);
 int iris_vdec_qbuf(struct iris_inst *inst, struct vb2_v4l2_buffer *vbuf);
 bool iris_vdec_discard_stale_frame(struct iris_inst *inst, u64 timestamp);
+int iris_vdec_recycle_pending_output(struct iris_inst *inst);
 int iris_vdec_complete_pending_output(struct iris_inst *inst);
 int iris_vdec_hold_output(struct iris_inst *inst, struct iris_buffer *buf);
 void iris_vdec_clear_pending_output(struct iris_inst *inst);

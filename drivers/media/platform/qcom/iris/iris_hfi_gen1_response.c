@@ -582,7 +582,16 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 
 	if (inst->domain == DECODER && buf->type == BUF_OUTPUT &&
 	    inst->core->iris_platform_data->legacy_vpu5) {
-		ret = iris_vdec_complete_pending_output(inst);
+		/* Legacy VPU5 emits both subframes from a VP9 superframe, including
+		 * the leading show_frame=0 alt-ref frame.  HFI gives both outputs the
+		 * packet timestamp and does not set DROP_FRAME.  Keep one output
+		 * pending so a same-timestamp successor can replace the hidden frame. */
+		if (inst->codec == V4L2_PIX_FMT_VP9 && filled_len &&
+		    inst->pending_output &&
+		    inst->pending_output->timestamp == timestamp_us)
+			ret = iris_vdec_recycle_pending_output(inst);
+		else
+			ret = iris_vdec_complete_pending_output(inst);
 		if (ret)
 			goto error;
 		seek_was_pending = inst->seek_timestamp_pending;
@@ -668,9 +677,11 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 
 	if (inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len &&
 	    inst->core->iris_platform_data->legacy_vpu5 &&
-	    !(hfi_flags & (HFI_BUFFERFLAG_DATACORRUPT |
-			    HFI_BUFFERFLAG_DROP_FRAME)) &&
-	    !seek_was_pending && inst->seek_hold_frames) {
+	    !seek_was_pending &&
+	    (inst->codec == V4L2_PIX_FMT_VP9 ||
+	     (!(hfi_flags & (HFI_BUFFERFLAG_DATACORRUPT |
+			     HFI_BUFFERFLAG_DROP_FRAME)) &&
+	      inst->seek_hold_frames))) {
 		ret = iris_vdec_hold_output(inst, buf);
 		if (ret)
 			goto error;
