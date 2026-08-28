@@ -591,7 +591,13 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 	}
 
 	if (inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len) {
+		/* Legacy VP9 reports DROP_FRAME on filled, otherwise usable output
+		 * around show-existing frames and immediately after an in-place seek.
+		 * Hiding that completion starves one userspace target per occurrence
+		 * and can exhaust Chromium's pool.  Complete those VP9 buffers below;
+		 * retain the bounded recycle workaround for the other codecs. */
 		if (inst->core->iris_platform_data->legacy_vpu5 &&
+		    inst->codec != V4L2_PIX_FMT_VP9 &&
 		    (hfi_flags & (HFI_BUFFERFLAG_DATACORRUPT |
 				  HFI_BUFFERFLAG_DROP_FRAME)) &&
 		    inst->corrupt_output_drops < IRIS1_MAX_CORRUPT_OUTPUT_DROPS) {
@@ -643,10 +649,19 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 	buf->attr |= BUF_ATTR_DEQUEUED;
 	buf->attr |= BUF_ATTR_BUFFER_DONE;
 
-	if (hfi_flags & HFI_BUFFERFLAG_DATACORRUPT)
+	/* On legacy VP9, filled DROP_FRAME/DATACORRUPT buffers are usable output.
+	 * Do not turn them into VB2 errors: iris_vb2_buffer_done() would discard
+	 * their payload, and Chromium treats the dequeue error as fatal. */
+	if ((hfi_flags & HFI_BUFFERFLAG_DATACORRUPT) &&
+	    !(inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len &&
+	      inst->core->iris_platform_data->legacy_vpu5 &&
+	      inst->codec == V4L2_PIX_FMT_VP9))
 		flags |= V4L2_BUF_FLAG_ERROR;
 
-	if (hfi_flags & HFI_BUFFERFLAG_DROP_FRAME)
+	if ((hfi_flags & HFI_BUFFERFLAG_DROP_FRAME) &&
+	    !(inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len &&
+	      inst->core->iris_platform_data->legacy_vpu5 &&
+	      inst->codec == V4L2_PIX_FMT_VP9))
 		flags |= V4L2_BUF_FLAG_ERROR;
 
 	buf->flags |= flags;
