@@ -21,6 +21,7 @@
 
 #include <linux/delay.h>
 #include <linux/input.h>
+#include <linux/notifier.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
@@ -171,6 +172,8 @@ struct nvt_ts_data {
 	int db_wakeup;
 	bool wakeup_source;
 	bool irq_wake_enabled;
+	bool system_suspending;
+	struct notifier_block pm_notif;
 	uint8_t debug_flag;
 	bool fw_debug;
 	bool dev_pm_suspend;

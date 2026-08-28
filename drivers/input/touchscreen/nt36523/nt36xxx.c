@@ -26,6 +26,7 @@
 #include <linux/debugfs.h>
 #include <linux/of_gpio.h>
 #include <linux/of_irq.h>
+#include <linux/suspend.h>
 
 #ifdef CONFIG_DRM
 #include <drm/drm_notifier.h>
@@ -53,6 +54,32 @@ static int nvt_drm_notifier_callback(struct notifier_block *self, unsigned long 
 
 static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
+
+static int nvt_pm_notifier_callback(struct notifier_block *self,
+				    unsigned long action, void *data)
+{
+	struct nvt_ts_data *ts_data =
+		container_of(self, struct nvt_ts_data, pm_notif);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		WRITE_ONCE(ts_data->system_suspending, true);
+		NVT_LOG("system suspend prepare: gate pre-freeze gestures\n");
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		WRITE_ONCE(ts_data->system_suspending, false);
+		NVT_LOG("system suspend complete: ungate gestures\n");
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_OK;
+}
 
 #define GESTURE_DOUBLE_CLICK 15
 #define DATA_PROTOCOL 30
@@ -1027,6 +1054,20 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 			gesture_id = point_data[3];
 
 		if (gesture_id == GESTURE_DOUBLE_CLICK) {
+			/*
+			 * The DRM blank notifier enters gesture mode before the
+			 * system freezer runs.  A stale/noisy report in that narrow
+			 * interval would set pm_wakeup_pending(), abort freezing at
+			 * 0.000 seconds and leave Qualcomm remoteprocs in a partial
+			 * suspend rollback.  Once nvt_pm_suspend() has run, the IRQ is
+			 * a real system wake source and the gesture must be accepted.
+			 */
+			if (READ_ONCE(ts->system_suspending) &&
+			    !READ_ONCE(ts->dev_pm_suspend)) {
+				NVT_LOG("ignore double tap during pre-freeze suspend transition\n");
+				goto XFER_ERROR;
+			}
+
 			NVT_LOG("Gesture: double tap wakeup\n");
 			pm_wakeup_event(&ts->client->dev, 5000);
 			input_report_key(ts->input_dev, KEY_WAKEUP, 1);
@@ -1510,6 +1551,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	ts->ic_state = NVT_IC_INIT;
 	ts->dev_pm_suspend = false;
+	ts->system_suspending = false;
 	ts->gesture_command_delayed = -1;
 	init_completion(&ts->dev_pm_suspend_completion);
 	ts->fw_debug = false;
@@ -1565,6 +1607,14 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		ts->db_wakeup = 0;
 	}
 
+	ts->pm_notif.notifier_call = nvt_pm_notifier_callback;
+	ret = register_pm_notifier(&ts->pm_notif);
+	if (ret) {
+		NVT_ERR("failed to register PM notifier: %d\n", ret);
+		device_init_wakeup(&client->dev, false);
+		goto err_register_pm_notifier_failed;
+	}
+
 	bTouchIsAwake = 1;
 	disable_pen_input_device(false);
 	NVT_LOG("end\n");
@@ -1572,6 +1622,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	nvt_irq_enable(true);
 
 	return 0;
+
+err_register_pm_notifier_failed:
 
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
@@ -1646,6 +1698,7 @@ return:
 static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
+	unregister_pm_notifier(&ts->pm_notif);
 
 #ifdef CONFIG_DRM
 	if (mi_drm_unregister_client(&ts->drm_notif))
