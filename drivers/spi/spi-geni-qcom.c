@@ -78,6 +78,16 @@
 #define GSI_CPHA		BIT(4)
 #define GSI_CPOL		BIT(5)
 
+enum spi_geni_state {
+	SPI_GENI_IDLE,
+	SPI_GENI_TRANSFER,
+	SPI_GENI_CANCEL,
+	SPI_GENI_ABORT,
+	SPI_GENI_DMA_RESET,
+	SPI_GENI_FAULTED,
+	SPI_GENI_RECOVERING,
+};
+
 struct spi_geni_master {
 	struct geni_se se;
 	struct device *dev;
@@ -101,11 +111,70 @@ struct spi_geni_master {
 	spinlock_t lock;
 	int irq;
 	bool cs_flag;
-	bool abort_failed;
 	struct dma_chan *tx;
 	struct dma_chan *rx;
 	int cur_xfer_mode;
+	enum spi_geni_state state;
 };
+
+/*
+ * State, cur_xfer and all completion reinitialization are protected by lock.
+ * The SPI core serializes mode selection; the interrupt handler only reads
+ * cur_xfer_mode while holding lock.  Completion waits must be done unlocked.
+ */
+static void spi_geni_record_fault(struct spi_geni_master *mas,
+				  const char *reason)
+{
+	struct geni_se *se = &mas->se;
+	u32 dma_rx_status, dma_tx_status, m_irq, m_irq_en;
+
+	lockdep_assert_held(&mas->lock);
+
+	m_irq = readl(se->base + SE_GENI_M_IRQ_STATUS);
+	m_irq_en = readl(se->base + SE_GENI_M_IRQ_EN);
+	dma_tx_status = readl_relaxed(se->base + SE_DMA_TX_IRQ_STAT);
+	dma_rx_status = readl_relaxed(se->base + SE_DMA_RX_IRQ_STAT);
+
+	dev_err(mas->dev,
+		"%s: m_irq=%#010x m_irq_en=%#010x dma_tx=%#010x dma_rx=%#010x\n",
+		reason, m_irq, m_irq_en, dma_tx_status, dma_rx_status);
+}
+
+static int spi_geni_check_ready(struct spi_geni_master *mas)
+{
+	struct geni_se *se = &mas->se;
+	u32 dma_rx_status, dma_tx_status, m_irq;
+	int ret = 0;
+
+	spin_lock_irq(&mas->lock);
+	switch (mas->state) {
+	case SPI_GENI_IDLE:
+		break;
+	case SPI_GENI_RECOVERING:
+		m_irq = readl(se->base + SE_GENI_M_IRQ_STATUS);
+		dma_tx_status = readl_relaxed(se->base + SE_DMA_TX_IRQ_STAT);
+		dma_rx_status = readl_relaxed(se->base + SE_DMA_RX_IRQ_STAT);
+		if (!m_irq && !dma_tx_status && !dma_rx_status) {
+			mas->state = SPI_GENI_IDLE;
+			break;
+		}
+
+		dev_err_ratelimited(mas->dev,
+				    "Controller recovery pending: m_irq=%#010x dma_tx=%#010x dma_rx=%#010x\n",
+				    m_irq, dma_tx_status, dma_rx_status);
+		ret = -EBUSY;
+		break;
+	case SPI_GENI_FAULTED:
+		ret = -EIO;
+		break;
+	default:
+		ret = -EBUSY;
+		break;
+	}
+	spin_unlock_irq(&mas->lock);
+
+	return ret;
+}
 
 static void spi_slv_setup(struct spi_geni_master *mas)
 {
@@ -155,19 +224,25 @@ static void handle_se_timeout(struct spi_controller *spi)
 	unsigned long time_left;
 	struct geni_se *se = &mas->se;
 	const struct spi_transfer *xfer;
+	bool abort_timed_out = false;
 
 	spin_lock_irq(&mas->lock);
+	if (mas->state == SPI_GENI_FAULTED || mas->state == SPI_GENI_IDLE) {
+		spin_unlock_irq(&mas->lock);
+		return;
+	}
+
 	if (mas->cur_xfer_mode == GENI_SE_FIFO)
 		writel(0, se->base + SE_GENI_TX_WATERMARK_REG);
 
 	xfer = mas->cur_xfer;
 	mas->cur_xfer = NULL;
 
-	/* The controller doesn't support the Cancel commnand in target mode */
+	/* The controller does not support the cancel command in target mode. */
 	if (!spi->target) {
+		mas->state = SPI_GENI_CANCEL;
 		reinit_completion(&mas->cancel_done);
 		geni_se_cancel_m_cmd(se);
-
 		spin_unlock_irq(&mas->lock);
 
 		time_left = wait_for_completion_timeout(&mas->cancel_done, HZ);
@@ -177,19 +252,18 @@ static void handle_se_timeout(struct spi_controller *spi)
 		spin_lock_irq(&mas->lock);
 	}
 
+	mas->state = SPI_GENI_ABORT;
 	reinit_completion(&mas->abort_done);
 	geni_se_abort_m_cmd(se);
 	spin_unlock_irq(&mas->lock);
 
 	time_left = wait_for_completion_timeout(&mas->abort_done, HZ);
 	if (!time_left) {
-		dev_err(mas->dev, "Failed to cancel/abort m_cmd\n");
-
-		/*
-		 * No need for a lock since SPI core has a lock and we never
-		 * access this from an interrupt.
-		 */
-		mas->abort_failed = true;
+		spin_lock_irq(&mas->lock);
+		mas->state = SPI_GENI_RECOVERING;
+		spi_geni_record_fault(mas, "Failed to cancel/abort m_cmd");
+		spin_unlock_irq(&mas->lock);
+		abort_timed_out = true;
 	}
 
 reset_if_dma:
@@ -197,21 +271,33 @@ reset_if_dma:
 		if (xfer) {
 			if (xfer->tx_buf) {
 				spin_lock_irq(&mas->lock);
+				mas->state = SPI_GENI_DMA_RESET;
 				reinit_completion(&mas->tx_reset_done);
 				writel(1, se->base + SE_DMA_TX_FSM_RST);
 				spin_unlock_irq(&mas->lock);
 				time_left = wait_for_completion_timeout(&mas->tx_reset_done, HZ);
-				if (!time_left)
-					dev_err(mas->dev, "DMA TX RESET failed\n");
+				if (!time_left) {
+					spin_lock_irq(&mas->lock);
+					mas->state = SPI_GENI_FAULTED;
+					spi_geni_record_fault(mas, "DMA TX reset failed");
+					spin_unlock_irq(&mas->lock);
+					return;
+				}
 			}
 			if (xfer->rx_buf) {
 				spin_lock_irq(&mas->lock);
+				mas->state = SPI_GENI_DMA_RESET;
 				reinit_completion(&mas->rx_reset_done);
 				writel(1, se->base + SE_DMA_RX_FSM_RST);
 				spin_unlock_irq(&mas->lock);
 				time_left = wait_for_completion_timeout(&mas->rx_reset_done, HZ);
-				if (!time_left)
-					dev_err(mas->dev, "DMA RX RESET failed\n");
+				if (!time_left) {
+					spin_lock_irq(&mas->lock);
+					mas->state = SPI_GENI_FAULTED;
+					spi_geni_record_fault(mas, "DMA RX reset failed");
+					spin_unlock_irq(&mas->lock);
+					return;
+				}
 			}
 		} else {
 			/*
@@ -222,6 +308,10 @@ reset_if_dma:
 			dev_warn(mas->dev, "Cancel/Abort on completed SPI transfer\n");
 		}
 	}
+
+	spin_lock_irq(&mas->lock);
+	mas->state = abort_timed_out ? SPI_GENI_RECOVERING : SPI_GENI_IDLE;
+	spin_unlock_irq(&mas->lock);
 }
 
 static void handle_gpi_timeout(struct spi_controller *spi)
@@ -247,40 +337,6 @@ static void spi_geni_handle_err(struct spi_controller *spi, struct spi_message *
 	default:
 		dev_err(mas->dev, "Abort on Mode:%d not supported", mas->cur_xfer_mode);
 	}
-}
-
-static bool spi_geni_is_abort_still_pending(struct spi_geni_master *mas)
-{
-	struct geni_se *se = &mas->se;
-	u32 m_irq, m_irq_en;
-
-	if (!mas->abort_failed)
-		return false;
-
-	/*
-	 * The only known case where a transfer times out and then a cancel
-	 * times out then an abort times out is if something is blocking our
-	 * interrupt handler from running.  Avoid starting any new transfers
-	 * until that sorts itself out.
-	 */
-	spin_lock_irq(&mas->lock);
-	m_irq = readl(se->base + SE_GENI_M_IRQ_STATUS);
-	m_irq_en = readl(se->base + SE_GENI_M_IRQ_EN);
-	spin_unlock_irq(&mas->lock);
-
-	if (m_irq & m_irq_en) {
-		dev_err(mas->dev, "Interrupts pending after abort: %#010x\n",
-			m_irq & m_irq_en);
-		return true;
-	}
-
-	/*
-	 * If we're here the problem resolved itself so no need to check more
-	 * on future transfers.
-	 */
-	mas->abort_failed = false;
-
-	return false;
 }
 
 static void spi_setup_word_len(struct spi_geni_master *mas, u16 mode,
@@ -540,8 +596,9 @@ static int spi_geni_prepare_message(struct spi_controller *spi,
 	switch (mas->cur_xfer_mode) {
 	case GENI_SE_FIFO:
 	case GENI_SE_DMA:
-		if (spi_geni_is_abort_still_pending(mas))
-			return -EBUSY;
+		ret = spi_geni_check_ready(mas);
+		if (ret)
+			return ret;
 		ret = setup_fifo_params(spi_msg->spi, spi);
 		if (ret)
 			dev_err(mas->dev, "Couldn't select mode %d\n", ret);
@@ -834,7 +891,6 @@ static int setup_se_xfer(struct spi_transfer *xfer,
 
 	len = get_xfer_len_in_words(xfer, mas);
 
-	mas->cur_xfer = xfer;
 	if (xfer->tx_buf) {
 		m_cmd |= SPI_TX_ONLY;
 		mas->tx_rem_bytes = xfer->len;
@@ -879,6 +935,13 @@ static int setup_se_xfer(struct spi_transfer *xfer,
 	 * interrupt could come in at any time now.
 	 */
 	spin_lock_irq(&mas->lock);
+	if (mas->state != SPI_GENI_IDLE) {
+		spin_unlock_irq(&mas->lock);
+		return -EBUSY;
+	}
+
+	mas->state = SPI_GENI_TRANSFER;
+	mas->cur_xfer = xfer;
 	geni_se_setup_m_cmd(se, m_cmd, m_params);
 
 	trace_geni_spi_transfer(mas->dev, len, m_cmd);
@@ -906,8 +969,9 @@ static int spi_geni_transfer_one(struct spi_controller *spi,
 	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
 	int ret;
 
-	if (spi_geni_is_abort_still_pending(mas))
-		return -EBUSY;
+	ret = spi_geni_check_ready(mas);
+	if (ret)
+		return ret;
 
 	/* Terminate and return success for 0 byte length transfer */
 	if (!xfer->len)
@@ -957,6 +1021,7 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
 			if (mas->cur_xfer) {
 				spi_finalize_current_transfer(spi);
 				mas->cur_xfer = NULL;
+				mas->state = SPI_GENI_IDLE;
 				/*
 				 * If this happens, then a CMD_DONE came before all the
 				 * Tx buffer bytes were sent out. This is unusual, log
@@ -978,8 +1043,9 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
 				if (mas->rx_rem_bytes)
 					dev_err(mas->dev, "Premature done. rx_rem = %d bpw%d\n",
 						mas->rx_rem_bytes, mas->cur_bits_per_word);
-			} else {
+			} else if (mas->state == SPI_GENI_TRANSFER) {
 				complete(&mas->cs_done);
+				mas->state = SPI_GENI_IDLE;
 			}
 		}
 	} else if (mas->cur_xfer_mode == GENI_SE_DMA) {
@@ -1000,6 +1066,7 @@ static irqreturn_t geni_spi_isr(int irq, void *data)
 		if (!mas->tx_rem_bytes && !mas->rx_rem_bytes && xfer) {
 			spi_finalize_current_transfer(spi);
 			mas->cur_xfer = NULL;
+			mas->state = SPI_GENI_IDLE;
 		}
 	}
 
@@ -1111,6 +1178,7 @@ static int spi_geni_probe(struct platform_device *pdev)
 	init_completion(&mas->tx_reset_done);
 	init_completion(&mas->rx_reset_done);
 	spin_lock_init(&mas->lock);
+	mas->state = SPI_GENI_IDLE;
 
 	if (spi->target)
 		spi->target_abort = spi_geni_target_abort;
