@@ -66,6 +66,13 @@ properties:
     minimum: 6500000
     maximum: 12000000
 
+  lionsemi,input-ntc-unwired:
+    type: boolean
+    description: |
+      The board does not populate a thermistor on the LN8000 TSBUS input.
+      This disables only that absent input while battery NTC, die-temperature,
+      voltage, current, watchdog and reverse-current protections stay active.
+
 required:
   - compatible
   - reg
@@ -111,6 +118,7 @@ examples:
             lionsemi,input-ocp-alarm-microamp = <3500000>;
             lionsemi,ntc-alarm-code = <226>;
             lionsemi,min-input-microvolt = <8000000>;
+            lionsemi,input-ntc-unwired;
         };
     };
 ...
