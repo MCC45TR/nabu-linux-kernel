@@ -148,6 +148,20 @@ static inline int32_t spi_read_write(struct spi_device *client, uint8_t *buf, si
 	return spi_sync(client, &m);
 }
 
+static int nvt_spi_transfer(struct spi_device *client, uint8_t *buf,
+			    u16 len, NVT_SPI_RW rw)
+{
+	int ret;
+
+	ret = spi_read_write(client, buf, len, rw);
+	if (ret != -EBUSY)
+		return ret;
+
+	/* Allow a pending controller abort IRQ to finish, then retry once. */
+	usleep_range(1000, 2000);
+	return spi_read_write(client, buf, len, rw);
+}
+
 /*******************************************************
 Description:
 	Novatek touchscreen spi read function.
@@ -158,24 +172,15 @@ return:
 int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len)
 {
 	int32_t ret = -1;
-	int32_t retries = 0;
 
 	mutex_lock(&ts->xbuf_lock);
 
 	buf[0] = SPI_READ_MASK(buf[0]);
-
-	while (retries < 5) {
-		ret = spi_read_write(client, buf, len, NVTREAD);
-		if (ret == 0) break;
-		retries++;
-	}
-
-	if (unlikely(retries == 5)) {
+	ret = nvt_spi_transfer(client, buf, len, NVTREAD);
+	if (ret)
 		NVT_ERR("read error, ret=%d\n", ret);
-		ret = -EIO;
-	} else {
+	else
 		memcpy((buf+1), (ts->rbuf+2), (len-1));
-	}
 
 	mutex_unlock(&ts->xbuf_lock);
 
@@ -192,22 +197,13 @@ return:
 int32_t CTP_SPI_WRITE(struct spi_device *client, uint8_t *buf, uint16_t len)
 {
 	int32_t ret = -1;
-	int32_t retries = 0;
 
 	mutex_lock(&ts->xbuf_lock);
 
 	buf[0] = SPI_WRITE_MASK(buf[0]);
-
-	while (retries < 5) {
-		ret = spi_read_write(client, buf, len, NVTWRITE);
-		if (ret == 0)	break;
-		retries++;
-	}
-
-	if (unlikely(retries == 5)) {
+	ret = nvt_spi_transfer(client, buf, len, NVTWRITE);
+	if (ret)
 		NVT_ERR("error, ret=%d\n", ret);
-		ret = -EIO;
-	}
 
 	mutex_unlock(&ts->xbuf_lock);
 
