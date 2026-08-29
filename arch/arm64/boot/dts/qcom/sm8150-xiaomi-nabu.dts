@@ -558,6 +558,8 @@
 		interrupt-parent = <&tlmm>;
 		interrupts = <81 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&vreg_s4a_1p8>;
+		VP-supply = <&vph_pwr>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "BR";
 		cirrus,boost-peak-milliamp = <4000>;
@@ -575,6 +577,8 @@
 		interrupt-parent = <&tlmm>;
 		interrupts = <90 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&vreg_s4a_1p8>;
+		VP-supply = <&vph_pwr>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "TR";
 		cirrus,boost-peak-milliamp = <4000>;
@@ -592,6 +596,8 @@
 		interrupt-parent = <&tlmm>;
 		interrupts = <91 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&vreg_s4a_1p8>;
+		VP-supply = <&vph_pwr>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "BL";
 		cirrus,boost-peak-milliamp = <4000>;
@@ -609,6 +615,8 @@
 		interrupt-parent = <&tlmm>;
 		interrupts = <93 IRQ_TYPE_LEVEL_LOW>;
 		reset-gpios = <&tlmm 92 GPIO_ACTIVE_HIGH>;
+		VA-supply = <&vreg_s4a_1p8>;
+		VP-supply = <&vph_pwr>;
 		#sound-dai-cells = <1>;
 		sound-name-prefix = "TL";
 		cirrus,boost-peak-milliamp = <4000>;
