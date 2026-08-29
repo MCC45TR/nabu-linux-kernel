@@ -562,6 +562,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -578,6 +579,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -594,6 +596,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;
@@ -610,6 +613,7 @@
 		cirrus,boost-peak-milliamp = <4000>;
 		cirrus,boost-ind-nanohenry = <1000>;
 		cirrus,boost-cap-microfarad = <15>;
+		cirrus,allow-missing-pdn-done;
 		cirrus,asp-sdout-hiz = <3>;
 		cirrus,gpio2-src-select = <4>;
 		cirrus,gpio2-output-enable;

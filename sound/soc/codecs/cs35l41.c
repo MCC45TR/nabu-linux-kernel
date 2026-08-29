@@ -399,12 +399,15 @@ static irqreturn_t cs35l41_irq(int irq, void *data)
 	ret = IRQ_NONE;
 
 	for (i = 0; i < ARRAY_SIZE(status); i++) {
-		regmap_read(cs35l41->regmap,
-			    CS35L41_IRQ1_STATUS1 + (i * CS35L41_REGSTRIDE),
-			    &status[i]);
-		regmap_read(cs35l41->regmap,
-			    CS35L41_IRQ1_MASK1 + (i * CS35L41_REGSTRIDE),
-			    &masks[i]);
+		if (regmap_read(cs35l41->regmap,
+				CS35L41_IRQ1_STATUS1 + (i * CS35L41_REGSTRIDE),
+				&status[i]) ||
+		    regmap_read(cs35l41->regmap,
+				CS35L41_IRQ1_MASK1 + (i * CS35L41_REGSTRIDE),
+				&masks[i])) {
+			dev_err_ratelimited(cs35l41->dev, "failed to read IRQ status\n");
+			goto done;
+		}
 	}
 
 	/* Check to see if unmasked bits are active */
@@ -504,6 +507,46 @@ static const struct reg_sequence cs35l41_pdn_patch[] = {
 	{ CS35L41_TEST_KEY_CTL, 0x00000033 },
 };
 
+#define CS35L41_PROTECTION_ERROR_MASK	(CS35L41_AMP_SHORT_ERR_MASK | \
+					 CS35L41_BST_SHORT_ERR_MASK | \
+					 CS35L41_TEMP_WARN_MASK | \
+					 CS35L41_TEMP_ERR_MASK | \
+					 CS35L41_BST_OVP_ERR_MASK | \
+					 CS35L41_BST_DCM_UVP_ERR_MASK)
+
+static int cs35l41_handle_missing_pdn_done(struct cs35l41_private *cs35l41,
+					   int ret)
+{
+	unsigned int pwr_ctrl1 = ~0U, pwr_ctrl2 = ~0U, irq_status1 = ~0U;
+	int pwr1_ret, pwr2_ret, irq_ret;
+
+	if (ret != -ETIMEDOUT ||
+	    !device_property_read_bool(cs35l41->dev,
+				       "cirrus,allow-missing-pdn-done"))
+		return ret;
+
+	pwr1_ret = regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL1, &pwr_ctrl1);
+	pwr2_ret = regmap_read(cs35l41->regmap, CS35L41_PWR_CTRL2, &pwr_ctrl2);
+	irq_ret = regmap_read(cs35l41->regmap, CS35L41_IRQ1_STATUS1, &irq_status1);
+
+	if (!pwr1_ret && !pwr2_ret && !irq_ret &&
+	    !(pwr_ctrl1 & CS35L41_GLOBAL_EN_MASK) &&
+	    !(pwr_ctrl2 & CS35L41_AMP_EN_MASK) &&
+	    !(irq_status1 & CS35L41_PROTECTION_ERROR_MASK)) {
+		dev_warn_ratelimited(cs35l41->dev,
+				     "PDN_DONE timeout accepted: GLOBAL_EN and AMP_EN are clear, status1=0x%08x\n",
+				     irq_status1);
+		return 0;
+	}
+
+	dev_err_ratelimited(cs35l41->dev,
+			    "PDN_DONE timeout rejected: read=%d/%d/%d pwr1=0x%08x pwr2=0x%08x status1=0x%08x\n",
+			    pwr1_ret, pwr2_ret, irq_ret, pwr_ctrl1, pwr_ctrl2,
+			    irq_status1);
+
+	return ret;
+}
+
 static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
 				  struct snd_kcontrol *kcontrol, int event)
 {
@@ -523,6 +566,7 @@ static int cs35l41_main_amp_event(struct snd_soc_dapm_widget *w,
 	case SND_SOC_DAPM_POST_PMD:
 		ret = cs35l41_global_enable(cs35l41->dev, cs35l41->regmap, cs35l41->hw_cfg.bst_type,
 					    0, &cs35l41->dsp.cs_dsp);
+		ret = cs35l41_handle_missing_pdn_done(cs35l41, ret);
 
 		regmap_multi_reg_write_bypassed(cs35l41->regmap,
 						cs35l41_pdn_patch,

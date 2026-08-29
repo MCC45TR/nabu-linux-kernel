@@ -1244,8 +1244,13 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 	switch (b_type) {
 	case CS35L41_SHD_BOOST_ACTV:
 	case CS35L41_SHD_BOOST_PASS:
-		regmap_read(regmap, CS35L41_PWR_CTRL3, &pwr_ctrl3);
-		regmap_read(regmap, CS35L41_GPIO_PAD_CONTROL, &pad_control);
+		ret = regmap_read(regmap, CS35L41_PWR_CTRL3, &pwr_ctrl3);
+		if (ret)
+			return ret;
+
+		ret = regmap_read(regmap, CS35L41_GPIO_PAD_CONTROL, &pad_control);
+		if (ret)
+			return ret;
 
 		pwr_ctrl3 &= ~CS35L41_SYNC_EN_MASK;
 		pwr_ctrl1 = enable << CS35L41_GLOBAL_EN_SHIFT;
