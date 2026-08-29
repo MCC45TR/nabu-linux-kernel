@@ -1960,6 +1960,10 @@ static int ath10k_mac_vif_setup_ps(struct ath10k_vif *arvif)
 	if (arvif->vif->type != NL80211_IFTYPE_STATION)
 		return 0;
 
+	/* mac80211 can update PS state while tearing down a failed device. */
+	if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags))
+		return 0;
+
 	enable_ps = arvif->ps;
 
 	if (enable_ps && ath10k_mac_num_vifs_started(ar) > 1 &&
@@ -2004,6 +2008,10 @@ static int ath10k_mac_vif_setup_ps(struct ath10k_vif *arvif)
 
 	ret = ath10k_wmi_set_psmode(ar, arvif->vdev_id, psmode);
 	if (ret) {
+		if (ret == -ESHUTDOWN &&
+		    test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags))
+			return 0;
+
 		ath10k_warn(ar, "failed to set PS Mode %d for vdev %d: %d\n",
 			    psmode, arvif->vdev_id, ret);
 		return ret;
@@ -4249,6 +4257,12 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 		if (!skb)
 			break;
 
+		/* The transport cannot accept WMI commands after a crash flush. */
+		if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags)) {
+			ieee80211_free_txskb(ar->hw, skb);
+			continue;
+		}
+
 		if (test_bit(ATH10K_FW_FEATURE_MGMT_TX_BY_REF,
 			     ar->running_fw->fw_file.fw_features)) {
 			paddr = dma_map_single(ar->dev, skb->data,
@@ -4259,8 +4273,14 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 			}
 			ret = ath10k_wmi_mgmt_tx_send(ar, skb, paddr);
 			if (ret) {
-				ath10k_warn(ar, "failed to transmit management frame by ref via WMI: %d\n",
-					    ret);
+				if (ret == -ESHUTDOWN &&
+				    test_bit(ATH10K_FLAG_CRASH_FLUSH,
+					     &ar->dev_flags))
+					ath10k_dbg(ar, ATH10K_DBG_MAC,
+						   "drop management frame during crash teardown\n");
+				else
+					ath10k_warn(ar, "failed to transmit management frame by ref via WMI: %d\n",
+						    ret);
 				/* remove this msdu from idr tracking */
 				ath10k_wmi_cleanup_mgmt_tx_send(ar, skb);
 
@@ -4271,8 +4291,14 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 		} else {
 			ret = ath10k_wmi_mgmt_tx(ar, skb);
 			if (ret) {
-				ath10k_warn(ar, "failed to transmit management frame via WMI: %d\n",
-					    ret);
+				if (ret == -ESHUTDOWN &&
+				    test_bit(ATH10K_FLAG_CRASH_FLUSH,
+					     &ar->dev_flags))
+					ath10k_dbg(ar, ATH10K_DBG_MAC,
+						   "drop management frame during crash teardown\n");
+				else
+					ath10k_warn(ar, "failed to transmit management frame via WMI: %d\n",
+						    ret);
 				ieee80211_free_txskb(ar->hw, skb);
 			}
 		}
@@ -6628,6 +6654,25 @@ static int ath10k_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		}
 	}
 
+	/*
+	 * Firmware state is already gone during crash teardown.  Complete key
+	 * removal locally instead of sending WMI to a closed transport and
+	 * returning -ESHUTDOWN to mac80211.
+	 */
+	if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags)) {
+		if (cmd == DISABLE_KEY) {
+			spin_lock_bh(&ar->data_lock);
+			peer = ath10k_peer_find(ar, arvif->vdev_id, peer_addr);
+			if (peer)
+				peer->keys[key->keyidx] = NULL;
+			spin_unlock_bh(&ar->data_lock);
+			goto exit;
+		}
+
+		ret = -ESHUTDOWN;
+		goto exit;
+	}
+
 	if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE)
 		flags |= WMI_KEY_PAIRWISE;
 	else
@@ -6657,10 +6702,16 @@ static int ath10k_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 
 	ret = ath10k_install_key(arvif, key, cmd, peer_addr, flags);
 	if (ret) {
-		WARN_ON(ret > 0);
-		ath10k_warn(ar, "failed to install key for vdev %i peer %pM: %d\n",
-			    arvif->vdev_id, peer_addr, ret);
-		goto exit;
+		if (ret == -ESHUTDOWN && cmd == DISABLE_KEY &&
+		    test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags)) {
+			ret = 0;
+			goto update_key_state;
+		} else {
+			WARN_ON(ret > 0);
+			ath10k_warn(ar, "failed to install key for vdev %i peer %pM: %d\n",
+				    arvif->vdev_id, peer_addr, ret);
+			goto exit;
+		}
 	}
 
 	/* mac80211 sets static WEP keys as groupwise while firmware requires
@@ -6687,6 +6738,7 @@ static int ath10k_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
 		}
 	}
 
+update_key_state:
 	ath10k_set_key_h_def_keyidx(ar, arvif, cmd, key);
 
 	spin_lock_bh(&ar->data_lock);
@@ -7645,10 +7697,19 @@ static int ath10k_sta_state(struct ieee80211_hw *hw,
 					    WMI_TDLS_PEER_STATE_TEARDOWN, ret);
 		}
 
-		ret = ath10k_peer_delete(ar, arvif->vdev_id, sta->addr);
-		if (ret)
-			ath10k_warn(ar, "failed to delete peer %pM for vdev %d: %i\n",
-				    sta->addr, arvif->vdev_id, ret);
+		if (test_bit(ATH10K_FLAG_CRASH_FLUSH, &ar->dev_flags)) {
+			/* Firmware peer state is gone; local cleanup below is enough. */
+			ret = 0;
+		} else {
+			ret = ath10k_peer_delete(ar, arvif->vdev_id, sta->addr);
+			if (ret == -ESHUTDOWN &&
+			    test_bit(ATH10K_FLAG_CRASH_FLUSH,
+				     &ar->dev_flags))
+				ret = 0;
+			else if (ret)
+				ath10k_warn(ar, "failed to delete peer %pM for vdev %d: %i\n",
+					    sta->addr, arvif->vdev_id, ret);
+		}
 
 		ath10k_mac_dec_num_stations(arvif, sta);
 
@@ -7659,8 +7720,15 @@ static int ath10k_sta_state(struct ieee80211_hw *hw,
 				continue;
 
 			if (peer->sta == sta) {
-				ath10k_warn(ar, "found sta peer %pM (ptr %p id %d) entry on vdev %i after it was supposedly removed\n",
-					    sta->addr, peer, i, arvif->vdev_id);
+				if (test_bit(ATH10K_FLAG_CRASH_FLUSH,
+					     &ar->dev_flags))
+					ath10k_dbg(ar, ATH10K_DBG_MAC,
+						   "remove local sta peer %pM id %d during crash teardown\n",
+						   sta->addr, i);
+				else
+					ath10k_warn(ar, "found sta peer %pM (ptr %p id %d) entry on vdev %i after it was supposedly removed\n",
+						    sta->addr, peer, i,
+						    arvif->vdev_id);
 				peer->sta = NULL;
 
 				/* Clean up the peer object as well since we
@@ -8112,9 +8180,12 @@ void ath10k_mac_wait_tx_complete(struct ath10k *ar)
 			(empty || skip);
 		}), ATH10K_FLUSH_TIMEOUT_HZ);
 
-	if (time_left == 0 || skip)
+	if (time_left == 0)
 		ath10k_warn(ar, "failed to flush transmit queue (skip %i ar-state %i): %ld\n",
 			    skip, ar->state, time_left);
+	else if (skip)
+		ath10k_dbg(ar, ATH10K_DBG_MAC,
+			   "skip transmit queue flush during crash teardown\n");
 }
 
 static void ath10k_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
