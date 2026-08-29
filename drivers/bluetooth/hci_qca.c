@@ -1288,7 +1288,13 @@ static int qca_recv(struct hci_uart *hu, const void *data, int count)
 				  qca_recv_pkts, ARRAY_SIZE(qca_recv_pkts));
 	if (IS_ERR(qca->rx_skb)) {
 		int err = PTR_ERR(qca->rx_skb);
-		bt_dev_err(hu->hdev, "Frame reassembly failed (%d)", err);
+
+		/* WCN399x can leave a partial frame around setup baud changes. */
+		if (err == -EILSEQ && hci_dev_test_flag(hu->hdev, HCI_SETUP))
+			bt_dev_dbg(hu->hdev,
+				   "Setup frame reassembly discarded (%d)", err);
+		else
+			bt_dev_err(hu->hdev, "Frame reassembly failed (%d)", err);
 		qca->rx_skb = NULL;
 		return err;
 	}
