@@ -172,6 +172,12 @@ struct nvt_ts_data {
 	int db_wakeup;
 	bool wakeup_source;
 	bool irq_wake_enabled;
+	bool system_suspending;
+	bool offline;
+	bool health_reported;
+	bool pen_format_warned;
+	bool work_suspended;
+	struct notifier_block pm_notif;
 	uint8_t debug_flag;
 	bool fw_debug;
 	bool dev_pm_suspend;
