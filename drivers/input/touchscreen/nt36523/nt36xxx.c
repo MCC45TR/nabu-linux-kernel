@@ -376,7 +376,7 @@ void nvt_tx_auto_copy_mode(void)
 	//---write TX_AUTO_COPY_EN cmds---
 	nvt_write_addr(ts->mmap->TX_AUTO_COPY_EN, 0x69);
 
-	NVT_ERR("tx auto copy mode enable\n");
+	NVT_LOG("tx auto copy mode enabled\n");
 }
 
 /*******************************************************
