@@ -1274,7 +1274,9 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
 					int_status, int_status & pup_pdn_mask,
 					1000, 100000);
-		if (ret)
+		if (ret && (ret != -ETIMEDOUT || enable ||
+		    !device_property_read_bool(dev,
+					       "cirrus,allow-missing-pdn-done")))
 			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
 
 		/* Clear PUP/PDN status */
@@ -1291,7 +1293,9 @@ int cs35l41_global_enable(struct device *dev, struct regmap *regmap, enum cs35l4
 		ret = regmap_read_poll_timeout(regmap, CS35L41_IRQ1_STATUS1,
 					int_status, int_status & pup_pdn_mask,
 					1000, 100000);
-		if (ret)
+		if (ret && (ret != -ETIMEDOUT || enable ||
+		    !device_property_read_bool(dev,
+					       "cirrus,allow-missing-pdn-done")))
 			dev_err(dev, "Enable(%d) failed: %d\n", enable, ret);
 
 		/* Clear PUP/PDN status */
