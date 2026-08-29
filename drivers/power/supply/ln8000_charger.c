@@ -1292,7 +1292,7 @@ static irqreturn_t ln8000_interrupt_handler(int irq, void *data)
 	u8 masked_int;
 	int ret;
 
-	ln_err("ln8000_interrupt_handler enter!\n");
+	ln_info("enter\n");
 	ret = ln8000_read_int_value(info, &int_reg);
 	if (IS_ERR_VALUE((unsigned long)ret)) {
 		ln_err("fail to read INT reg (ret=%d)\n", ret);

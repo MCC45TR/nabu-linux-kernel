@@ -2834,6 +2834,14 @@ void ath10k_wmi_event_chan_info(struct ath10k *ar, struct sk_buff *skb)
 		break;
 	}
 
+	/* Some firmware emits scan bookkeeping events without a channel. */
+	if (!ch_info_param.freq) {
+		ath10k_dbg(ar, ATH10K_DBG_WMI,
+			   "received chan info event without a frequency, flags %#x, ignoring\n",
+			   ch_info_param.cmd_flags);
+		goto exit;
+	}
+
 	if (test_bit(ATH10K_FW_FEATURE_SINGLE_CHAN_INFO_PER_CHANNEL,
 		     ar->running_fw->fw_file.fw_features))
 		ath10k_wmi_event_chan_info_unpaired(ar, &ch_info_param);

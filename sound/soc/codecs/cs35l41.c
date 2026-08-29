@@ -399,12 +399,15 @@ static irqreturn_t cs35l41_irq(int irq, void *data)
 	ret = IRQ_NONE;
 
 	for (i = 0; i < ARRAY_SIZE(status); i++) {
-		regmap_read(cs35l41->regmap,
-			    CS35L41_IRQ1_STATUS1 + (i * CS35L41_REGSTRIDE),
-			    &status[i]);
-		regmap_read(cs35l41->regmap,
-			    CS35L41_IRQ1_MASK1 + (i * CS35L41_REGSTRIDE),
-			    &masks[i]);
+		if (regmap_read(cs35l41->regmap,
+				CS35L41_IRQ1_STATUS1 + (i * CS35L41_REGSTRIDE),
+				&status[i]) ||
+		    regmap_read(cs35l41->regmap,
+				CS35L41_IRQ1_MASK1 + (i * CS35L41_REGSTRIDE),
+				&masks[i])) {
+			dev_err_ratelimited(cs35l41->dev, "failed to read IRQ status\n");
+			goto done;
+		}
 	}
 
 	/* Check to see if unmasked bits are active */
@@ -530,15 +533,16 @@ static int cs35l41_handle_missing_pdn_done(struct cs35l41_private *cs35l41,
 	    !(pwr_ctrl1 & CS35L41_GLOBAL_EN_MASK) &&
 	    !(pwr_ctrl2 & CS35L41_AMP_EN_MASK) &&
 	    !(irq_status1 & CS35L41_PROTECTION_ERROR_MASK)) {
-		dev_warn_ratelimited(cs35l41->dev,
-				     "PDN_DONE timeout accepted: GLOBAL_EN and AMP_EN are clear, status1=0x%08x\n",
-				     irq_status1);
+		dev_dbg_ratelimited(cs35l41->dev,
+				    "PDN_DONE timeout accepted: GLOBAL_EN and AMP_EN are clear, status1=0x%08x\n",
+				    irq_status1);
 		return 0;
 	}
 
-	dev_err(cs35l41->dev,
-		"PDN_DONE timeout rejected: read=%d/%d/%d pwr1=0x%08x pwr2=0x%08x status1=0x%08x\n",
-		pwr1_ret, pwr2_ret, irq_ret, pwr_ctrl1, pwr_ctrl2, irq_status1);
+	dev_err_ratelimited(cs35l41->dev,
+			    "PDN_DONE timeout rejected: read=%d/%d/%d pwr1=0x%08x pwr2=0x%08x status1=0x%08x\n",
+			    pwr1_ret, pwr2_ret, irq_ret, pwr_ctrl1, pwr_ctrl2,
+			    irq_status1);
 
 	return ret;
 }

@@ -9298,8 +9298,8 @@ int ufshcd_get_vreg(struct device *dev, struct ufs_vreg *vreg)
 	vreg->reg = devm_regulator_get(dev, vreg->name);
 	if (IS_ERR(vreg->reg)) {
 		ret = PTR_ERR(vreg->reg);
-		dev_err(dev, "%s: %s get failed, err=%d\n",
-				__func__, vreg->name, ret);
+		dev_err_probe(dev, ret, "%s: %s get failed\n",
+			      __func__, vreg->name);
 	}
 out:
 	return ret;

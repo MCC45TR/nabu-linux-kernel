@@ -1450,18 +1450,32 @@ static void qcom_slim_ngd_down(struct qcom_slim_ngd_ctrl *ctrl)
 static void qcom_slim_ngd_up_worker(struct work_struct *work)
 {
 	struct qcom_slim_ngd_ctrl *ctrl;
+	long wait_ret;
 
 	ctrl = container_of(work, struct qcom_slim_ngd_ctrl, ngd_up_work);
 
+	/* SSR, PDR and probe reconciliation can report the same UP transition. */
+	mutex_lock(&ctrl->ssr_lock);
+	if (ctrl->state != QCOM_SLIM_NGD_CTRL_DOWN) {
+		mutex_unlock(&ctrl->ssr_lock);
+		return;
+	}
+	mutex_unlock(&ctrl->ssr_lock);
+
 	/* Make sure qmi service is up before continuing */
-	if (!wait_for_completion_interruptible_timeout(&ctrl->qmi_up,
-						       msecs_to_jiffies(MSEC_PER_SEC))) {
-		dev_err(ctrl->dev, "QMI wait timeout\n");
+	wait_ret = wait_for_completion_interruptible_timeout(&ctrl->qmi_up,
+						msecs_to_jiffies(MSEC_PER_SEC));
+	if (wait_ret <= 0) {
+		if (wait_ret < 0)
+			dev_dbg(ctrl->dev, "QMI wait interrupted: %ld\n", wait_ret);
+		else
+			dev_err(ctrl->dev, "QMI wait timeout\n");
 		return;
 	}
 
 	mutex_lock(&ctrl->ssr_lock);
-	qcom_slim_ngd_enable(ctrl, true);
+	if (ctrl->state == QCOM_SLIM_NGD_CTRL_DOWN)
+		qcom_slim_ngd_enable(ctrl, true);
 	mutex_unlock(&ctrl->ssr_lock);
 }
 

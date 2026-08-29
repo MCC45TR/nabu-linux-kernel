@@ -2,6 +2,7 @@
 // Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
 // Copyright (c) 2018, Linaro Limited
 
+#include <linux/bits.h>
 #include <linux/completion.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
@@ -2345,7 +2346,7 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct device *rdev = &rpdev->dev;
 	struct fastrpc_channel_ctx *data;
-	int i, err, domain_id = -1, matrix_count, vmcount;
+	int i, j, err, domain_id = -1, matrix_count, vmcount;
 	const char *domain;
 	const char *matrix[9];
 	bool secure_dsp;
@@ -2374,10 +2375,26 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 
 	vmcount = of_property_read_variable_u32_array(rdev->of_node,
 				"qcom,vmids", &vmids[0], 0, FASTRPC_MAX_VMIDS);
-	if (vmcount < 0)
+	if (vmcount == -EINVAL)
 		vmcount = 0;
+	else if (vmcount < 0)
+		return dev_err_probe(rdev, vmcount, "invalid qcom,vmids\n");
 	else if (!qcom_scm_is_available())
 		return -EPROBE_DEFER;
+
+	for (i = 0; i < vmcount; i++) {
+		if (vmids[i] >= BITS_PER_TYPE(u64))
+			return dev_err_probe(rdev, -ERANGE,
+					     "qcom,vmids value %u exceeds ownership mask\n",
+					     vmids[i]);
+
+		for (j = 0; j < i; j++) {
+			if (vmids[i] == vmids[j])
+				return dev_err_probe(rdev, -EINVAL,
+						     "duplicate qcom,vmids value %u\n",
+						     vmids[i]);
+		}
+	}
 
 	data = kzalloc(sizeof(*data), GFP_KERNEL);
 	if (!data)
@@ -2418,14 +2435,28 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		struct resource res;
 		u64 src_perms;
 
-		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
-		if (!err) {
-			src_perms = BIT(QCOM_SCM_VMID_HLOS);
-
-			qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
-				    data->vmperms, data->vmcount);
+		if (!data->vmcount) {
+			err = dev_err_probe(rdev, -EINVAL,
+					    "SDSP requires qcom,vmids\n");
+			goto err_free_data;
 		}
 
+		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
+		if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to resolve SDSP reserved memory\n");
+			goto err_free_data;
+		}
+
+		src_perms = BIT_ULL(QCOM_SCM_VMID_HLOS);
+		err = qcom_scm_assign_mem(res.start, resource_size(&res),
+					  &src_perms, data->vmperms,
+					  data->vmcount);
+		if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to assign SDSP reserved memory\n");
+			goto err_free_data;
+		}
 	}
 
 	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
