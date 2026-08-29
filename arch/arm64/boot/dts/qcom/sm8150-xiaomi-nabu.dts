@@ -528,6 +528,7 @@
 		lionsemi,input-ocp-alarm-microamp = <3500000>;
 		lionsemi,ntc-alarm-code = <226>;
 		lionsemi,min-input-microvolt = <8000000>;
+		lionsemi,input-ntc-unwired;
 	};
 
 	typec-mux@43 {
