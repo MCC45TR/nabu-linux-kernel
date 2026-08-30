@@ -31,14 +31,20 @@ properties:
       - const: usbin-icl-change
 
   io-channels:
+    minItems: 2
+    maxItems: 3
     items:
       - description: USB in current in uA
       - description: USB in voltage in uV
+      - description: Optional USB connector thermistor temperature in millicelsius
 
   io-channel-names:
+    minItems: 2
+    maxItems: 3
     items:
       - const: usbin_i
       - const: usbin_v
+      - const: connector_temp
 
   monitored-battery: true
 
