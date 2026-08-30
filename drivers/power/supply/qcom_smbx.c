@@ -202,9 +202,9 @@ enum smb_generation {
 #define CURRENT_MAX_UA					DCP_CURRENT_UA
 
 #define SMB5_FAST_CHARGE_CURRENT_UA			1950000
-/* Conservative SMB5 fallback and an exact 25 mA register step. */
+/* Conservative current used until the complete safety policy succeeds. */
 #define SMB5_THERMAL_LIMIT_CURRENT_UA			1000000
-#define SMB5_THERMAL_POLL_MS				5000
+#define SMB5_THERMAL_POLL_MS				1000
 #define SMB5_JEITA_HYSTERESIS_DECIC			20
 #define SMB5_PD_5P9V_UV					5900000
 #define SMB5_PD_6P5V_UV					6500000
@@ -253,6 +253,7 @@ struct smb_init_register {
  * @jeita_ranges:	Battery-profile temperature/current/voltage ranges
  * @num_jeita_ranges: Number of software JEITA ranges
  * @jeita_index:	Active software JEITA range, or -1
+ * @jeita_blocked:	Charging is latched off beyond a hard JEITA boundary
  * @policy_health:	Combined hardware and software JEITA health
  * @policy_lock:	Serialises charge-limit calculation and register writes
  * @thermal_levels:	Fast-charge limits for cooling-device states
@@ -260,7 +261,8 @@ struct smb_init_register {
  * @thermal_dcp_levels: DCP input-current limits for cooling-device states
  * @thermal_pd_levels: PD base input-current limits for cooling-device states
  * @num_thermal_levels: Number of thermal mitigation levels
- * @cooling_state:	Current Linux thermal cooling state
+ * @thermal_cooling_state: State requested by the thermal framework
+ * @user_cooling_state: Additional userspace-requested cooling state
  * @source_current_ua:	Input-current ceiling detected for the USB source
  * @source_voltage_uv:	Negotiated USB source voltage
  * @usb_type:		Detected TCPM/APSD USB source type
@@ -279,6 +281,10 @@ struct smb_init_register {
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @chg_psy:		Charger power supply instance
+ * @current_step_ua:	Current-register resolution for this PMIC generation
+ * @fv_min_uv:		Voltage represented by float-voltage register value zero
+ * @fv_max_uv:		Maximum representable float voltage
+ * @fv_step_uv:		Float-voltage register resolution
  */
 struct smb_chip {
 	struct device *dev;
@@ -293,6 +299,7 @@ struct smb_chip {
 	struct smb_jeita_range *jeita_ranges;
 	unsigned int num_jeita_ranges;
 	int jeita_index;
+	bool jeita_blocked;
 	int policy_health;
 	struct mutex policy_lock;
 	u32 *thermal_levels;
@@ -300,7 +307,8 @@ struct smb_chip {
 	u32 *thermal_dcp_levels;
 	u32 *thermal_pd_levels;
 	unsigned int num_thermal_levels;
-	unsigned long cooling_state;
+	unsigned long thermal_cooling_state;
+	unsigned long user_cooling_state;
 	unsigned int source_current_ua;
 	unsigned int source_voltage_uv;
 	int usb_type;
@@ -321,6 +329,10 @@ struct smb_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+	unsigned int current_step_ua;
+	unsigned int fv_min_uv;
+	unsigned int fv_max_uv;
+	unsigned int fv_step_uv;
 };
 
 struct smb_match_data {
@@ -328,6 +340,10 @@ struct smb_match_data {
 	enum smb_generation gen;
 	size_t init_seq_len;
 	const struct smb_init_register *init_seq;
+	unsigned int current_step_ua;
+	unsigned int fv_min_uv;
+	unsigned int fv_max_uv;
+	unsigned int fv_step_uv;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -491,7 +507,7 @@ static inline int smb_get_current_limit(struct smb_chip *chip,
 	int rc = regmap_read(chip->regmap, chip->base + ICL_STATUS(chip), val);
 
 	if (rc >= 0)
-		*val *= CURRENT_SCALE_FACTOR;
+		*val *= chip->current_step_ua;
 	return rc;
 }
 
@@ -504,7 +520,7 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			"Can't set current limit higher than 4800000uA");
 		return -EINVAL;
 	}
-	val_raw = val / CURRENT_SCALE_FACTOR;
+	val_raw = val / chip->current_step_ua;
 
 	return regmap_write(chip->regmap, chip->base + USBIN_CURRENT_LIMIT_CFG,
 			    val_raw);
@@ -513,36 +529,41 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 static void smb_update_input_contract(struct smb_chip *chip)
 {
 	union power_supply_propval val;
-	unsigned int current_ua;
-	int apsd_type;
+	unsigned int current_ua = SDP_CURRENT_UA;
+	unsigned int voltage_uv = 5000000;
+	int apsd_type, usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 
 	if (!chip->input_psy)
 		return;
-
-	if (!power_supply_get_property(chip->input_psy,
-				       POWER_SUPPLY_PROP_CURRENT_MAX, &val) &&
-	    val.intval > 0) {
-		current_ua = min_t(unsigned int, val.intval,
-				   chip->batt_info->constant_charge_current_max_ua);
-		WRITE_ONCE(chip->source_current_ua, current_ua);
-	}
-
-	if (!power_supply_get_property(chip->input_psy,
-				       POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) &&
-	    val.intval > 0)
-		WRITE_ONCE(chip->source_voltage_uv, val.intval);
-
 	if (power_supply_get_property(chip->input_psy,
-				      POWER_SUPPLY_PROP_USB_TYPE, &val))
-		return;
+				      POWER_SUPPLY_PROP_ONLINE, &val) ||
+	    !val.intval)
+		goto update;
 
-	if (val.intval == POWER_SUPPLY_USB_TYPE_PD ||
-	    val.intval == POWER_SUPPLY_USB_TYPE_PD_DRP ||
-	    val.intval == POWER_SUPPLY_USB_TYPE_PD_PPS) {
-		WRITE_ONCE(chip->usb_type, val.intval);
-	} else if (!smb_apsd_get_charger_type(chip, &apsd_type)) {
-		WRITE_ONCE(chip->usb_type, apsd_type);
-	}
+	if (!power_supply_get_property(chip->input_psy,
+					       POWER_SUPPLY_PROP_CURRENT_MAX, &val) &&
+	    val.intval > 0)
+		current_ua = min_t(unsigned int, val.intval,
+					   chip->batt_info->constant_charge_current_max_ua);
+
+	if (!power_supply_get_property(chip->input_psy,
+					       POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) &&
+	    val.intval > 0)
+		voltage_uv = val.intval;
+
+	if (!power_supply_get_property(chip->input_psy,
+				       POWER_SUPPLY_PROP_USB_TYPE, &val) &&
+	    (val.intval == POWER_SUPPLY_USB_TYPE_PD ||
+	     val.intval == POWER_SUPPLY_USB_TYPE_PD_DRP ||
+	     val.intval == POWER_SUPPLY_USB_TYPE_PD_PPS))
+		usb_type = val.intval;
+	else if (!smb_apsd_get_charger_type(chip, &apsd_type))
+		usb_type = apsd_type;
+
+update:
+	WRITE_ONCE(chip->source_current_ua, current_ua);
+	WRITE_ONCE(chip->source_voltage_uv, voltage_uv);
+	WRITE_ONCE(chip->usb_type, usb_type);
 }
 
 static void smb_status_change_work(struct work_struct *work)
@@ -555,8 +576,16 @@ static void smb_status_change_work(struct work_struct *work)
 	chip = container_of(work, struct smb_chip, status_change_work.work);
 
 	smb_get_prop_usb_online(chip, &usb_online);
-	if (!usb_online)
+	if (!usb_online) {
+		if (chip->gen == SMB5) {
+			WRITE_ONCE(chip->source_current_ua, SDP_CURRENT_UA);
+			WRITE_ONCE(chip->source_voltage_uv, 5000000);
+			WRITE_ONCE(chip->usb_type,
+				   POWER_SUPPLY_USB_TYPE_UNKNOWN);
+			mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		}
 		return;
+	}
 
 	for (count = 0; count < 3; count++) {
 		dev_dbg(chip->dev, "get charger type retry %d\n", count);
@@ -713,12 +742,12 @@ static int smb_set_fast_charge_current(struct smb_chip *chip,
 				       unsigned int current_ua)
 {
 	if (current_ua > FAST_CHARGE_CURRENT_SETTING_MASK *
-			 CURRENT_SCALE_FACTOR)
+				 chip->current_step_ua)
 		return -EINVAL;
 
 	return regmap_write(chip->regmap,
 			    chip->base + FAST_CHARGE_CURRENT_CFG,
-			    current_ua / CURRENT_SCALE_FACTOR);
+			    current_ua / chip->current_step_ua);
 }
 
 static int smb_get_fast_charge_current(struct smb_chip *chip, int *current_ua)
@@ -732,7 +761,7 @@ static int smb_get_fast_charge_current(struct smb_chip *chip, int *current_ua)
 		return rc;
 
 	*current_ua = (val & FAST_CHARGE_CURRENT_SETTING_MASK) *
-		      CURRENT_SCALE_FACTOR;
+			      chip->current_step_ua;
 
 	return 0;
 }
@@ -741,10 +770,11 @@ static int smb_set_float_voltage(struct smb_chip *chip, unsigned int voltage_uv)
 {
 	unsigned int val;
 
-	if (voltage_uv < 3487500 || voltage_uv > 5392500)
+	if (voltage_uv < chip->fv_min_uv || voltage_uv > chip->fv_max_uv)
 		return -EINVAL;
 
-	val = DIV_ROUND_CLOSEST(voltage_uv - 3487500, 7500) + 1;
+	/* Round down so the programmed voltage never exceeds the ceiling. */
+	val = (voltage_uv - chip->fv_min_uv) / chip->fv_step_uv;
 
 	return regmap_update_bits(chip->regmap,
 				  chip->base + FLOAT_VOLTAGE_CFG,
@@ -781,6 +811,7 @@ static int smb_read_battery_temperature(int *temp_decic)
 static int smb_find_jeita_range(struct smb_chip *chip, int temp_decic)
 {
 	struct smb_jeita_range *active, *candidate;
+	unsigned int last = chip->num_jeita_ranges - 1;
 	int candidate_index = -ERANGE;
 	unsigned int i;
 
@@ -792,7 +823,25 @@ static int smb_find_jeita_range(struct smb_chip *chip, int temp_decic)
 			break;
 		}
 	}
-	if (candidate_index < 0 || chip->jeita_index < 0 ||
+	if (candidate_index < 0) {
+		chip->jeita_index = temp_decic < chip->jeita_ranges[0].temp_min_decic ?
+				    0 : last;
+		chip->jeita_blocked = true;
+		return -ERANGE;
+	}
+
+	if (chip->jeita_blocked) {
+		if ((chip->jeita_index == 0 && candidate_index == 0 &&
+		     temp_decic < chip->jeita_ranges[0].temp_min_decic +
+				  SMB5_JEITA_HYSTERESIS_DECIC) ||
+		    (chip->jeita_index == last && candidate_index == last &&
+		     temp_decic > chip->jeita_ranges[last].temp_max_decic -
+				  SMB5_JEITA_HYSTERESIS_DECIC))
+			return -ERANGE;
+		chip->jeita_blocked = false;
+	}
+
+	if (chip->jeita_index < 0 ||
 	    candidate_index == chip->jeita_index)
 		return candidate_index;
 
@@ -833,8 +882,8 @@ static int smb_get_software_jeita(struct smb_chip *chip, int *health,
 
 	index = smb_find_jeita_range(chip, temp_decic);
 	if (index < 0) {
-		chip->jeita_index = -1;
-		*health = temp_decic < chip->jeita_ranges[0].temp_min_decic ?
+		/* Preserve which hard boundary owns the restart hysteresis. */
+		*health = chip->jeita_index == 0 ?
 			  POWER_SUPPLY_HEALTH_COLD :
 			  POWER_SUPPLY_HEALTH_OVERHEAT;
 		*current_ua = 0;
@@ -930,9 +979,6 @@ static unsigned int smb_get_thermal_input_limit(struct smb_chip *chip,
 	unsigned int contract_limit;
 	int usb_type = READ_ONCE(chip->usb_type);
 
-	if (!state)
-		return limit;
-
 	if (usb_type == POWER_SUPPLY_USB_TYPE_DCP && chip->thermal_dcp_levels)
 		return min(limit, chip->thermal_dcp_levels[state]);
 
@@ -981,7 +1027,9 @@ static int smb_apply_charge_policy(struct smb_chip *chip, int health,
 	if (jeita_voltage_uv)
 		voltage_uv = min(voltage_uv, jeita_voltage_uv);
 
-	cooling_state = min_t(unsigned long, READ_ONCE(chip->cooling_state),
+	cooling_state = max(READ_ONCE(chip->thermal_cooling_state),
+			    READ_ONCE(chip->user_cooling_state));
+	cooling_state = min_t(unsigned long, cooling_state,
 			      chip->num_thermal_levels - 1);
 	current_ua = min(current_ua, chip->thermal_levels[cooling_state]);
 	input_ua = min(input_ua,
@@ -1095,7 +1143,7 @@ static int smb_get_property(struct power_supply *psy,
 			     union power_supply_propval *val)
 {
 	struct smb_chip *chip = power_supply_get_drvdata(psy);
-	int ret;
+	int policy_health, ret;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_MANUFACTURER:
@@ -1112,7 +1160,8 @@ static int smb_get_property(struct power_supply *psy,
 		val->intval = chip->batt_info->constant_charge_current_max_ua;
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
-		val->intval = READ_ONCE(chip->cooling_state);
+		val->intval = max(READ_ONCE(chip->thermal_cooling_state),
+				  READ_ONCE(chip->user_cooling_state));
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX:
 		val->intval = chip->num_thermal_levels ?
@@ -1134,12 +1183,13 @@ static int smb_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_STATUS:
 		return smb_get_prop_status(chip, &val->intval);
 	case POWER_SUPPLY_PROP_HEALTH:
-		if (READ_ONCE(chip->policy_health) !=
-		    POWER_SUPPLY_HEALTH_UNKNOWN) {
-			val->intval = READ_ONCE(chip->policy_health);
-			return 0;
-		}
-		return smb_get_prop_health(chip, &val->intval);
+		ret = smb_get_prop_health(chip, &val->intval);
+		if (ret < 0)
+			return ret;
+		policy_health = READ_ONCE(chip->policy_health);
+		if (policy_health != POWER_SUPPLY_HEALTH_UNKNOWN)
+			val->intval = smb_merge_health(val->intval, policy_health);
+		return 0;
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		return smb_apsd_get_charger_type(chip, &val->intval);
 	default:
@@ -1178,7 +1228,7 @@ static int smb_set_property(struct power_supply *psy,
 		if (chip->gen != SMB5 || val->intval < 0 ||
 		    val->intval >= chip->num_thermal_levels)
 			return -EINVAL;
-		WRITE_ONCE(chip->cooling_state, val->intval);
+		WRITE_ONCE(chip->user_cooling_state, val->intval);
 		mod_delayed_work(system_wq, &chip->thermal_work, 0);
 		return 0;
 	default:
@@ -1204,10 +1254,22 @@ static int smb_property_is_writable(struct power_supply *psy,
 static irqreturn_t smb_handle_batt_overvoltage(int irq, void *data)
 {
 	struct smb_chip *chip = data;
+	int rc;
 
 	if (smbx_ov_status(chip) == 1) {
-		/* The hardware stops charging automatically */
 		dev_err(chip->dev, "battery overvoltage detected\n");
+		WRITE_ONCE(chip->policy_health,
+			   POWER_SUPPLY_HEALTH_OVERVOLTAGE);
+		mutex_lock(&chip->policy_lock);
+		rc = smb_set_charging_enabled(chip, false);
+		if (!rc)
+			chip->charging_enabled = false;
+		mutex_unlock(&chip->policy_lock);
+		if (rc)
+			dev_err_ratelimited(chip->dev,
+					    "failed to disable charging: %d\n", rc);
+		if (chip->gen == SMB5)
+			mod_delayed_work(system_wq, &chip->thermal_work, 0);
 		power_supply_changed(chip->chg_psy);
 	}
 
@@ -1268,6 +1330,10 @@ static const struct power_supply_desc smb_psy_desc = {
 
 /* Init sequence derived from vendor downstream driver */
 static const struct smb_init_register smb5_init_seq[] = {
+	/* Override bootloader state before changing any other charger setting. */
+	{ .addr = CHARGING_ENABLE_CMD,
+	  .mask = CHARGING_ENABLE_CMD_BIT,
+	  .val = 0 },
 	{ .addr = USBIN_CMD_IL, .mask = USBIN_SUSPEND_BIT, .val = 0 },
 	/*
 	 * By default configure us as an upstream facing port
@@ -1304,10 +1370,6 @@ static const struct smb_init_register smb5_init_seq[] = {
 	{ .addr = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_REG,
 	  .mask = SMB5_CHARGE_RCHG_SOC_THRESHOLD_CFG_MASK,
 	  .val = 250 },
-	/* Enable charging */
-	{ .addr = CHARGING_ENABLE_CMD,
-	  .mask = CHARGING_ENABLE_CMD_BIT,
-	  .val = CHARGING_ENABLE_CMD_BIT },
 	/* Enable BC1P2 auto Src detect */
 	{ .addr = USBIN_OPTIONS_1_CFG,
 	  .mask = AUTO_SRC_DETECT_BIT,
@@ -1338,14 +1400,6 @@ static const struct smb_init_register smb5_init_seq[] = {
 			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT,
 	  .val = USBIN_AICL_PERIODIC_RERUN_EN_BIT | USBIN_AICL_ADC_EN_BIT
 			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT },
-	/*
-	 * This overrides all of the other current limit configs and is
-	 * used for temperature-based limits.  Begin with the reduced value;
-	 * the thermal worker raises it only after a valid GOOD JEITA state.
-	 */
-	{ .addr = FAST_CHARGE_CURRENT_CFG,
-	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
-	  .val = SMB5_THERMAL_LIMIT_CURRENT_UA / CURRENT_SCALE_FACTOR },
 };
 
 /* Init sequence derived from vendor downstream driver */
@@ -1447,6 +1501,10 @@ struct smb_match_data pmi8998_match_data = {
 	.init_seq_len = ARRAY_SIZE(smb2_init_seq),
 	.name = "pmi8998",
 	.gen = SMB2,
+	.current_step_ua = 25000,
+	.fv_min_uv = 3487500,
+	.fv_max_uv = 4920000,
+	.fv_step_uv = 7500,
 };
 
 struct smb_match_data pm660_match_data = {
@@ -1454,6 +1512,10 @@ struct smb_match_data pm660_match_data = {
 	.init_seq_len = ARRAY_SIZE(smb2_init_seq),
 	.name = "pm660",
 	.gen = SMB2,
+	.current_step_ua = 25000,
+	.fv_min_uv = 3487500,
+	.fv_max_uv = 4920000,
+	.fv_step_uv = 7500,
 };
 
 struct smb_match_data pm8150b_match_data = {
@@ -1461,6 +1523,10 @@ struct smb_match_data pm8150b_match_data = {
 	.init_seq_len = ARRAY_SIZE(smb5_init_seq),
 	.name = "pm8150b",
 	.gen = SMB5,
+	.current_step_ua = 50000,
+	.fv_min_uv = 3600000,
+	.fv_max_uv = 4790000,
+	.fv_step_uv = 10000,
 };
 
 struct smb_match_data pm7250b_match_data = {
@@ -1468,6 +1534,10 @@ struct smb_match_data pm7250b_match_data = {
 	.init_seq_len = ARRAY_SIZE(smb5_init_seq),
 	.name = "pm7250b",
 	.gen = SMB5,
+	.current_step_ua = 50000,
+	.fv_min_uv = 3600000,
+	.fv_max_uv = 4790000,
+	.fv_step_uv = 10000,
 };
 
 
@@ -1655,7 +1725,8 @@ static int smb_parse_jeita_ranges(struct smb_chip *chip)
 		range->voltage_uv = values[i * 4 + 3];
 
 		if (range->temp_min_decic > range->temp_max_decic ||
-		    !range->current_ua || range->voltage_uv < 3487500 ||
+		    !range->current_ua || range->voltage_uv < chip->fv_min_uv ||
+		    range->voltage_uv > chip->fv_max_uv ||
 		    range->voltage_uv >
 			chip->batt_info->voltage_max_design_uv ||
 		    (i && range->temp_min_decic <=
@@ -1681,7 +1752,7 @@ static int smb_cooling_get_cur_state(struct thermal_cooling_device *cdev,
 {
 	struct smb_chip *chip = cdev->devdata;
 
-	*state = READ_ONCE(chip->cooling_state);
+	*state = READ_ONCE(chip->thermal_cooling_state);
 	return 0;
 }
 
@@ -1692,10 +1763,10 @@ static int smb_cooling_set_cur_state(struct thermal_cooling_device *cdev,
 
 	if (state >= chip->num_thermal_levels)
 		return -EINVAL;
-	if (state == READ_ONCE(chip->cooling_state))
+	if (state == READ_ONCE(chip->thermal_cooling_state))
 		return 0;
 
-	WRITE_ONCE(chip->cooling_state, state);
+	WRITE_ONCE(chip->thermal_cooling_state, state);
 	mod_delayed_work(system_wq, &chip->thermal_work, 0);
 	return 0;
 }
@@ -1754,6 +1825,32 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't read base address\n");
 
+	match_data = device_get_match_data(chip->dev);
+	if (!match_data)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "missing charger match data\n");
+	if (!match_data->current_step_ua || !match_data->fv_step_uv ||
+	    match_data->fv_min_uv > match_data->fv_max_uv)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "invalid charger register parameters\n");
+
+	chip->gen = match_data->gen;
+	chip->current_step_ua = match_data->current_step_ua;
+	chip->fv_min_uv = match_data->fv_min_uv;
+	chip->fv_max_uv = match_data->fv_max_uv;
+	chip->fv_step_uv = match_data->fv_step_uv;
+
+	dev_info(chip->dev, "Generation %s\n",
+		 chip->gen == SMB2 ? "SMB2" : "SMB5");
+
+	/* Disable SMB5 before any probe deferral can preserve bootloader state. */
+	if (chip->gen == SMB5) {
+		rc = smb_set_charging_enabled(chip, false);
+		if (rc < 0)
+			return dev_err_probe(chip->dev, rc,
+					     "failed to enter fail-safe state\n");
+	}
+
 	chip->usb_in_v_chan = devm_iio_channel_get(chip->dev, "usbin_v");
 	if (IS_ERR(chip->usb_in_v_chan))
 		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_v_chan),
@@ -1774,12 +1871,6 @@ static int smb_probe(struct platform_device *pdev)
 				chip->dev, PTR_ERR(chip->connector_temp_chan),
 				"Couldn't get connector temperature channel\n");
 	}
-
-	match_data = (const struct smb_match_data *)device_get_match_data(chip->dev);
-
-	chip->gen = match_data->gen;
-
-	dev_info(chip->dev, "Generation %s\n", chip->gen == SMB2 ? "SMB2" : "SMB5");
 
 	rc = smb_init_hw(chip, match_data->init_seq, match_data->init_seq_len);
 	if (rc < 0)

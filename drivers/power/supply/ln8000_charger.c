@@ -265,6 +265,7 @@ struct ln8000_platform_data {
 		ntc_alarm_cfg; /* input/battery NTC voltage threshold code: 0~1023 */
 	unsigned int min_input_uv; /* minimum safe voltage for 2:1 switching */
 	bool input_ntc_unwired; /* board has no thermistor on the TSBUS input */
+	bool allow_direct_charging; /* explicit opt-in after platform validation */
 };
 
 struct ln8000_info {
@@ -1481,6 +1482,9 @@ static int ln8000_parse_dt(struct ln8000_info *info)
 		return dev_err_probe(dev, ret, "missing minimum input voltage\n");
 	pdata->input_ntc_unwired =
 		device_property_read_bool(dev, "lionsemi,input-ntc-unwired");
+	pdata->allow_direct_charging =
+		device_property_read_bool(dev,
+					  "lionsemi,allow-direct-charging");
 
 	if (pdata->bat_ovp_alarm_th >= pdata->bat_ovp_th ||
 	    pdata->bus_ovp_alarm_th >= pdata->bus_ovp_th ||
@@ -1532,6 +1536,8 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 	chip->status = online.intval;
 	chip->usb_present = online.intval != 0;
 	if (!chip->usb_present)
+		goto out_disable;
+	if (!chip->pdata->allow_direct_charging)
 		goto out_disable;
 
 	ret = power_supply_get_property(
@@ -1625,6 +1631,22 @@ static int ln8000_probe(struct i2c_client *client)
 	}
 	info->dev = &client->dev;
 	info->client = client;
+	info->regmap = devm_regmap_init_i2c(client, &ln8000_regmap_config);
+	if (IS_ERR(info->regmap)) {
+		ln_err("fail to initialize regmap\n");
+		return PTR_ERR(info->regmap);
+	}
+
+	mutex_init(&info->data_lock);
+	mutex_init(&info->i2c_lock);
+	mutex_init(&info->irq_lock);
+	i2c_set_clientdata(client, info);
+
+	/* Override a possibly active bootloader configuration before deferring. */
+	ret = ln8000_change_opmode(info, LN8000_OPMODE_STANDBY);
+	if (ret)
+		return dev_err_probe(info->dev, ret,
+				     "failed to enter fail-safe standby\n");
 
 	info->typec_psy = devm_power_supply_get_by_reference(
 		info->dev, "input-power-supply");
@@ -1655,16 +1677,6 @@ static int ln8000_probe(struct i2c_client *client)
 		return ret;
 	}
 
-	info->regmap = devm_regmap_init_i2c(client, &ln8000_regmap_config);
-	if (IS_ERR(info->regmap)) {
-		ln_err("fail to initialize regmap\n");
-		return PTR_ERR(info->regmap);
-	}
-
-	mutex_init(&info->data_lock);
-	mutex_init(&info->i2c_lock);
-	mutex_init(&info->irq_lock);
-	i2c_set_clientdata(client, info);
 	INIT_DELAYED_WORK(&info->status_changed_work,
 			  ln8000_status_changed_worker);
 	INIT_DELAYED_WORK(&info->charge_work, psy_chg_get_ti_alarm_status);

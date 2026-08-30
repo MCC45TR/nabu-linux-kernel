@@ -823,19 +823,17 @@ static int qcom_fg_gen3_get_temp_threshold(struct qcom_fg_chip *chip,
  */
 static int qcom_fg_gen4_get_temperature(struct qcom_fg_chip *chip, int *val)
 {
-	int temp;
-	u8 readval[2];
+	u8 raw_temp;
 	int ret;
 
-	ret = qcom_fg_read(chip, readval, ADC_RR_BATT_TEMP_LSB, 2);
+	ret = qcom_fg_read(chip, &raw_temp, ADC_RR_BATT_TEMP_LSB, 1);
 	if (ret) {
 		dev_err(chip->dev, "Failed to read temperature: %d", ret);
 		return ret;
 	}
 
-	/* RRADC reports signed degrees Celsius; power_supply uses decidegrees. */
-	temp = (s16)(readval[1] << 8 | readval[0]);
-	*val = temp * 10;
+	/* Only eight bits are used; bit 7 is the Celsius sign bit. */
+	*val = sign_extend32(raw_temp, 7) * 10;
 	return 0;
 }
 

@@ -73,6 +73,14 @@ properties:
       This disables only that absent input while battery NTC, die-temperature,
       voltage, current, watchdog and reverse-current protections stay active.
 
+  lionsemi,allow-direct-charging:
+    type: boolean
+    description: |
+      Explicitly allows the 2:1 direct-charge path. Omit this property unless
+      the platform has a validated source-contract and battery-current policy;
+      without it the driver remains in standby and the conventional charger
+      supplies the battery.
+
 required:
   - compatible
   - reg
