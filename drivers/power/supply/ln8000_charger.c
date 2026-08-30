@@ -1519,6 +1519,7 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 						status_changed_work.work);
 	union power_supply_propval online = {};
 	union power_supply_propval voltage = {};
+	union power_supply_propval health = {};
 	bool enable = false;
 	int ret;
 
@@ -1535,6 +1536,19 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 	ret = power_supply_get_property(
 		chip->typec_psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &voltage);
 	if (ret || voltage.intval < chip->pdata->min_input_uv)
+		goto out_disable;
+
+	/*
+	 * Direct charging bypasses the PMIC switching path, but the PM8150B
+	 * still owns the battery thermistor and its hardware JEITA comparators.
+	 * Only use the high-current direct path while that hardware reports a
+	 * normal battery temperature.  Warm/cool states fall back to the PMIC
+	 * charger, where qcom_smbx applies its reduced fast-charge current;
+	 * hard temperature and over-voltage states remain disabled there.
+	 */
+	ret = power_supply_get_property(chip->switching_psy,
+					POWER_SUPPLY_PROP_HEALTH, &health);
+	if (ret || health.intval != POWER_SUPPLY_HEALTH_GOOD)
 		goto out_disable;
 
 	ret = ln8000_check_status(chip);
@@ -1570,7 +1584,8 @@ static int ln8000_notifier_call(struct notifier_block *nb, unsigned long val,
 	struct ln8000_info *chip = container_of(nb, struct ln8000_info, nb);
 	struct power_supply *psy = v;
 
-	if (psy == chip->typec_psy && !READ_ONCE(chip->suspended))
+	if ((psy == chip->typec_psy || psy == chip->switching_psy) &&
+	    !READ_ONCE(chip->suspended))
 		mod_delayed_work(system_wq, &chip->status_changed_work,
 				 msecs_to_jiffies(100));
 
