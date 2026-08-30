@@ -139,6 +139,10 @@
 		energy-full-design-microwatt-hours = <33600000>;
 		voltage-min-design-microvolt = <3400000>;
 		voltage-max-design-microvolt = <4480000>;
+		constant-charge-current-max-microamp = <1950000>;
+		constant-charge-voltage-max-microvolt = <4450000>;
+		alert-celsius = <15 45>;
+		operating-range-celsius = <(-10) 59>;
 	};
 
 	xiaomi_keyboard: keyboard-cover {
@@ -520,8 +524,9 @@
 		input-power-supply = <&pm8150b_typec>;
 		switching-power-supply = <&pm8150b_charger>;
 
-		lionsemi,battery-ovp-microvolt = <4560000>;
-		lionsemi,battery-ovp-alarm-microvolt = <4525000>;
+		/* 102% OVP encoding yields the same conservative 4.45 V float. */
+		lionsemi,battery-ovp-microvolt = <4539000>;
+		lionsemi,battery-ovp-alarm-microvolt = <4480000>;
 		lionsemi,input-ovp-microvolt = <13000000>;
 		lionsemi,input-ovp-alarm-microvolt = <11000000>;
 		lionsemi,input-ocp-microamp = <3750000>;
@@ -722,6 +727,75 @@
 &pm8150b_charger {
 	status = "okay";
 	monitored-battery = <&battery>;
+	input-power-supply = <&pm8150b_typec>;
+	#cooling-cells = <2>;
+
+	/* OEM Nabu levels; the driver retains its verified 1.95 A ceiling. */
+	qcom,thermal-mitigation-microamp =
+		<3000000 2800000 2600000 2400000
+		 2200000 2100000 2000000 1800000
+		 1600000 1500000 1400000 1200000
+		 1000000 900000 800000 500000>;
+	qcom,thermal-mitigation-input-microamp =
+		<2800000 2700000 2600000 2400000
+		 2200000 2100000 2000000 1800000
+		 1600000 1500000 1400000 1300000
+		 1200000 1100000 950000 750000>;
+	qcom,thermal-mitigation-dcp-microamp =
+		<1800000 1800000 1800000 1800000
+		 1800000 1800000 1800000 1800000
+		 1800000 1700000 1600000 1400000
+		 1200000 1100000 1100000 1000000>;
+	qcom,thermal-mitigation-pd-microamp =
+		<3000000 2800000 2600000 2400000
+		 2200000 2000000 1800000 1600000
+		 1600000 1400000 1200000 1100000
+		 1050000 1000000 950000 500000>;
+
+	/* Sunwoda OEM JEITA profile, bounded by the conservative battery limits. */
+	qcom,jeita-ranges =
+		<(-100) 0 820000 4450000
+		 1 50 820000 4450000
+		 51 100 2500000 4450000
+		 101 150 5964000 4450000
+		 151 480 5900000 4480000
+		 481 590 4260000 4100000>;
+};
+
+&{/thermal-zones/cpu0-thermal} {
+	cooling-maps {
+		nabu-charge-map {
+			trip = <&cpu0_alert0>;
+			cooling-device = <&pm8150b_charger 1 15>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu4-top-thermal} {
+	cooling-maps {
+		nabu-charge-map {
+			trip = <&cpu4_top_alert0>;
+			cooling-device = <&pm8150b_charger 1 15>;
+		};
+	};
+};
+
+&{/thermal-zones/gpu-top-thermal} {
+	cooling-maps {
+		nabu-charge-map {
+			trip = <&gpu_top_alert0>;
+			cooling-device = <&pm8150b_charger 1 15>;
+		};
+	};
+};
+
+&{/thermal-zones/pm8150b-thermal} {
+	cooling-maps {
+		nabu-charge-map {
+			trip = <&pm8150b_trip0>;
+			cooling-device = <&pm8150b_charger 8 15>;
+		};
+	};
 };
 
 &pm8150b_typec {
