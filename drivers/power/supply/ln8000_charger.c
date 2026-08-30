@@ -1520,6 +1520,7 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 	union power_supply_propval online = {};
 	union power_supply_propval voltage = {};
 	union power_supply_propval health = {};
+	union power_supply_propval thermal_level = {};
 	bool enable = false;
 	int ret;
 
@@ -1549,6 +1550,13 @@ static void ln8000_status_changed_worker(struct work_struct *work)
 	ret = power_supply_get_property(chip->switching_psy,
 					POWER_SUPPLY_PROP_HEALTH, &health);
 	if (ret || health.intval != POWER_SUPPLY_HEALTH_GOOD)
+		goto out_disable;
+
+	/* System thermal mitigation always takes precedence over direct charge. */
+	ret = power_supply_get_property(
+		chip->switching_psy, POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+		&thermal_level);
+	if (ret || thermal_level.intval != 0)
 		goto out_disable;
 
 	ret = ln8000_check_status(chip);

@@ -13,13 +13,17 @@
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
+#include <linux/limits.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/string.h>
+#include <linux/thermal.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
 
@@ -201,6 +205,11 @@ enum smb_generation {
 /* Conservative SMB5 fallback and an exact 25 mA register step. */
 #define SMB5_THERMAL_LIMIT_CURRENT_UA			1000000
 #define SMB5_THERMAL_POLL_MS				5000
+#define SMB5_JEITA_HYSTERESIS_DECIC			20
+#define SMB5_PD_5P9V_UV					5900000
+#define SMB5_PD_6P5V_UV					6500000
+#define SMB5_PD_7P5V_UV					7500000
+#define SMB5_PD_8P5V_UV					8500000
 
 /* pmi8998 registers represent current in increments of 1/40th of an amp */
 #define CURRENT_SCALE_FACTOR				25000
@@ -217,11 +226,11 @@ enum charger_status {
 	DISABLE_CHARGE,
 };
 
-enum smb_thermal_charge_state {
-	SMB_THERMAL_UNKNOWN,
-	SMB_THERMAL_NORMAL,
-	SMB_THERMAL_LIMITED,
-	SMB_THERMAL_DISABLED,
+struct smb_jeita_range {
+	s32 temp_min_decic;
+	s32 temp_max_decic;
+	u32 current_ua;
+	u32 voltage_uv;
 };
 
 struct smb_init_register {
@@ -239,7 +248,28 @@ struct smb_init_register {
  * @batt_info:		Battery data from DT
  * @status_change_work: Worker to handle plug/unplug events
  * @thermal_work:	Worker to enforce the SMB5 hardware JEITA state
- * @thermal_state:	Last successfully programmed thermal charge state
+ * @jeita_ranges:	Battery-profile temperature/current/voltage ranges
+ * @num_jeita_ranges: Number of software JEITA ranges
+ * @jeita_index:	Active software JEITA range, or -1
+ * @policy_health:	Combined hardware and software JEITA health
+ * @policy_lock:	Serialises charge-limit calculation and register writes
+ * @thermal_levels:	Fast-charge limits for cooling-device states
+ * @thermal_input_levels: Input-current limits for cooling-device states
+ * @thermal_dcp_levels: DCP input-current limits for cooling-device states
+ * @thermal_pd_levels: PD base input-current limits for cooling-device states
+ * @num_thermal_levels: Number of thermal mitigation levels
+ * @cooling_state:	Current Linux thermal cooling state
+ * @source_current_ua:	Input-current ceiling detected for the USB source
+ * @source_voltage_uv:	Negotiated USB source voltage
+ * @usb_type:		Detected TCPM/APSD USB source type
+ * @user_fcc_ua:	Optional userspace fast-charge-current ceiling
+ * @user_icl_ua:	Optional userspace input-current ceiling
+ * @applied_fcc_ua:	Last fast-charge current programmed to hardware
+ * @applied_icl_ua:	Last input-current limit programmed to hardware
+ * @charging_enabled:	Last charging-enable state programmed to hardware
+ * @cdev:		Linux thermal cooling device
+ * @input_psy:		Optional TCPM power supply describing the PD contract
+ * @nb:			Battery and TCPM power-supply change notifier
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
  * @usb_in_i_chan:	USB_IN current measurement channel
@@ -256,7 +286,28 @@ struct smb_chip {
 
 	struct delayed_work status_change_work;
 	struct delayed_work thermal_work;
-	enum smb_thermal_charge_state thermal_state;
+	struct smb_jeita_range *jeita_ranges;
+	unsigned int num_jeita_ranges;
+	int jeita_index;
+	int policy_health;
+	struct mutex policy_lock;
+	u32 *thermal_levels;
+	u32 *thermal_input_levels;
+	u32 *thermal_dcp_levels;
+	u32 *thermal_pd_levels;
+	unsigned int num_thermal_levels;
+	unsigned long cooling_state;
+	unsigned int source_current_ua;
+	unsigned int source_voltage_uv;
+	int usb_type;
+	unsigned int user_fcc_ua;
+	unsigned int user_icl_ua;
+	unsigned int applied_fcc_ua;
+	unsigned int applied_icl_ua;
+	bool charging_enabled;
+	struct thermal_cooling_device *cdev;
+	struct power_supply *input_psy;
+	struct notifier_block nb;
 	int cable_irq;
 	bool wakeup_enabled;
 
@@ -278,6 +329,9 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
@@ -450,6 +504,41 @@ static int smb_set_current_limit(struct smb_chip *chip, unsigned int val)
 			    val_raw);
 }
 
+static void smb_update_input_contract(struct smb_chip *chip)
+{
+	union power_supply_propval val;
+	unsigned int current_ua;
+	int apsd_type;
+
+	if (!chip->input_psy)
+		return;
+
+	if (!power_supply_get_property(chip->input_psy,
+				       POWER_SUPPLY_PROP_CURRENT_MAX, &val) &&
+	    val.intval > 0) {
+		current_ua = min_t(unsigned int, val.intval,
+				   chip->batt_info->constant_charge_current_max_ua);
+		WRITE_ONCE(chip->source_current_ua, current_ua);
+	}
+
+	if (!power_supply_get_property(chip->input_psy,
+				       POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) &&
+	    val.intval > 0)
+		WRITE_ONCE(chip->source_voltage_uv, val.intval);
+
+	if (power_supply_get_property(chip->input_psy,
+				      POWER_SUPPLY_PROP_USB_TYPE, &val))
+		return;
+
+	if (val.intval == POWER_SUPPLY_USB_TYPE_PD ||
+	    val.intval == POWER_SUPPLY_USB_TYPE_PD_DRP ||
+	    val.intval == POWER_SUPPLY_USB_TYPE_PD_PPS) {
+		WRITE_ONCE(chip->usb_type, val.intval);
+	} else if (!smb_apsd_get_charger_type(chip, &apsd_type)) {
+		WRITE_ONCE(chip->usb_type, apsd_type);
+	}
+}
+
 static void smb_status_change_work(struct work_struct *work)
 {
 	unsigned int charger_type, current_ua;
@@ -498,7 +587,14 @@ static void smb_status_change_work(struct work_struct *work)
 		break;
 	}
 
-	smb_set_current_limit(chip, current_ua);
+	if (chip->gen == SMB5) {
+		WRITE_ONCE(chip->usb_type, charger_type);
+		WRITE_ONCE(chip->source_current_ua, current_ua);
+		smb_update_input_contract(chip);
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+	} else {
+		smb_set_current_limit(chip, current_ua);
+	}
 	power_supply_changed(chip->chg_psy);
 }
 
@@ -635,6 +731,20 @@ static int smb_get_fast_charge_current(struct smb_chip *chip, int *current_ua)
 	return 0;
 }
 
+static int smb_set_float_voltage(struct smb_chip *chip, unsigned int voltage_uv)
+{
+	unsigned int val;
+
+	if (voltage_uv < 3487500 || voltage_uv > 5392500)
+		return -EINVAL;
+
+	val = DIV_ROUND_CLOSEST(voltage_uv - 3487500, 7500) + 1;
+
+	return regmap_update_bits(chip->regmap,
+				  chip->base + FLOAT_VOLTAGE_CFG,
+				  FLOAT_VOLTAGE_SETTING_MASK, val);
+}
+
 static int smb_set_charging_enabled(struct smb_chip *chip, bool enable)
 {
 	return regmap_update_bits(chip->regmap,
@@ -643,75 +753,298 @@ static int smb_set_charging_enabled(struct smb_chip *chip, bool enable)
 				  enable ? CHARGING_ENABLE_CMD_BIT : 0);
 }
 
-static int smb_apply_thermal_state(struct smb_chip *chip,
-				   enum smb_thermal_charge_state state)
+static int smb_read_battery_temperature(int *temp_decic)
 {
-	unsigned int current_ua;
+	union power_supply_propval val;
+	struct power_supply *battery;
 	int rc;
 
-	if (state == chip->thermal_state)
+	battery = power_supply_get_by_name("qcom-battery");
+	if (!battery)
+		return -ENODEV;
+
+	rc = power_supply_get_property(battery, POWER_SUPPLY_PROP_TEMP, &val);
+	power_supply_put(battery);
+	if (rc < 0)
+		return rc;
+
+	*temp_decic = val.intval;
+	return 0;
+}
+
+static int smb_find_jeita_range(struct smb_chip *chip, int temp_decic)
+{
+	struct smb_jeita_range *active, *candidate;
+	int candidate_index = -ERANGE;
+	unsigned int i;
+
+	for (i = 0; i < chip->num_jeita_ranges; i++) {
+		candidate = &chip->jeita_ranges[i];
+		if (temp_decic >= candidate->temp_min_decic &&
+		    temp_decic <= candidate->temp_max_decic) {
+			candidate_index = i;
+			break;
+		}
+	}
+	if (candidate_index < 0 || chip->jeita_index < 0 ||
+	    candidate_index == chip->jeita_index)
+		return candidate_index;
+
+	active = &chip->jeita_ranges[chip->jeita_index];
+	candidate = &chip->jeita_ranges[candidate_index];
+
+	/* Tighten immediately; use hysteresis only when relaxing a limit. */
+	if (candidate->current_ua <= active->current_ua &&
+	    candidate->voltage_uv <= active->voltage_uv)
+		return candidate_index;
+
+	if (candidate_index > chip->jeita_index &&
+	    temp_decic <= active->temp_max_decic +
+			  SMB5_JEITA_HYSTERESIS_DECIC)
+		return chip->jeita_index;
+	if (candidate_index < chip->jeita_index &&
+	    temp_decic >= active->temp_min_decic -
+			  SMB5_JEITA_HYSTERESIS_DECIC)
+		return chip->jeita_index;
+
+	return candidate_index;
+}
+
+static int smb_get_software_jeita(struct smb_chip *chip, int *health,
+				  unsigned int *current_ua,
+				  unsigned int *voltage_uv)
+{
+	struct smb_jeita_range *range;
+	int index, temp_decic, rc;
+	int alert_min, alert_max, hard_min, hard_max;
+
+	if (!chip->num_jeita_ranges)
+		return -EOPNOTSUPP;
+
+	rc = smb_read_battery_temperature(&temp_decic);
+	if (rc < 0)
+		return rc;
+
+	index = smb_find_jeita_range(chip, temp_decic);
+	if (index < 0) {
+		chip->jeita_index = -1;
+		*health = temp_decic < chip->jeita_ranges[0].temp_min_decic ?
+			  POWER_SUPPLY_HEALTH_COLD :
+			  POWER_SUPPLY_HEALTH_OVERHEAT;
+		*current_ua = 0;
+		*voltage_uv = 0;
 		return 0;
-
-	if (state == SMB_THERMAL_DISABLED) {
-		rc = smb_set_charging_enabled(chip, false);
-		if (rc < 0)
-			return rc;
-	} else {
-		current_ua = state == SMB_THERMAL_NORMAL ?
-			     SMB5_FAST_CHARGE_CURRENT_UA :
-			     SMB5_THERMAL_LIMIT_CURRENT_UA;
-
-		/* Program the safe current before re-enabling battery charging. */
-		rc = smb_set_fast_charge_current(chip, current_ua);
-		if (rc < 0)
-			return rc;
-
-		rc = smb_set_charging_enabled(chip, true);
-		if (rc < 0)
-			return rc;
 	}
 
-	chip->thermal_state = state;
-	dev_info(chip->dev, "thermal charge state changed to %u\n", state);
-	power_supply_changed(chip->chg_psy);
+	chip->jeita_index = index;
+	range = &chip->jeita_ranges[index];
+	*current_ua = range->current_ua;
+	*voltage_uv = range->voltage_uv;
+
+	hard_min = chip->batt_info->temp_min;
+	hard_max = chip->batt_info->temp_max;
+	alert_min = chip->batt_info->temp_alert_min;
+	alert_max = chip->batt_info->temp_alert_max;
+
+	if (hard_min > INT_MIN && temp_decic < hard_min * 10)
+		*health = POWER_SUPPLY_HEALTH_COLD;
+	else if (hard_max < INT_MAX && temp_decic > hard_max * 10)
+		*health = POWER_SUPPLY_HEALTH_OVERHEAT;
+	else if (alert_min > INT_MIN && temp_decic < alert_min * 10)
+		*health = POWER_SUPPLY_HEALTH_COOL;
+	else if (alert_max < INT_MAX && temp_decic > alert_max * 10)
+		*health = POWER_SUPPLY_HEALTH_WARM;
+	else
+		*health = POWER_SUPPLY_HEALTH_GOOD;
 
 	return 0;
+}
+
+static int smb_merge_health(int hardware, int software)
+{
+	if (hardware == POWER_SUPPLY_HEALTH_OVERVOLTAGE ||
+	    software == POWER_SUPPLY_HEALTH_OVERVOLTAGE)
+		return POWER_SUPPLY_HEALTH_OVERVOLTAGE;
+	if (hardware == POWER_SUPPLY_HEALTH_OVERHEAT ||
+	    software == POWER_SUPPLY_HEALTH_OVERHEAT)
+		return POWER_SUPPLY_HEALTH_OVERHEAT;
+	if (hardware == POWER_SUPPLY_HEALTH_COLD ||
+	    software == POWER_SUPPLY_HEALTH_COLD)
+		return POWER_SUPPLY_HEALTH_COLD;
+	if ((hardware == POWER_SUPPLY_HEALTH_WARM &&
+	     software == POWER_SUPPLY_HEALTH_COOL) ||
+	    (hardware == POWER_SUPPLY_HEALTH_COOL &&
+	     software == POWER_SUPPLY_HEALTH_WARM))
+		return POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+	if (hardware == POWER_SUPPLY_HEALTH_WARM ||
+	    software == POWER_SUPPLY_HEALTH_WARM)
+		return POWER_SUPPLY_HEALTH_WARM;
+	if (hardware == POWER_SUPPLY_HEALTH_COOL ||
+	    software == POWER_SUPPLY_HEALTH_COOL)
+		return POWER_SUPPLY_HEALTH_COOL;
+
+	return POWER_SUPPLY_HEALTH_GOOD;
+}
+
+static unsigned int smb_get_thermal_input_limit(struct smb_chip *chip,
+						 unsigned long state)
+{
+	unsigned int limit = chip->thermal_input_levels[state];
+	unsigned int voltage_uv = READ_ONCE(chip->source_voltage_uv);
+	unsigned int contract_limit;
+	int usb_type = READ_ONCE(chip->usb_type);
+
+	if (!state)
+		return limit;
+
+	if (usb_type == POWER_SUPPLY_USB_TYPE_DCP && chip->thermal_dcp_levels)
+		return min(limit, chip->thermal_dcp_levels[state]);
+
+	if (usb_type != POWER_SUPPLY_USB_TYPE_PD &&
+	    usb_type != POWER_SUPPLY_USB_TYPE_PD_DRP &&
+	    usb_type != POWER_SUPPLY_USB_TYPE_PD_PPS)
+		return limit;
+	if (!chip->thermal_pd_levels)
+		return limit;
+
+	contract_limit = chip->thermal_pd_levels[state];
+	if (voltage_uv >= SMB5_PD_8P5V_UV)
+		contract_limit = contract_limit * 65 / 100;
+	else if (voltage_uv >= SMB5_PD_7P5V_UV)
+		contract_limit = contract_limit * 70 / 100;
+	else if (voltage_uv >= SMB5_PD_6P5V_UV)
+		contract_limit = contract_limit * 75 / 100;
+	else if (voltage_uv >= SMB5_PD_5P9V_UV)
+		contract_limit = contract_limit * 85 / 100;
+
+	return min(limit, contract_limit);
+}
+
+static int smb_apply_charge_policy(struct smb_chip *chip, int health,
+				   unsigned int jeita_current_ua,
+				   unsigned int jeita_voltage_uv)
+{
+	unsigned int current_ua, input_ua, voltage_uv;
+	unsigned long cooling_state;
+	bool changed = false, enable;
+	int rc;
+
+	current_ua = min_t(unsigned int, SMB5_FAST_CHARGE_CURRENT_UA,
+			   chip->batt_info->constant_charge_current_max_ua);
+	voltage_uv = chip->batt_info->constant_charge_voltage_max_uv;
+	if ((int)voltage_uv <= 0)
+		voltage_uv = chip->batt_info->voltage_max_design_uv;
+	input_ua = READ_ONCE(chip->source_current_ua) ?: SDP_CURRENT_UA;
+	if (READ_ONCE(chip->user_fcc_ua))
+		current_ua = min(current_ua, READ_ONCE(chip->user_fcc_ua));
+	if (READ_ONCE(chip->user_icl_ua))
+		input_ua = min(input_ua, READ_ONCE(chip->user_icl_ua));
+
+	if (jeita_current_ua)
+		current_ua = min(current_ua, jeita_current_ua);
+	if (jeita_voltage_uv)
+		voltage_uv = min(voltage_uv, jeita_voltage_uv);
+
+	cooling_state = min_t(unsigned long, READ_ONCE(chip->cooling_state),
+			      chip->num_thermal_levels - 1);
+	current_ua = min(current_ua, chip->thermal_levels[cooling_state]);
+	input_ua = min(input_ua,
+		       smb_get_thermal_input_limit(chip, cooling_state));
+
+	enable = health == POWER_SUPPLY_HEALTH_GOOD ||
+		 health == POWER_SUPPLY_HEALTH_WARM ||
+		 health == POWER_SUPPLY_HEALTH_COOL;
+	if (chip->num_thermal_levels > 1 &&
+	    cooling_state == chip->num_thermal_levels - 1)
+		enable = false;
+	if (health == POWER_SUPPLY_HEALTH_WARM ||
+	    health == POWER_SUPPLY_HEALTH_COOL)
+		current_ua = min(current_ua,
+				 SMB5_THERMAL_LIMIT_CURRENT_UA);
+
+	mutex_lock(&chip->policy_lock);
+	if (enable) {
+		/* Apply all ceilings before enabling or increasing charge power. */
+		rc = smb_set_current_limit(chip, input_ua);
+		if (rc < 0)
+			goto disable_on_error;
+		rc = smb_set_float_voltage(chip, voltage_uv);
+		if (rc < 0)
+			goto disable_on_error;
+		rc = smb_set_fast_charge_current(chip, current_ua);
+		if (rc < 0)
+			goto disable_on_error;
+		rc = smb_set_charging_enabled(chip, true);
+		if (rc < 0)
+			goto disable_on_error;
+	} else {
+		rc = smb_set_charging_enabled(chip, false);
+		if (rc < 0)
+			goto out_unlock;
+	}
+
+	changed = chip->applied_fcc_ua != current_ua ||
+		  chip->applied_icl_ua != input_ua ||
+		  chip->charging_enabled != enable ||
+		  chip->policy_health != health;
+	if (changed)
+		dev_info(chip->dev,
+			 "charge policy health=%d cooling=%lu fcc=%u icl=%u enabled=%d\n",
+			 health, cooling_state, current_ua, input_ua, enable);
+
+	chip->applied_fcc_ua = current_ua;
+	chip->applied_icl_ua = input_ua;
+	chip->charging_enabled = enable;
+	chip->policy_health = health;
+	rc = 0;
+	goto out_unlock;
+
+disable_on_error:
+	/* A partially applied limit set must never leave charging enabled. */
+	if (!smb_set_charging_enabled(chip, false))
+		chip->charging_enabled = false;
+
+out_unlock:
+	mutex_unlock(&chip->policy_lock);
+	if (!rc && changed)
+		power_supply_changed(chip->chg_psy);
+
+	return rc;
 }
 
 static void smb_thermal_work(struct work_struct *work)
 {
 	struct smb_chip *chip =
 		container_of(work, struct smb_chip, thermal_work.work);
-	enum smb_thermal_charge_state state;
-	int health, rc;
+	unsigned int jeita_current_ua = UINT_MAX;
+	unsigned int jeita_voltage_uv = UINT_MAX;
+	int hardware_health, software_health, health, rc;
 
-	rc = smb_get_prop_health(chip, &health);
+	smb_update_input_contract(chip);
+	rc = smb_get_prop_health(chip, &hardware_health);
 	if (rc < 0) {
-		/* Fail closed when the hardware JEITA state cannot be read. */
-		state = SMB_THERMAL_DISABLED;
+		health = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
 	} else {
-		switch (health) {
-		case POWER_SUPPLY_HEALTH_GOOD:
-			state = SMB_THERMAL_NORMAL;
-			break;
-		case POWER_SUPPLY_HEALTH_WARM:
-		case POWER_SUPPLY_HEALTH_COOL:
-			state = SMB_THERMAL_LIMITED;
-			break;
-		case POWER_SUPPLY_HEALTH_OVERHEAT:
-		case POWER_SUPPLY_HEALTH_COLD:
-		case POWER_SUPPLY_HEALTH_OVERVOLTAGE:
-		default:
-			state = SMB_THERMAL_DISABLED;
-			break;
+		rc = smb_get_software_jeita(chip, &software_health,
+					    &jeita_current_ua,
+					    &jeita_voltage_uv);
+		if (rc == -EOPNOTSUPP) {
+			software_health = POWER_SUPPLY_HEALTH_GOOD;
+			jeita_current_ua = UINT_MAX;
+			jeita_voltage_uv = UINT_MAX;
+		} else if (rc < 0) {
+			software_health = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+			jeita_current_ua = 0;
+			jeita_voltage_uv = 0;
 		}
+		health = smb_merge_health(hardware_health, software_health);
 	}
 
-	rc = smb_apply_thermal_state(chip, state);
+	rc = smb_apply_charge_policy(chip, health, jeita_current_ua,
+				     jeita_voltage_uv);
 	if (rc < 0)
 		dev_err_ratelimited(chip->dev,
-				    "failed to apply thermal charge state %u: %d\n",
-				    state, rc);
+				    "failed to apply charge policy: %d\n", rc);
 
 	mod_delayed_work(system_wq, &chip->thermal_work,
 			 msecs_to_jiffies(SMB5_THERMAL_POLL_MS));
@@ -735,6 +1068,16 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_current_limit(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 		return smb_get_fast_charge_current(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		val->intval = chip->batt_info->constant_charge_current_max_ua;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		val->intval = READ_ONCE(chip->cooling_state);
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX:
+		val->intval = chip->num_thermal_levels ?
+			      chip->num_thermal_levels - 1 : 0;
+		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		return smb_get_iio_chan(chip, chip->usb_in_i_chan,
 					 &val->intval);
@@ -751,6 +1094,11 @@ static int smb_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_STATUS:
 		return smb_get_prop_status(chip, &val->intval);
 	case POWER_SUPPLY_PROP_HEALTH:
+		if (READ_ONCE(chip->policy_health) !=
+		    POWER_SUPPLY_HEALTH_UNKNOWN) {
+			val->intval = READ_ONCE(chip->policy_health);
+			return 0;
+		}
 		return smb_get_prop_health(chip, &val->intval);
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		return smb_apsd_get_charger_type(chip, &val->intval);
@@ -771,7 +1119,28 @@ static int smb_set_property(struct power_supply *psy,
 		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
 					  USBIN_SUSPEND_BIT, !val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
-		return smb_set_current_limit(chip, val->intval);
+		if (chip->gen != SMB5)
+			return smb_set_current_limit(chip, val->intval);
+		if (val->intval <= 0 || val->intval > 4800000)
+			return -EINVAL;
+		WRITE_ONCE(chip->user_icl_ua, val->intval);
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		return 0;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		if (chip->gen != SMB5 || val->intval <= 0 ||
+		    val->intval >
+			chip->batt_info->constant_charge_current_max_ua)
+			return -EINVAL;
+		WRITE_ONCE(chip->user_fcc_ua, val->intval);
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		if (chip->gen != SMB5 || val->intval < 0 ||
+		    val->intval >= chip->num_thermal_levels)
+			return -EINVAL;
+		WRITE_ONCE(chip->cooling_state, val->intval);
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		return 0;
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
 		return -EINVAL;
@@ -784,6 +1153,8 @@ static int smb_property_is_writable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		return 1;
 	default:
 		return 0;
@@ -1102,6 +1473,222 @@ static int smb_init_irq(struct smb_chip *chip, int *irq, const char *name,
 	return 0;
 }
 
+static int smb_read_limit_table(struct smb_chip *chip, const char *property,
+				u32 **table, unsigned int *count)
+{
+	int entries, rc;
+	unsigned int i;
+
+	entries = device_property_count_u32(chip->dev, property);
+	if (entries < 0)
+		return entries;
+	if (!entries || entries > 32)
+		return -EINVAL;
+
+	*table = devm_kcalloc(chip->dev, entries, sizeof(**table), GFP_KERNEL);
+	if (!*table)
+		return -ENOMEM;
+
+	rc = device_property_read_u32_array(chip->dev, property, *table,
+					    entries);
+	if (rc < 0)
+		return rc;
+
+	for (i = 0; i < entries; i++) {
+		if (!(*table)[i] ||
+		    (i && (*table)[i] > (*table)[i - 1]))
+			return dev_err_probe(chip->dev, -EINVAL,
+				"%s must contain non-zero descending limits\n",
+				property);
+	}
+
+	*count = entries;
+	return 0;
+}
+
+static int smb_parse_thermal_tables(struct smb_chip *chip)
+{
+	unsigned int input_count;
+	int rc;
+
+	if (!device_property_present(chip->dev,
+				     "qcom,thermal-mitigation-microamp") &&
+	    !device_property_present(chip->dev,
+				     "qcom,thermal-mitigation-input-microamp")) {
+		chip->thermal_levels = devm_kmalloc(
+			chip->dev, sizeof(*chip->thermal_levels), GFP_KERNEL);
+		chip->thermal_input_levels = devm_kmalloc(
+			chip->dev, sizeof(*chip->thermal_input_levels), GFP_KERNEL);
+		if (!chip->thermal_levels || !chip->thermal_input_levels)
+			return -ENOMEM;
+		chip->thermal_levels[0] = SMB5_FAST_CHARGE_CURRENT_UA;
+		chip->thermal_input_levels[0] = 4800000;
+		chip->num_thermal_levels = 1;
+		return 0;
+	}
+
+	if (!device_property_present(chip->dev,
+				     "qcom,thermal-mitigation-microamp") ||
+	    !device_property_present(chip->dev,
+				     "qcom,thermal-mitigation-input-microamp"))
+		return dev_err_probe(chip->dev, -EINVAL,
+			"both thermal FCC and ICL tables are required\n");
+
+	rc = smb_read_limit_table(chip, "qcom,thermal-mitigation-microamp",
+				  &chip->thermal_levels,
+				  &chip->num_thermal_levels);
+	if (rc < 0)
+		return rc;
+
+	rc = smb_read_limit_table(
+		chip, "qcom,thermal-mitigation-input-microamp",
+		&chip->thermal_input_levels, &input_count);
+	if (rc < 0)
+		return rc;
+	if (input_count != chip->num_thermal_levels)
+		return dev_err_probe(chip->dev, -EINVAL,
+			"thermal FCC and ICL tables must have equal lengths\n");
+
+	if (device_property_present(chip->dev,
+				    "qcom,thermal-mitigation-dcp-microamp")) {
+		rc = smb_read_limit_table(
+			chip, "qcom,thermal-mitigation-dcp-microamp",
+			&chip->thermal_dcp_levels, &input_count);
+		if (rc < 0)
+			return rc;
+		if (input_count != chip->num_thermal_levels)
+			return dev_err_probe(
+				chip->dev, -EINVAL,
+				"DCP thermal table must match FCC table length\n");
+	}
+
+	if (device_property_present(chip->dev,
+				    "qcom,thermal-mitigation-pd-microamp")) {
+		rc = smb_read_limit_table(
+			chip, "qcom,thermal-mitigation-pd-microamp",
+			&chip->thermal_pd_levels, &input_count);
+		if (rc < 0)
+			return rc;
+		if (input_count != chip->num_thermal_levels)
+			return dev_err_probe(
+				chip->dev, -EINVAL,
+				"PD thermal table must match FCC table length\n");
+	}
+
+	return 0;
+}
+
+static int smb_parse_jeita_ranges(struct smb_chip *chip)
+{
+	struct smb_jeita_range *range;
+	u32 *values;
+	int count, rc;
+	unsigned int i;
+
+	if (!device_property_present(chip->dev, "qcom,jeita-ranges"))
+		return 0;
+
+	count = device_property_count_u32(chip->dev, "qcom,jeita-ranges");
+	if (count < 0)
+		return count;
+	if (!count || count % 4 || count > 32)
+		return dev_err_probe(chip->dev, -EINVAL,
+				     "qcom,jeita-ranges must contain 1..8 tuples\n");
+
+	values = devm_kcalloc(chip->dev, count, sizeof(*values), GFP_KERNEL);
+	chip->jeita_ranges = devm_kcalloc(chip->dev, count / 4,
+					  sizeof(*chip->jeita_ranges), GFP_KERNEL);
+	if (!values || !chip->jeita_ranges)
+		return -ENOMEM;
+
+	rc = device_property_read_u32_array(chip->dev, "qcom,jeita-ranges",
+					    values, count);
+	if (rc < 0)
+		return rc;
+
+	chip->num_jeita_ranges = count / 4;
+	for (i = 0; i < chip->num_jeita_ranges; i++) {
+		range = &chip->jeita_ranges[i];
+		range->temp_min_decic = (s32)values[i * 4];
+		range->temp_max_decic = (s32)values[i * 4 + 1];
+		range->current_ua = values[i * 4 + 2];
+		range->voltage_uv = values[i * 4 + 3];
+
+		if (range->temp_min_decic > range->temp_max_decic ||
+		    !range->current_ua || range->voltage_uv < 3487500 ||
+		    range->voltage_uv >
+			chip->batt_info->voltage_max_design_uv ||
+		    (i && range->temp_min_decic <=
+			  chip->jeita_ranges[i - 1].temp_max_decic))
+			return dev_err_probe(chip->dev, -EINVAL,
+					     "invalid JEITA range %u\n", i);
+	}
+
+	return 0;
+}
+
+static int smb_cooling_get_max_state(struct thermal_cooling_device *cdev,
+				     unsigned long *state)
+{
+	struct smb_chip *chip = cdev->devdata;
+
+	*state = chip->num_thermal_levels - 1;
+	return 0;
+}
+
+static int smb_cooling_get_cur_state(struct thermal_cooling_device *cdev,
+				     unsigned long *state)
+{
+	struct smb_chip *chip = cdev->devdata;
+
+	*state = READ_ONCE(chip->cooling_state);
+	return 0;
+}
+
+static int smb_cooling_set_cur_state(struct thermal_cooling_device *cdev,
+				     unsigned long state)
+{
+	struct smb_chip *chip = cdev->devdata;
+
+	if (state >= chip->num_thermal_levels)
+		return -EINVAL;
+	if (state == READ_ONCE(chip->cooling_state))
+		return 0;
+
+	WRITE_ONCE(chip->cooling_state, state);
+	mod_delayed_work(system_wq, &chip->thermal_work, 0);
+	return 0;
+}
+
+static const struct thermal_cooling_device_ops smb_cooling_ops = {
+	.get_max_state = smb_cooling_get_max_state,
+	.get_cur_state = smb_cooling_get_cur_state,
+	.set_cur_state = smb_cooling_set_cur_state,
+};
+
+static int smb_power_supply_notifier(struct notifier_block *nb,
+				     unsigned long event, void *data)
+{
+	struct smb_chip *chip = container_of(nb, struct smb_chip, nb);
+	struct power_supply *psy = data;
+
+	if (event != PSY_EVENT_PROP_CHANGED)
+		return NOTIFY_OK;
+	if (psy != chip->input_psy &&
+	    strcmp(psy->desc->name, "qcom-battery"))
+		return NOTIFY_OK;
+
+	mod_delayed_work(system_wq, &chip->thermal_work, 0);
+	return NOTIFY_OK;
+}
+
+static void smb_unregister_power_supply_notifier(void *data)
+{
+	struct smb_chip *chip = data;
+
+	power_supply_unreg_notifier(&chip->nb);
+}
+
 static int smb_probe(struct platform_device *pdev)
 {
 	struct power_supply_config supply_config = {};
@@ -1173,6 +1760,16 @@ static int smb_probe(struct platform_device *pdev)
 				     "Failed to get battery info\n");
 	if (chip->batt_info->constant_charge_current_max_ua == -EINVAL)
 		chip->batt_info->constant_charge_current_max_ua = DCP_CURRENT_UA;
+	if (chip->batt_info->constant_charge_voltage_max_uv == -EINVAL)
+		chip->batt_info->constant_charge_voltage_max_uv =
+			chip->batt_info->voltage_max_design_uv;
+
+	mutex_init(&chip->policy_lock);
+	chip->jeita_index = -1;
+	chip->policy_health = POWER_SUPPLY_HEALTH_UNKNOWN;
+	chip->source_current_ua = SDP_CURRENT_UA;
+	chip->source_voltage_uv = 5000000;
+	chip->usb_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 
 	rc = devm_delayed_work_autocancel(chip->dev, &chip->status_change_work,
 					  smb_status_change_work);
@@ -1181,18 +1778,36 @@ static int smb_probe(struct platform_device *pdev)
 				     "Failed to init status change work\n");
 
 	if (chip->gen == SMB5) {
+		if (device_property_present(chip->dev, "input-power-supply")) {
+			chip->input_psy = devm_power_supply_get_by_reference(
+				chip->dev, "input-power-supply");
+			if (IS_ERR(chip->input_psy))
+				return dev_err_probe(
+					chip->dev, PTR_ERR(chip->input_psy),
+					"Failed to get input power supply\n");
+			if (!chip->input_psy)
+				return dev_err_probe(
+					chip->dev, -EPROBE_DEFER,
+					"Input power supply is not ready\n");
+		}
+
+		rc = smb_parse_thermal_tables(chip);
+		if (rc < 0)
+			return rc;
+		rc = smb_parse_jeita_ranges(chip);
+		if (rc < 0)
+			return rc;
+
 		rc = devm_delayed_work_autocancel(chip->dev,
 						  &chip->thermal_work,
 						  smb_thermal_work);
 		if (rc)
 			return dev_err_probe(chip->dev, rc,
 					     "Failed to init thermal work\n");
-		chip->thermal_state = SMB_THERMAL_UNKNOWN;
 	}
 
-	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
-	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
-				FLOAT_VOLTAGE_SETTING_MASK, rc);
+	rc = smb_set_float_voltage(
+		chip, chip->batt_info->constant_charge_voltage_max_uv);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc, "Couldn't set vbat max\n");
 
@@ -1238,6 +1853,33 @@ static int smb_probe(struct platform_device *pdev)
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't write fast AICL rerun time");
+
+	if (chip->gen == SMB5) {
+		chip->cdev = devm_thermal_of_cooling_device_register(
+			chip->dev, chip->dev->of_node, "smb5-charger", chip,
+			&smb_cooling_ops);
+		if (IS_ERR(chip->cdev)) {
+			rc = PTR_ERR(chip->cdev);
+			chip->cdev = NULL;
+			if (rc != -ENODEV)
+				return dev_err_probe(
+					chip->dev, rc,
+					"Failed to register cooling device\n");
+			dev_warn(chip->dev,
+				 "thermal framework unavailable; using JEITA only\n");
+		}
+
+		chip->nb.notifier_call = smb_power_supply_notifier;
+		rc = power_supply_reg_notifier(&chip->nb);
+		if (rc)
+			return dev_err_probe(
+				chip->dev, rc,
+				"Failed to register power-supply notifier\n");
+		rc = devm_add_action_or_reset(
+			chip->dev, smb_unregister_power_supply_notifier, chip);
+		if (rc)
+			return rc;
+	}
 
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
