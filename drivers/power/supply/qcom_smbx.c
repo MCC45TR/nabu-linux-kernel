@@ -197,6 +197,11 @@ enum smb_generation {
 #define DCP_CURRENT_UA					1500000
 #define CURRENT_MAX_UA					DCP_CURRENT_UA
 
+#define SMB5_FAST_CHARGE_CURRENT_UA			1950000
+/* Conservative SMB5 fallback and an exact 25 mA register step. */
+#define SMB5_THERMAL_LIMIT_CURRENT_UA			1000000
+#define SMB5_THERMAL_POLL_MS				5000
+
 /* pmi8998 registers represent current in increments of 1/40th of an amp */
 #define CURRENT_SCALE_FACTOR				25000
 /* clang-format on */
@@ -210,6 +215,13 @@ enum charger_status {
 	TERMINATE_CHARGE,
 	INHIBIT_CHARGE,
 	DISABLE_CHARGE,
+};
+
+enum smb_thermal_charge_state {
+	SMB_THERMAL_UNKNOWN,
+	SMB_THERMAL_NORMAL,
+	SMB_THERMAL_LIMITED,
+	SMB_THERMAL_DISABLED,
 };
 
 struct smb_init_register {
@@ -226,6 +238,8 @@ struct smb_init_register {
  * @regmap:		Register map
  * @batt_info:		Battery data from DT
  * @status_change_work: Worker to handle plug/unplug events
+ * @thermal_work:	Worker to enforce the SMB5 hardware JEITA state
+ * @thermal_state:	Last successfully programmed thermal charge state
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
  * @usb_in_i_chan:	USB_IN current measurement channel
@@ -241,6 +255,8 @@ struct smb_chip {
 	enum smb_generation gen;
 
 	struct delayed_work status_change_work;
+	struct delayed_work thermal_work;
+	enum smb_thermal_charge_state thermal_state;
 	int cable_irq;
 	bool wakeup_enabled;
 
@@ -261,6 +277,7 @@ static enum power_supply_property smb_properties[] = {
 	POWER_SUPPLY_PROP_MANUFACTURER,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_STATUS,
@@ -590,6 +607,116 @@ static int smb_get_prop_health(struct smb_chip *chip, int *val)
 	}
 }
 
+static int smb_set_fast_charge_current(struct smb_chip *chip,
+				       unsigned int current_ua)
+{
+	if (current_ua > FAST_CHARGE_CURRENT_SETTING_MASK *
+			 CURRENT_SCALE_FACTOR)
+		return -EINVAL;
+
+	return regmap_write(chip->regmap,
+			    chip->base + FAST_CHARGE_CURRENT_CFG,
+			    current_ua / CURRENT_SCALE_FACTOR);
+}
+
+static int smb_get_fast_charge_current(struct smb_chip *chip, int *current_ua)
+{
+	unsigned int val;
+	int rc;
+
+	rc = regmap_read(chip->regmap,
+			 chip->base + FAST_CHARGE_CURRENT_CFG, &val);
+	if (rc < 0)
+		return rc;
+
+	*current_ua = (val & FAST_CHARGE_CURRENT_SETTING_MASK) *
+		      CURRENT_SCALE_FACTOR;
+
+	return 0;
+}
+
+static int smb_set_charging_enabled(struct smb_chip *chip, bool enable)
+{
+	return regmap_update_bits(chip->regmap,
+				  chip->base + CHARGING_ENABLE_CMD,
+				  CHARGING_ENABLE_CMD_BIT,
+				  enable ? CHARGING_ENABLE_CMD_BIT : 0);
+}
+
+static int smb_apply_thermal_state(struct smb_chip *chip,
+				   enum smb_thermal_charge_state state)
+{
+	unsigned int current_ua;
+	int rc;
+
+	if (state == chip->thermal_state)
+		return 0;
+
+	if (state == SMB_THERMAL_DISABLED) {
+		rc = smb_set_charging_enabled(chip, false);
+		if (rc < 0)
+			return rc;
+	} else {
+		current_ua = state == SMB_THERMAL_NORMAL ?
+			     SMB5_FAST_CHARGE_CURRENT_UA :
+			     SMB5_THERMAL_LIMIT_CURRENT_UA;
+
+		/* Program the safe current before re-enabling battery charging. */
+		rc = smb_set_fast_charge_current(chip, current_ua);
+		if (rc < 0)
+			return rc;
+
+		rc = smb_set_charging_enabled(chip, true);
+		if (rc < 0)
+			return rc;
+	}
+
+	chip->thermal_state = state;
+	dev_info(chip->dev, "thermal charge state changed to %u\n", state);
+	power_supply_changed(chip->chg_psy);
+
+	return 0;
+}
+
+static void smb_thermal_work(struct work_struct *work)
+{
+	struct smb_chip *chip =
+		container_of(work, struct smb_chip, thermal_work.work);
+	enum smb_thermal_charge_state state;
+	int health, rc;
+
+	rc = smb_get_prop_health(chip, &health);
+	if (rc < 0) {
+		/* Fail closed when the hardware JEITA state cannot be read. */
+		state = SMB_THERMAL_DISABLED;
+	} else {
+		switch (health) {
+		case POWER_SUPPLY_HEALTH_GOOD:
+			state = SMB_THERMAL_NORMAL;
+			break;
+		case POWER_SUPPLY_HEALTH_WARM:
+		case POWER_SUPPLY_HEALTH_COOL:
+			state = SMB_THERMAL_LIMITED;
+			break;
+		case POWER_SUPPLY_HEALTH_OVERHEAT:
+		case POWER_SUPPLY_HEALTH_COLD:
+		case POWER_SUPPLY_HEALTH_OVERVOLTAGE:
+		default:
+			state = SMB_THERMAL_DISABLED;
+			break;
+		}
+	}
+
+	rc = smb_apply_thermal_state(chip, state);
+	if (rc < 0)
+		dev_err_ratelimited(chip->dev,
+				    "failed to apply thermal charge state %u: %d\n",
+				    state, rc);
+
+	mod_delayed_work(system_wq, &chip->thermal_work,
+			 msecs_to_jiffies(SMB5_THERMAL_POLL_MS));
+}
+
 static int smb_get_property(struct power_supply *psy,
 			     enum power_supply_property psp,
 			     union power_supply_propval *val)
@@ -606,6 +733,8 @@ static int smb_get_property(struct power_supply *psy,
 		return 0;
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_get_current_limit(chip, &val->intval);
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		return smb_get_fast_charge_current(chip, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		return smb_get_iio_chan(chip, chip->usb_in_i_chan,
 					 &val->intval);
@@ -682,6 +811,8 @@ static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 
 	schedule_delayed_work(&chip->status_change_work,
 			      msecs_to_jiffies(1500));
+	if (chip->gen == SMB5)
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
 
 	return IRQ_HANDLED;
 }
@@ -798,13 +929,12 @@ static const struct smb_init_register smb5_init_seq[] = {
 			| USBIN_AICL_EN_BIT | SUSPEND_ON_COLLAPSE_USBIN_BIT },
 	/*
 	 * This overrides all of the other current limit configs and is
-	 * expected to be used for setting limits based on temperature.
-	 * We set some relatively safe default value while still allowing
-	 * a comfortably fast charging rate.
+	 * used for temperature-based limits.  Begin with the reduced value;
+	 * the thermal worker raises it only after a valid GOOD JEITA state.
 	 */
 	{ .addr = FAST_CHARGE_CURRENT_CFG,
 	  .mask = FAST_CHARGE_CURRENT_SETTING_MASK,
-	  .val = 1950000 / CURRENT_SCALE_FACTOR },
+	  .val = SMB5_THERMAL_LIMIT_CURRENT_UA / CURRENT_SCALE_FACTOR },
 };
 
 /* Init sequence derived from vendor downstream driver */
@@ -1050,6 +1180,16 @@ static int smb_probe(struct platform_device *pdev)
 		return dev_err_probe(chip->dev, rc,
 				     "Failed to init status change work\n");
 
+	if (chip->gen == SMB5) {
+		rc = devm_delayed_work_autocancel(chip->dev,
+						  &chip->thermal_work,
+						  smb_thermal_work);
+		if (rc)
+			return dev_err_probe(chip->dev, rc,
+					     "Failed to init thermal work\n");
+		chip->thermal_state = SMB_THERMAL_UNKNOWN;
+	}
+
 	rc = (chip->batt_info->voltage_max_design_uv - 3487500) / 7500 + 1;
 	rc = regmap_update_bits(chip->regmap, chip->base + FLOAT_VOLTAGE_CFG,
 				FLOAT_VOLTAGE_SETTING_MASK, rc);
@@ -1082,15 +1222,13 @@ static int smb_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, chip);
 
 	/*
-	 * This overrides all of the other current limits and is expected
-	 * to be used for setting limits based on temperature. We set some
-	 * relatively safe default value while still allowing a comfortably
-	 * fast charging rate. Once temperature monitoring is hooked up we
-	 * would expect this to be changed dynamically based on temperature
-	 * reporting.
+	 * This overrides all of the other current limits.  SMB5 starts at the
+	 * reduced fail-safe value; smb_thermal_work raises it only after the
+	 * hardware JEITA state has been read successfully as GOOD.
 	 */
-	rc = regmap_write(chip->regmap, chip->base + FAST_CHARGE_CURRENT_CFG,
-			  1950000 / CURRENT_SCALE_FACTOR);
+	rc = smb_set_fast_charge_current(chip, chip->gen == SMB5 ?
+					 SMB5_THERMAL_LIMIT_CURRENT_UA :
+					 SMB5_FAST_CHARGE_CURRENT_UA);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
 				     "Couldn't write fast charge current cfg");
@@ -1103,6 +1241,8 @@ static int smb_probe(struct platform_device *pdev)
 
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
+	if (chip->gen == SMB5)
+		mod_delayed_work(system_wq, &chip->thermal_work, 0);
 
 	return 0;
 }

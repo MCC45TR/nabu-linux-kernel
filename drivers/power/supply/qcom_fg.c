@@ -833,7 +833,8 @@ static int qcom_fg_gen4_get_temperature(struct qcom_fg_chip *chip, int *val)
 		return ret;
 	}
 
-	temp = readval[1] << 8 | readval[0];
+	/* RRADC reports signed degrees Celsius; power_supply uses decidegrees. */
+	temp = (s16)(readval[1] << 8 | readval[0]);
 	*val = temp * 10;
 	return 0;
 }
