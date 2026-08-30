@@ -210,6 +210,8 @@ enum smb_generation {
 #define SMB5_PD_6P5V_UV					6500000
 #define SMB5_PD_7P5V_UV					7500000
 #define SMB5_PD_8P5V_UV					8500000
+#define SMB5_CONNECTOR_SHUTDOWN_MC			70000
+#define SMB5_CONNECTOR_RESTART_MC			60000
 
 /* pmi8998 registers represent current in increments of 1/40th of an amp */
 #define CURRENT_SCALE_FACTOR				25000
@@ -270,6 +272,8 @@ struct smb_init_register {
  * @cdev:		Linux thermal cooling device
  * @input_psy:		Optional TCPM power supply describing the PD contract
  * @nb:			Battery and TCPM power-supply change notifier
+ * @connector_temp_chan: USB connector thermistor temperature channel
+ * @connector_overheat: Connector shutdown latch with restart hysteresis
  * @cable_irq:		USB plugin IRQ
  * @wakeup_enabled:	If the cable IRQ will cause a wakeup
  * @usb_in_i_chan:	USB_IN current measurement channel
@@ -308,6 +312,8 @@ struct smb_chip {
 	struct thermal_cooling_device *cdev;
 	struct power_supply *input_psy;
 	struct notifier_block nb;
+	struct iio_channel *connector_temp_chan;
+	bool connector_overheat;
 	int cable_irq;
 	bool wakeup_enabled;
 
@@ -871,6 +877,13 @@ static int smb_merge_health(int hardware, int software)
 	if (hardware == POWER_SUPPLY_HEALTH_COLD ||
 	    software == POWER_SUPPLY_HEALTH_COLD)
 		return POWER_SUPPLY_HEALTH_COLD;
+	if ((hardware != POWER_SUPPLY_HEALTH_GOOD &&
+	     hardware != POWER_SUPPLY_HEALTH_WARM &&
+	     hardware != POWER_SUPPLY_HEALTH_COOL) ||
+	    (software != POWER_SUPPLY_HEALTH_GOOD &&
+	     software != POWER_SUPPLY_HEALTH_WARM &&
+	     software != POWER_SUPPLY_HEALTH_COOL))
+		return POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
 	if ((hardware == POWER_SUPPLY_HEALTH_WARM &&
 	     software == POWER_SUPPLY_HEALTH_COOL) ||
 	    (hardware == POWER_SUPPLY_HEALTH_COOL &&
@@ -884,6 +897,29 @@ static int smb_merge_health(int hardware, int software)
 		return POWER_SUPPLY_HEALTH_COOL;
 
 	return POWER_SUPPLY_HEALTH_GOOD;
+}
+
+static int smb_get_connector_health(struct smb_chip *chip, int *health)
+{
+	int temp_mc, rc;
+
+	if (!chip->connector_temp_chan) {
+		*health = POWER_SUPPLY_HEALTH_GOOD;
+		return 0;
+	}
+
+	rc = iio_read_channel_processed(chip->connector_temp_chan, &temp_mc);
+	if (rc < 0)
+		return rc;
+
+	if (temp_mc >= SMB5_CONNECTOR_SHUTDOWN_MC)
+		chip->connector_overheat = true;
+	else if (temp_mc <= SMB5_CONNECTOR_RESTART_MC)
+		chip->connector_overheat = false;
+
+	*health = chip->connector_overheat ? POWER_SUPPLY_HEALTH_OVERHEAT :
+						 POWER_SUPPLY_HEALTH_GOOD;
+	return 0;
 }
 
 static unsigned int smb_get_thermal_input_limit(struct smb_chip *chip,
@@ -1018,7 +1054,7 @@ static void smb_thermal_work(struct work_struct *work)
 		container_of(work, struct smb_chip, thermal_work.work);
 	unsigned int jeita_current_ua = UINT_MAX;
 	unsigned int jeita_voltage_uv = UINT_MAX;
-	int hardware_health, software_health, health, rc;
+	int hardware_health, software_health, connector_health, health, rc;
 
 	smb_update_input_contract(chip);
 	rc = smb_get_prop_health(chip, &hardware_health);
@@ -1038,6 +1074,10 @@ static void smb_thermal_work(struct work_struct *work)
 			jeita_voltage_uv = 0;
 		}
 		health = smb_merge_health(hardware_health, software_health);
+		rc = smb_get_connector_health(chip, &connector_health);
+		if (rc < 0)
+			connector_health = POWER_SUPPLY_HEALTH_UNSPEC_FAILURE;
+		health = smb_merge_health(health, connector_health);
 	}
 
 	rc = smb_apply_charge_policy(chip, health, jeita_current_ua,
@@ -1723,6 +1763,16 @@ static int smb_probe(struct platform_device *pdev)
 	if (IS_ERR(chip->usb_in_i_chan)) {
 		return dev_err_probe(chip->dev, PTR_ERR(chip->usb_in_i_chan),
 				     "Couldn't get usbin_i IIO channel\n");
+	}
+
+	if (device_property_match_string(chip->dev, "io-channel-names",
+					 "connector_temp") >= 0) {
+		chip->connector_temp_chan = devm_iio_channel_get(
+			chip->dev, "connector_temp");
+		if (IS_ERR(chip->connector_temp_chan))
+			return dev_err_probe(
+				chip->dev, PTR_ERR(chip->connector_temp_chan),
+				"Couldn't get connector temperature channel\n");
 	}
 
 	match_data = (const struct smb_match_data *)device_get_match_data(chip->dev);

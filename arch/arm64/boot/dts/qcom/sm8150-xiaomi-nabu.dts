@@ -718,6 +718,14 @@
 	};
 };
 
+&pm8150b_adc {
+	channel@4f {
+		reg = <ADC5_AMUX_THM3_100K_PU>;
+		qcom,pre-scaling = <1 1>;
+		label = "conn_therm";
+	};
+};
+
 &pm8150b_fg {
 	status = "okay";
 	monitored-battery = <&battery>;
@@ -728,6 +736,10 @@
 	status = "okay";
 	monitored-battery = <&battery>;
 	input-power-supply = <&pm8150b_typec>;
+	io-channels = <&pm8150b_adc ADC5_USB_IN_I>,
+		       <&pm8150b_adc ADC5_USB_IN_V_16>,
+		       <&pm8150b_adc ADC5_AMUX_THM3_100K_PU>;
+	io-channel-names = "usbin_i", "usbin_v", "connector_temp";
 	#cooling-cells = <2>;
 
 	/* OEM Nabu levels; the driver retains its verified 1.95 A ceiling. */
