@@ -42,6 +42,61 @@ properties:
 
   monitored-battery: true
 
+  input-power-supply:
+    description:
+      TCPM power supply used to obtain the negotiated USB current, voltage and
+      USB Power Delivery type.
+
+  '#cooling-cells':
+    const: 2
+    description:
+      The first cell is the minimum cooling state and the second cell is the
+      maximum cooling state. Higher states select lower charge-current limits.
+
+  qcom,thermal-mitigation-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 32
+    description:
+      Descending fast-charge-current limits, one for each cooling state.
+
+  qcom,thermal-mitigation-input-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 32
+    description:
+      Descending USB input-current limits. The number of entries must match
+      qcom,thermal-mitigation-microamp.
+
+  qcom,thermal-mitigation-dcp-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 32
+    description:
+      Optional descending DCP-specific USB input-current limits. The number of
+      entries must match qcom,thermal-mitigation-microamp.
+
+  qcom,thermal-mitigation-pd-microamp:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 32
+    description:
+      Optional descending 5 V PD base input-current limits. For higher fixed
+      PDO voltages the driver scales these limits to maintain a conservative
+      power ceiling. The number of entries must match
+      qcom,thermal-mitigation-microamp.
+
+  qcom,jeita-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 4
+    maxItems: 32
+    description:
+      Battery-profile JEITA tuples containing minimum temperature in
+      decidegrees Celsius, maximum temperature in decidegrees Celsius,
+      charge-current limit in microamps and float-voltage limit in microvolts.
+      Temperature cells use signed two's-complement values. Ranges must be
+      sorted, non-overlapping and contain four cells each.
+
 required:
   - compatible
   - reg
@@ -50,6 +105,21 @@ required:
   - io-channels
   - io-channel-names
   - monitored-battery
+
+dependencies:
+  qcom,thermal-mitigation-microamp:
+    - '#cooling-cells'
+    - qcom,thermal-mitigation-input-microamp
+  qcom,thermal-mitigation-input-microamp:
+    - '#cooling-cells'
+    - qcom,thermal-mitigation-microamp
+  qcom,thermal-mitigation-dcp-microamp:
+    - qcom,thermal-mitigation-microamp
+    - qcom,thermal-mitigation-input-microamp
+  qcom,thermal-mitigation-pd-microamp:
+    - input-power-supply
+    - qcom,thermal-mitigation-microamp
+    - qcom,thermal-mitigation-input-microamp
 
 allOf:
   - $ref: power-supply.yaml#
@@ -80,5 +150,12 @@ examples:
                            "usbin_v";
 
         monitored-battery = <&battery>;
+
+        #cooling-cells = <2>;
+        qcom,thermal-mitigation-microamp = <1500000 1000000 500000>;
+        qcom,thermal-mitigation-input-microamp = <1500000 1000000 500000>;
+        qcom,jeita-ranges = <0 150 820000 4150000
+                            151 450 1500000 4400000
+                            451 550 820000 4150000>;
       };
     };
