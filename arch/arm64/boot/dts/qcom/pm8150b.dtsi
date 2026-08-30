@@ -16,7 +16,7 @@
 			thermal-sensors = <&pm8150b_temp>;
 
 			trips {
-				trip0 {
+				pm8150b_trip0: trip0 {
 					temperature = <95000>;
 					hysteresis = <0>;
 					type = "passive";
