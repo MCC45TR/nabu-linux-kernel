@@ -570,9 +570,17 @@ static void dwc3_qcom_set_role_notifier(struct dwc3 *dwc, enum usb_role next_rol
 		return;
 	}
 
-	if (qcom->current_role == USB_ROLE_DEVICE)
+	/*
+	 * Only drive the Qualcomm software VBUS-valid override while entering or
+	 * leaving device mode.  Host-to-NONE and NONE-to-host transitions must
+	 * leave it cleared; otherwise a Type-C host reconnect can be mistaken for
+	 * a peripheral session and xHCI never sees the attached device.
+	 */
+	if (qcom->current_role == USB_ROLE_DEVICE &&
+	    next_role != USB_ROLE_DEVICE)
 		dwc3_qcom_vbus_override_enable(qcom, false);
-	else if (qcom->current_role != USB_ROLE_DEVICE)
+	else if (qcom->current_role != USB_ROLE_DEVICE &&
+		 next_role == USB_ROLE_DEVICE)
 		dwc3_qcom_vbus_override_enable(qcom, true);
 
 	pm_runtime_mark_last_busy(qcom->dev);
