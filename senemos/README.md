@@ -1,9 +1,8 @@
-# Senemos Nabu Linux 7.2 port
+# Senemos Nabu Linux 7.2.2 test port
 
-The `7.2.0` branch rebases Xiaomi Pad 5 (`nabu`) support onto the verified
-Linux 7.2 release tarball. The upstream archive SHA-256 is:
-
-`f9fef3d14c0df53819026f4be74459835c2a0b0dcbf5b5bbd9ea19f0829402b3`
+The `7.2.2-test` branch rebases Xiaomi Pad 5 (`nabu`) support onto Linux
+7.2.2.  It is an alpha test line built on the current camera/Iris integration,
+not a replacement for the known-good 6.17 kernel.
 
 The comparison baseline is the consolidated `6.17.0` source branch at commit
 `d5731dcf7d5e418483d62f65b03266206b133f88`, whose Linux 6.17 archive
@@ -24,10 +23,16 @@ tablet-mode reporting, Xiaomi HID pointer filtering, WCN3990 single-channel
 scan handling, post-enable DSI/touch wake ordering, and the P9418 event and
 stylus-MAC userspace ABI used by automatic BlueZ pairing.
 
-The optional high-power charge-pump and board-thermistor scaffold stays in the
-source tree but is excluded from the production DTB. It must not be enabled
-until its Linux drivers, limits and thermal behavior have been validated on
-physical Nabu hardware.
+The protected LN8000 driver and board thermal policy are included for staged
+qualification.  The direct 2:1 path remains disabled because the normal Nabu
+DTB deliberately omits `lionsemi,allow-direct-charging`; it must not be enabled
+until instrumented physical validation proves every protection and limit.
+
+The detailed Iris comparison is in `7.2.2-iris-audit.md`.  The sensor-first,
+GNOME-first but distribution-neutral test sequence is in
+`7.2.2-hil-plan.md`; the 6.17-to-7.2.2 source/HIL ledger is in
+`6.17-to-7.2.2-port-status.md`.  `hil/nabu-hil-collect.sh` captures read-only
+evidence at each physical gate.
 
 ## Build contract
 
@@ -41,11 +46,11 @@ The script recreates the output configuration from the Fedora Rawhide arm64
 base plus `nabu-minimal.config`, and builds `Image`, the Nabu DTB and all
 modules. The resulting ABI is:
 
-`7.2.0-nabu-senemos-v7.2.0`
+`7.2.2-nabu-senemos-mainline-alpha`
 
 The default output directory is:
 
-`/workspace/kernel-builds/linux-nabu-senemos-v7.2.0-linux-7.2`
+`/workspace/kernel-builds/linux-nabu-senemos-7.2.2-test`
 
 Source review, successful compilation, DT schema validation and RPM/COPR
 publication are separate gates. None of them proves boot, display, touch,
