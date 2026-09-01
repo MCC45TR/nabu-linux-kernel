@@ -283,6 +283,7 @@ struct fastrpc_channel_ctx {
 	struct list_head invoke_interrupted_mmaps;
 	bool secure;
 	bool unsigned_support;
+	bool reserved_mem_attached;
 	u64 dma_mask;
 	const struct fastrpc_soc_data *soc_data;
 	char *accel_mount_matrix;
@@ -2390,13 +2391,60 @@ static const struct fastrpc_soc_data default_soc_data = {
 	.dma_addr_bits_default = 32,
 };
 
+static int fastrpc_validate_mount_matrix(struct device *dev,
+					 const char * const matrix[9])
+{
+	int col, det, i, row;
+	int value[9];
+
+	for (i = 0; i < ARRAY_SIZE(value); i++) {
+		if (kstrtoint(matrix[i], 10, &value[i]) ||
+		    value[i] < -1 || value[i] > 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "mount-matrix entry %d must be -1, 0 or 1\n",
+					     i);
+	}
+
+	for (row = 0; row < 3; row++) {
+		int nonzero = 0;
+
+		for (col = 0; col < 3; col++)
+			nonzero += value[row * 3 + col] != 0;
+		if (nonzero != 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "mount-matrix row %d is not orthogonal\n",
+					     row);
+	}
+
+	for (col = 0; col < 3; col++) {
+		int nonzero = 0;
+
+		for (row = 0; row < 3; row++)
+			nonzero += value[row * 3 + col] != 0;
+		if (nonzero != 1)
+			return dev_err_probe(dev, -EINVAL,
+					     "mount-matrix column %d is not orthogonal\n",
+					     col);
+	}
+
+	det = value[0] * (value[4] * value[8] - value[5] * value[7]) -
+	      value[1] * (value[3] * value[8] - value[5] * value[6]) +
+	      value[2] * (value[3] * value[7] - value[4] * value[6]);
+	if (det != 1 && det != -1)
+		return dev_err_probe(dev, -EINVAL,
+				     "mount-matrix determinant must be -1 or 1\n");
+
+	return 0;
+}
+
 static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 {
 	struct device *rdev = &rpdev->dev;
 	struct fastrpc_channel_ctx *data;
-	int i, err, domain_id = -1, matrix_count, vmcount;
+	int i, j, err, domain_id = -1, matrix_count, vmcount;
 	const char *domain;
 	const char *matrix[9];
+	bool reserved_mem_attached = false;
 	bool secure_dsp;
 	unsigned int vmids[FASTRPC_MAX_VMIDS];
 	const struct fastrpc_soc_data *soc_data;
@@ -2416,19 +2464,50 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		return -EINVAL;
 	}
 
-	if (of_reserved_mem_device_init_by_idx(rdev, rdev->of_node, 0))
-		dev_info(rdev, "no reserved DMA memory for FASTRPC\n");
+	err = of_reserved_mem_device_init_by_idx(rdev, rdev->of_node, 0);
+	if (!err)
+		reserved_mem_attached = true;
+	if (err && domain_id == SDSP_DOMAIN_ID)
+		return dev_err_probe(rdev, err,
+				     "failed to attach SDSP reserved memory\n");
+	if (err)
+		dev_dbg(rdev, "no reserved DMA memory for FastRPC: %d\n", err);
 
 	vmcount = of_property_read_variable_u32_array(rdev->of_node,
 				"qcom,vmids", &vmids[0], 0, FASTRPC_MAX_VMIDS);
-	if (vmcount < 0)
+	if (vmcount == -EINVAL)
 		vmcount = 0;
-	else if (!qcom_scm_is_available())
-		return -EPROBE_DEFER;
+	else if (vmcount < 0) {
+		err = dev_err_probe(rdev, vmcount, "invalid qcom,vmids\n");
+		goto err_release_reserved_mem;
+	} else if (!qcom_scm_is_available()) {
+		goto err_defer_scm;
+	}
+
+	for (i = 0; i < vmcount; i++) {
+		if (vmids[i] >= BITS_PER_TYPE(u64)) {
+			err = dev_err_probe(rdev, -ERANGE,
+					    "qcom,vmids value %u exceeds ownership mask\n",
+					    vmids[i]);
+			goto err_release_reserved_mem;
+		}
+
+		for (j = 0; j < i; j++) {
+			if (vmids[i] == vmids[j]) {
+				err = dev_err_probe(rdev, -EINVAL,
+						    "duplicate qcom,vmids value %u\n",
+						    vmids[i]);
+				goto err_release_reserved_mem;
+			}
+		}
+	}
 
 	data = kzalloc_obj(*data);
-	if (!data)
-		return -ENOMEM;
+	if (!data) {
+		err = -ENOMEM;
+		goto err_release_reserved_mem;
+	}
+	data->reserved_mem_attached = reserved_mem_attached;
 
 	matrix_count = of_property_count_strings(rdev->of_node, "mount-matrix");
 	if (matrix_count != -EINVAL) {
@@ -2441,6 +2520,10 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		err = of_property_read_string_array(rdev->of_node, "mount-matrix",
 						    matrix, ARRAY_SIZE(matrix));
 		if (err < 0)
+			goto err_free_data;
+
+		err = fastrpc_validate_mount_matrix(rdev, matrix);
+		if (err)
 			goto err_free_data;
 
 		data->accel_mount_matrix = kasprintf(GFP_KERNEL,
@@ -2465,22 +2548,40 @@ static int fastrpc_rpmsg_probe(struct rpmsg_device *rpdev)
 		struct resource res;
 		u64 src_perms;
 
-		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
-		if (!err) {
-			src_perms = BIT(QCOM_SCM_VMID_HLOS);
-
-			err = qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
-				    data->vmperms, data->vmcount);
-			if (err &&
-			    !(err == -EINVAL &&
-			      of_property_read_bool(rdev->of_node,
-						    "qcom,vmids-retained-on-restart")))
-				goto err_free_data;
-
-			if (err == -EINVAL)
-				dev_dbg(rdev, "reserved memory VMIDs retained across restart\n");
+		if (!data->vmcount) {
+			err = dev_err_probe(rdev, -EINVAL,
+					    "SDSP requires qcom,vmids\n");
+			goto err_free_data;
 		}
 
+		err = of_reserved_mem_region_to_resource(rdev->of_node, 0, &res);
+		if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to resolve SDSP reserved memory\n");
+			goto err_free_data;
+		}
+
+		if (!resource_size(&res) || !IS_ALIGNED(res.start, PAGE_SIZE) ||
+		    !IS_ALIGNED(resource_size(&res), PAGE_SIZE)) {
+			err = dev_err_probe(rdev, -EINVAL,
+					    "invalid SDSP reserved-memory range\n");
+			goto err_free_data;
+		}
+
+		src_perms = BIT_ULL(QCOM_SCM_VMID_HLOS);
+		err = qcom_scm_assign_mem(res.start, resource_size(&res), &src_perms,
+					  data->vmperms, data->vmcount);
+		if (err == -EINVAL &&
+		    of_property_read_bool(rdev->of_node,
+					  "qcom,vmids-retained-on-restart")) {
+			dev_info_once(rdev,
+				      "SDSP reserved memory ownership was retained\n");
+			err = 0;
+		} else if (err) {
+			err = dev_err_probe(rdev, err,
+					    "failed to assign SDSP reserved memory\n");
+			goto err_free_data;
+		}
 	}
 
 	secure_dsp = !(of_property_read_bool(rdev->of_node, "qcom,non-secure-domain"));
@@ -2541,7 +2642,14 @@ err_deregister_fdev:
 err_free_data:
 	kfree(data->accel_mount_matrix);
 	kfree(data);
+err_release_reserved_mem:
+	if (reserved_mem_attached)
+		of_reserved_mem_device_release(rdev);
 	return err;
+
+err_defer_scm:
+	err = -EPROBE_DEFER;
+	goto err_release_reserved_mem;
 }
 
 static void fastrpc_notify_users(struct fastrpc_user *user)
@@ -2583,6 +2691,8 @@ static void fastrpc_rpmsg_remove(struct rpmsg_device *rpdev)
 		fastrpc_buf_free(cctx->remote_heap);
 
 	of_platform_depopulate(&rpdev->dev);
+	if (cctx->reserved_mem_attached)
+		of_reserved_mem_device_release(&rpdev->dev);
 
 	fastrpc_channel_ctx_put(cctx);
 }
