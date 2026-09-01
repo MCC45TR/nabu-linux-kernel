@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/* Xiaomi Pad 5 (nabu) combined Iris/Venus and camera derivative. */
+
+#include "sm8150-xiaomi-nabu.dts"
+#include "sm8150-xiaomi-nabu-iris.dtsi"
+#include "sm8150-xiaomi-nabu-camera.dtsi"
