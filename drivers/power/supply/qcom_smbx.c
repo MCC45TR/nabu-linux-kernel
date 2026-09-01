@@ -1997,7 +1997,7 @@ static int smb_probe(struct platform_device *pdev)
 
 	if (chip->gen == SMB5) {
 		chip->cdev = devm_thermal_of_cooling_device_register(
-			chip->dev, chip->dev->of_node, "smb5-charger", chip,
+			chip->dev, 0, "smb5-charger", chip,
 			&smb_cooling_ops);
 		if (IS_ERR(chip->cdev)) {
 			rc = PTR_ERR(chip->cdev);
