@@ -878,6 +878,16 @@ menuconfig VIDEO_CAMERA_LENS
 
 if VIDEO_CAMERA_LENS
 
+config VIDEO_CN3927
+	tristate "Chipnext CN3927 lens voice coil support"
+	depends on I2C && VIDEO_DEV
+	select MEDIA_CONTROLLER
+	select VIDEO_V4L2_SUBDEV_API
+	select V4L2_ASYNC
+	help
+	  This is a driver for the Chipnext CN3927 camera lens voice coil.
+	  The device contains a 10-bit DAC and is controlled through I2C.
+
 config VIDEO_AD5820
 	tristate "AD5820 lens voice coil support"
 	depends on GPIOLIB

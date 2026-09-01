@@ -10,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/clk.h>
 
 #include "camss.h"
 #include "camss-vfe.h"
@@ -98,6 +99,7 @@
 #define VFE_BUS_IRQ_MASK(n)		(0x2044 + (n) * 4)
 #define VFE_BUS_IRQ_CLEAR(n)		(0x2050 + (n) * 4)
 #define VFE_BUS_IRQ_STATUS(n)		(0x205c + (n) * 4)
+#define VFE_BUS_IRQ_NUM			3
 #define		STATUS0_COMP_RESET_DONE		BIT(0)
 #define		STATUS0_COMP_REG_UPDATE0_DONE	BIT(1)
 #define		STATUS0_COMP_REG_UPDATE1_DONE	BIT(2)
@@ -130,9 +132,18 @@
 
 #define VFE_BUS_IRQ_CLEAR_GLOBAL		(0x2068)
 
+#define VFE_BUS_COMP_ERROR_STATUS		(0x206c)
+#define VFE_BUS_COMP_OVERWRITE_STATUS		(0x2070)
+#define VFE_BUS_DUAL_COMP_ERROR_STATUS		(0x2074)
+#define VFE_BUS_DUAL_COMP_OVERWRITE_STATUS	(0x2078)
+#define VFE_BUS_ADDR_SYNC_CFG			(0x207c)
+#define VFE_BUS_ADDR_FIFO_STATUS			(0x20a8)
+#define VFE_BUS_SW_RESET			(0x2008)
+
 #define VFE_BUS_WM_DEBUG_STATUS_CFG		(0x226c)
 #define		DEBUG_STATUS_CFG_STATUS0(n)	BIT(n)
 #define		DEBUG_STATUS_CFG_STATUS1(n)	BIT(8 + (n))
+#define VFE_BUS_WM_DEBUG_STATUS0			(0x2270)
 
 #define VFE_BUS_WM_ADDR_SYNC_FRAME_HEADER	(0x2080)
 
@@ -207,6 +218,12 @@ static void vfe_global_reset(struct vfe_device *vfe)
 static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 {
 	u32 val;
+	int i;
+
+	for (i = 0; i < vfe->nclocks; i++)
+		dev_info(vfe->camss->dev, "VFE%d clock %s: %lu Hz\n",
+			 vfe->id, vfe->clock[i].name,
+			 clk_get_rate(vfe->clock[i].clk));
 
 	/*Set Debug Registers*/
 	val = DEBUG_STATUS_CFG_STATUS0(1) |
@@ -241,6 +258,12 @@ static void vfe_wm_start(struct vfe_device *vfe, u8 wm, struct vfe_line *line)
 	val = WM_STRIDE_DEFAULT_STRIDE;
 	writel_relaxed(val, vfe->base + VFE_BUS_WM_STRIDE(wm));
 
+	/* No dropped frames and one buffer-done interrupt per frame. */
+	writel_relaxed(0, vfe->base + VFE_BUS_WM_FRAMEDROP_PERIOD(wm));
+	writel_relaxed(1, vfe->base + VFE_BUS_WM_FRAMEDROP_PATTERN(wm));
+	writel_relaxed(0, vfe->base + VFE_BUS_WM_IRQ_SUBSAMPLE_PERIOD(wm));
+	writel_relaxed(1, vfe->base + VFE_BUS_WM_IRQ_SUBSAMPLE_PATTERN(wm));
+
 	/* Enable WM */
 	val = 1 << WM_CFG_EN |
 	      MODE_MIPI_RAW << WM_CFG_MODE;
@@ -259,9 +282,35 @@ static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
 	struct v4l2_pix_format_mplane *pix =
 		&line->video_out.active_fmt.fmt.pix_mp;
 	u32 stride = pix->plane_fmt[0].bytesperline;
+	u32 val;
 
-	writel_relaxed(addr, vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
+	if (upper_32_bits(addr))
+		dev_err_ratelimited(vfe->camss->dev,
+				    "WM%u DMA address exceeds 32 bits: %pad\n",
+				    wm, &addr);
+	else
+		dev_info_ratelimited(vfe->camss->dev,
+				     "WM%u DMA address: %pad\n", wm, &addr);
+
+	/*
+	 * VFE170 latches an RDI buffer update as a group.  Match the
+	 * downstream update sequence: refresh the frame-based width, queue
+	 * the image address and frame increment, then re-assert the WM mode.
+	 */
+	writel_relaxed(WM_BUFFER_DEFAULT_WIDTH,
+		       vfe->base + VFE_BUS_WM_BUFFER_WIDTH_CFG(wm));
+	wmb();
+	writel_relaxed(lower_32_bits(addr),
+		       vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
+	wmb();
+	dev_info_ratelimited(vfe->camss->dev,
+			     "WM%u address FIFO after queue: %08x\n", wm,
+			     readl_relaxed(vfe->base + VFE_BUS_ADDR_FIFO_STATUS));
 	writel_relaxed(stride * pix->height, vfe->base + VFE_BUS_WM_FRAME_INC(wm));
+
+	val = 1 << WM_CFG_EN |
+	      MODE_MIPI_RAW << WM_CFG_MODE;
+	writel_relaxed(val, vfe->base + VFE_BUS_WM_CFG(wm));
 }
 
 static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
@@ -328,7 +377,7 @@ static void vfe_violation_read(struct vfe_device *vfe)
 static irqreturn_t vfe_isr(int irq, void *dev)
 {
 	struct vfe_device *vfe = dev;
-	u32 status0, status1, vfe_bus_status[VFE_LINE_NUM_MAX];
+	u32 status0, status1, vfe_bus_status[VFE_BUS_IRQ_NUM];
 	int i, wm;
 
 	status0 = readl_relaxed(vfe->base + VFE_IRQ_STATUS_0);
@@ -337,10 +386,44 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 	writel_relaxed(status0, vfe->base + VFE_IRQ_CLEAR_0);
 	writel_relaxed(status1, vfe->base + VFE_IRQ_CLEAR_1);
 
-	for (i = VFE_LINE_RDI0; i < vfe->res->line_num; i++) {
+	for (i = 0; i < VFE_BUS_IRQ_NUM; i++) {
 		vfe_bus_status[i] = readl_relaxed(vfe->base + VFE_BUS_IRQ_STATUS(i));
 		writel_relaxed(vfe_bus_status[i], vfe->base + VFE_BUS_IRQ_CLEAR(i));
 	}
+
+	if (vfe->stream_count)
+		dev_info_ratelimited(vfe->camss->dev,
+				     "VFE%d IRQ: top=%08x/%08x bus=%08x/%08x/%08x WM0=%08x/%08x cfg=%08x addr=%08x width=%08x height=%08x stride=%08x inc=%08x\n",
+				     vfe->id, status0, status1,
+				     vfe_bus_status[0], vfe_bus_status[1],
+				     vfe_bus_status[2],
+				     readl_relaxed(vfe->base + VFE_BUS_WM_STATUS0(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_STATUS1(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_CFG(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_IMAGE_ADDR(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_BUFFER_WIDTH_CFG(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_BUFFER_HEIGHT_CFG(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_STRIDE(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_FRAME_INC(0)));
+
+	if (vfe->stream_count)
+		dev_info_ratelimited(vfe->camss->dev,
+				     "VFE%d BUS state: err=%08x overwrite=%08x dual=%08x/%08x sync=%08x no-sync=%08x fifo=%08x reset=%08x debug=%08x cgc=%08x drop=%08x/%08x irq-sub=%08x/%08x\n",
+				     vfe->id,
+				     readl_relaxed(vfe->base + VFE_BUS_COMP_ERROR_STATUS),
+				     readl_relaxed(vfe->base + VFE_BUS_COMP_OVERWRITE_STATUS),
+				     readl_relaxed(vfe->base + VFE_BUS_DUAL_COMP_ERROR_STATUS),
+				     readl_relaxed(vfe->base + VFE_BUS_DUAL_COMP_OVERWRITE_STATUS),
+				     readl_relaxed(vfe->base + VFE_BUS_ADDR_SYNC_CFG),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_ADDR_SYNC_NO_SYNC),
+				     readl_relaxed(vfe->base + VFE_BUS_ADDR_FIFO_STATUS),
+				     readl_relaxed(vfe->base + VFE_BUS_SW_RESET),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_DEBUG_STATUS0),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_CGC_OVERRIDE),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_FRAMEDROP_PERIOD(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_FRAMEDROP_PATTERN(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_IRQ_SUBSAMPLE_PERIOD(0)),
+				     readl_relaxed(vfe->base + VFE_BUS_WM_IRQ_SUBSAMPLE_PATTERN(0)));
 
 	/* Enforce ordering between IRQ reading and interpretation */
 	wmb();
@@ -359,14 +442,19 @@ static irqreturn_t vfe_isr(int irq, void *dev)
 		if (status0 & STATUS_1_RDI_SOF(i))
 			vfe->isr_ops.sof(vfe, i);
 
+	if (status1 & GENMASK(5, 2))
+		dev_err_ratelimited(vfe->camss->dev,
+				    "VFE%d RDI overflow: status1=%08x violation=%08x\n",
+				    vfe->id, status1,
+				    readl_relaxed(vfe->base + VFE_VIOLATION_STATUS));
+
 	for (i = 0; i < MSM_VFE_COMPOSITE_IRQ_NUM; i++)
 		if (vfe_bus_status[0] & STATUS0_COMP_BUF_DONE(i))
 			vfe->isr_ops.comp_done(vfe, i);
 
 	for (wm = 0; wm < MSM_VFE_IMAGE_MASTERS_NUM; wm++)
-		if (status0 & BIT(9))
-			if (vfe_bus_status[1] & STATUS1_WM_CLIENT_BUF_DONE(wm))
-				vfe->isr_ops.wm_done(vfe, wm);
+		if (vfe_bus_status[1] & STATUS1_WM_CLIENT_BUF_DONE(wm))
+			vfe->isr_ops.wm_done(vfe, wm);
 
 	return IRQ_HANDLED;
 }
@@ -400,11 +488,14 @@ static int vfe_get_output(struct vfe_line *line)
 
 	output->wm_num = 1;
 
-	wm_idx = vfe_reserve_wm(vfe, line->id);
-	if (wm_idx < 0) {
+	/* VFE170 paths are wired one-to-one to bus clients 0..3. */
+	wm_idx = line->id;
+	if (wm_idx >= MSM_VFE_IMAGE_MASTERS_NUM ||
+	    vfe->wm_output_map[wm_idx] != VFE_LINE_NONE) {
 		dev_err(vfe->camss->dev, "Can not reserve wm\n");
 		goto error_get_wm;
 	}
+	vfe->wm_output_map[wm_idx] = line->id;
 	output->wm_idx[0] = wm_idx;
 
 	output->drop_update_idx = 0;
@@ -414,7 +505,6 @@ static int vfe_get_output(struct vfe_line *line)
 	return 0;
 
 error_get_wm:
-	vfe_release_wm(vfe, output->wm_idx[0]);
 	output->state = VFE_OUTPUT_OFF;
 error:
 	spin_unlock_irqrestore(&vfe->output_lock, flags);

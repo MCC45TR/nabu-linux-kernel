@@ -1967,6 +1967,15 @@ static int ov8856_init_controls(struct ov8856 *ov8856)
 	if (ret)
 		goto err_ctrl_handler_free;
 
+	ret = v4l2_fwnode_device_parse(&client->dev, &props);
+	if (ret)
+		return ret;
+
+	ret = v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &ov8856_ctrl_ops,
+					      &props);
+	if (ret)
+		return ret;
+
 	ov8856->sd.ctrl_handler = ctrl_hdlr;
 
 	return 0;
@@ -1976,11 +1985,10 @@ err_ctrl_handler_free:
 	return ret;
 }
 
-static void ov8856_update_pad_format(struct ov8856 *ov8856,
-				     const struct ov8856_mode *mode,
-				     struct v4l2_mbus_framefmt *fmt)
+static unsigned int ov8856_update_pad_format(const struct ov8856_mode *mode,
+					      struct v4l2_mbus_framefmt *fmt)
 {
-	int index;
+	unsigned int index;
 
 	fmt->width = mode->width;
 	fmt->height = mode->height;
@@ -1990,13 +1998,20 @@ static void ov8856_update_pad_format(struct ov8856 *ov8856,
 	if (index == ARRAY_SIZE(ov8856_mbus_codes))
 		index = mode->default_mbus_index;
 	fmt->code = ov8856_mbus_codes[index];
-	ov8856->cur_mbus_index = index;
 	fmt->field = V4L2_FIELD_NONE;
+
+	return index;
 }
 
 static int ov8856_start_streaming(struct ov8856 *ov8856)
 {
 	const struct ov8856_reg_list *reg_list;
+	static const u16 debug_regs[] = {
+		OV8856_REG_MODE_SELECT, 0x0302, 0x0303, 0x3018,
+		0x4800, 0x4837, OV8856_REG_TEST_PATTERN,
+	};
+	u32 val;
+	unsigned int i;
 	int link_freq_index, ret;
 
 	ret = ov8856_identify_module(ov8856);
@@ -2035,6 +2050,19 @@ static int ov8856_start_streaming(struct ov8856 *ov8856)
 	if (ret) {
 		dev_err(ov8856->dev, "failed to set stream");
 		return ret;
+	}
+
+	usleep_range(1000, 2000);
+	for (i = 0; i < ARRAY_SIZE(debug_regs); i++) {
+		ret = ov8856_read_reg(ov8856, debug_regs[i],
+				      OV8856_REG_VALUE_08BIT, &val);
+		if (ret)
+			dev_err(ov8856->dev,
+				"failed to read back register 0x%04x: %d\n",
+				debug_regs[i], ret);
+		else
+			dev_info(ov8856->dev, "stream readback 0x%04x=0x%02x\n",
+				 debug_regs[i], val);
 	}
 
 	return 0;
@@ -2137,6 +2165,7 @@ static int ov8856_set_format(struct v4l2_subdev *sd,
 {
 	struct ov8856 *ov8856 = to_ov8856(sd);
 	const struct ov8856_mode *mode;
+	unsigned int mbus_index;
 	s32 vblank_def, h_blank;
 
 	mode = v4l2_find_nearest_size(ov8856->priv_lane->supported_modes,
@@ -2145,11 +2174,12 @@ static int ov8856_set_format(struct v4l2_subdev *sd,
 				      fmt->format.height);
 
 	mutex_lock(&ov8856->mutex);
-	ov8856_update_pad_format(ov8856, mode, &fmt->format);
+	mbus_index = ov8856_update_pad_format(mode, &fmt->format);
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
 	} else {
 		ov8856->cur_mode = mode;
+		ov8856->cur_mbus_index = mbus_index;
 		__v4l2_ctrl_s_ctrl(ov8856->link_freq, mode->link_freq_index);
 		__v4l2_ctrl_s_ctrl_int64(ov8856->pixel_rate,
 					 to_rate(ov8856->priv_lane->link_freq_menu_items,
@@ -2187,8 +2217,10 @@ static int ov8856_get_format(struct v4l2_subdev *sd,
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
 		fmt->format = *v4l2_subdev_state_get_format(sd_state,
 							    fmt->pad);
-	else
-		ov8856_update_pad_format(ov8856, ov8856->cur_mode, &fmt->format);
+	else {
+		fmt->format.code = ov8856_mbus_codes[ov8856->cur_mbus_index];
+		ov8856_update_pad_format(ov8856->cur_mode, &fmt->format);
+	}
 
 	mutex_unlock(&ov8856->mutex);
 
@@ -2236,7 +2268,7 @@ static int ov8856_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	struct ov8856 *ov8856 = to_ov8856(sd);
 
 	mutex_lock(&ov8856->mutex);
-	ov8856_update_pad_format(ov8856, &ov8856->priv_lane->supported_modes[0],
+	ov8856_update_pad_format(&ov8856->priv_lane->supported_modes[0],
 				 v4l2_subdev_state_get_format(fh->state, 0));
 	mutex_unlock(&ov8856->mutex);
 

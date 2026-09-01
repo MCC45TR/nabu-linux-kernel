@@ -777,10 +777,13 @@ static int csid_set_stream(struct v4l2_subdev *sd, int enable)
 			return -ENOLINK;
 	}
 
-	if (csid->phy.need_vc_update) {
-		csid->res->hw_ops->configure_stream(csid, enable);
-		csid->phy.need_vc_update = false;
-	}
+	/*
+	 * configure_stream() also starts and stops the hardware.  Restricting it
+	 * to link changes leaves the CSID running state stale after the first
+	 * stream cycle because need_vc_update is cleared on stream-on.
+	 */
+	csid->res->hw_ops->configure_stream(csid, enable);
+	csid->phy.need_vc_update = false;
 
 	return 0;
 }
