@@ -82,7 +82,15 @@ static irqreturn_t nabu_keyboard_detect_irq(int irq, void *data)
 {
 	struct nabu_keyboard *keyboard = data;
 
-	pm_wakeup_event(keyboard->dev, 500);
+	/*
+	 * Cover transitions while the system is awake are ordinary input
+	 * changes, not wake events.  Keeping a wakeup event pending during the
+	 * desktop's pre-suspend blanking phase can make the freezer abort the
+	 * following system suspend.  Only hold the system awake after the PM
+	 * callback has actually armed this IRQ as a wake source.
+	 */
+	if (READ_ONCE(keyboard->wake_enabled))
+		pm_wakeup_event(keyboard->dev, 500);
 	mod_delayed_work(system_wq, &keyboard->detect_work,
 			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
 	return IRQ_HANDLED;
@@ -249,7 +257,7 @@ static int nabu_keyboard_suspend(struct device *dev)
 
 	ret = enable_irq_wake(keyboard->irq);
 	if (!ret)
-		keyboard->wake_enabled = true;
+		WRITE_ONCE(keyboard->wake_enabled, true);
 	return ret;
 }
 
@@ -257,9 +265,9 @@ static int nabu_keyboard_resume(struct device *dev)
 {
 	struct nabu_keyboard *keyboard = dev_get_drvdata(dev);
 
-	if (keyboard->wake_enabled) {
+	if (READ_ONCE(keyboard->wake_enabled)) {
 		disable_irq_wake(keyboard->irq);
-		keyboard->wake_enabled = false;
+		WRITE_ONCE(keyboard->wake_enabled, false);
 	}
 	mod_delayed_work(system_wq, &keyboard->detect_work,
 			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
