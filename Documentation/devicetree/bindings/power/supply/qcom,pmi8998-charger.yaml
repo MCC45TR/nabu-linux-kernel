@@ -32,7 +32,6 @@ properties:
 
   io-channels:
     minItems: 2
-    maxItems: 3
     items:
       - description: USB in current in uA
       - description: USB in voltage in uV
@@ -40,7 +39,6 @@ properties:
 
   io-channel-names:
     minItems: 2
-    maxItems: 3
     items:
       - const: usbin_i
       - const: usbin_v
@@ -60,32 +58,36 @@ properties:
       maximum cooling state. Higher states select lower charge-current limits.
 
   qcom,thermal-mitigation-microamp:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
     maxItems: 32
+    items:
+      minimum: 0
     description:
       Descending fast-charge-current limits, one for each cooling state.
 
   qcom,thermal-mitigation-input-microamp:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
     maxItems: 32
+    items:
+      minimum: 0
     description:
       Descending USB input-current limits. The number of entries must match
       qcom,thermal-mitigation-microamp.
 
   qcom,thermal-mitigation-dcp-microamp:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
     maxItems: 32
+    items:
+      minimum: 0
     description:
       Optional descending DCP-specific USB input-current limits. The number of
       entries must match qcom,thermal-mitigation-microamp.
 
   qcom,thermal-mitigation-pd-microamp:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
     maxItems: 32
+    items:
+      minimum: 0
     description:
       Optional descending 5 V PD base input-current limits. For higher fixed
       PDO voltages the driver scales these limits to maintain a conservative
