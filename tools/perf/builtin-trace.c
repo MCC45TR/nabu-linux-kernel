@@ -196,6 +196,7 @@ struct trace {
 	unsigned int		max_stack;
 	unsigned int		min_stack;
 	enum trace_summary_mode	summary_mode;
+	int			max_summary;
 	int			raw_augmented_syscalls_args_size;
 	bool			raw_augmented_syscalls;
 	bool			fd_path_disabled;
@@ -1564,7 +1565,9 @@ static bool syscall_id_equal(long key1, long key2, void *ctx __maybe_unused)
 
 static struct hashmap *alloc_syscall_stats(void)
 {
-	return hashmap__new(syscall_id_hash, syscall_id_equal, NULL);
+	struct hashmap *result = hashmap__new(syscall_id_hash, syscall_id_equal, NULL);
+
+	return IS_ERR(result) ? NULL : result;
 }
 
 static void delete_syscall_stats(struct hashmap *syscall_stats)
@@ -1572,7 +1575,7 @@ static void delete_syscall_stats(struct hashmap *syscall_stats)
 	struct hashmap_entry *pos;
 	size_t bkt;
 
-	if (syscall_stats == NULL)
+	if (!syscall_stats)
 		return;
 
 	hashmap__for_each_entry(syscall_stats, pos, bkt)
@@ -1588,7 +1591,7 @@ static struct thread_trace *thread_trace__new(struct trace *trace)
 		ttrace->files.max = -1;
 		if (trace->summary) {
 			ttrace->syscall_stats = alloc_syscall_stats();
-			if (IS_ERR(ttrace->syscall_stats))
+			if (!ttrace->syscall_stats)
 				zfree(&ttrace);
 		}
 	}
@@ -2592,12 +2595,10 @@ static struct syscall *trace__syscall_info(struct trace *trace, struct evsel *ev
 		err = syscall__read_info(sc, trace);
 
 	if (err && verbose > 0) {
-		char sbuf[STRERR_BUFSIZE];
-
-		fprintf(trace->output, "Problems reading syscall %d: %d (%s)", id, -err,
-			str_error_r(-err, sbuf, sizeof(sbuf)));
+		errno = -err;
+		fprintf(trace->output, "Problems reading syscall %d: %m", id);
 		if (sc && sc->name)
-			fprintf(trace->output, "(%s)", sc->name);
+			fprintf(trace->output, " (%s)", sc->name);
 		fputs(" information\n", trace->output);
 	}
 	return err ? NULL : sc;
@@ -4440,7 +4441,7 @@ create_maps:
 
 	if (trace->summary_mode == SUMMARY__BY_TOTAL && !trace->summary_bpf) {
 		trace->syscall_stats = alloc_syscall_stats();
-		if (trace->syscall_stats == NULL)
+		if (!trace->syscall_stats)
 			goto out_delete_evlist;
 	}
 
@@ -4599,7 +4600,7 @@ out_disable:
 	if (!err) {
 		if (trace->summary) {
 			if (trace->summary_bpf)
-				trace_print_bpf_summary(trace->output);
+				trace_print_bpf_summary(trace->output, trace->max_summary);
 			else if (trace->summary_mode == SUMMARY__BY_TOTAL)
 				trace__fprintf_total_summary(trace, trace->output);
 			else
@@ -4649,9 +4650,8 @@ out_error:
 
 out_error_apply_filters:
 	fprintf(trace->output,
-		"Failed to set filter \"%s\" on event %s with %d (%s)\n",
-		evsel->filter, evsel__name(evsel), errno,
-		str_error_r(errno, errbuf, sizeof(errbuf)));
+		"Failed to set filter \"%s\" on event %s: %m\n",
+		evsel->filter, evsel__name(evsel));
 	goto out_delete_evlist;
 }
 out_error_mem:
@@ -4659,7 +4659,7 @@ out_error_mem:
 	goto out_delete_evlist;
 
 out_errno:
-	fprintf(trace->output, "errno=%d,%s\n", errno, strerror(errno));
+	fprintf(trace->output, "%m\n");
 	goto out_delete_evlist;
 }
 
@@ -4748,7 +4748,7 @@ static int trace__replay(struct trace *trace)
 
 	if (trace->summary_mode == SUMMARY__BY_TOTAL) {
 		trace->syscall_stats = alloc_syscall_stats();
-		if (trace->syscall_stats == NULL)
+		if (!trace->syscall_stats)
 			goto out;
 	}
 
@@ -4822,6 +4822,7 @@ static size_t syscall__dump_stats(struct trace *trace, int e_machine, FILE *fp,
 				  struct hashmap *syscall_stats)
 {
 	size_t printed = 0;
+	int lines = 0;
 	struct syscall *sc;
 	struct syscall_entry *entries;
 
@@ -4866,7 +4867,11 @@ static size_t syscall__dump_stats(struct trace *trace, int e_machine, FILE *fp,
 						fprintf(fp, "\t\t\t\t%s: %d\n", perf_env__arch_strerrno(trace->host->env, e + 1), stats->errnos[e]);
 				}
 			}
+			lines++;
 		}
+
+		if (trace->max_summary && trace->max_summary <= lines)
+			break;
 	}
 
 	free(entries);
@@ -5144,8 +5149,8 @@ static int trace__parse_events_option(const struct option *opt, const char *str,
 				      int unset __maybe_unused)
 {
 	struct trace *trace = (struct trace *)opt->value;
-	const char *s = str;
-	char *sep = NULL, *lists[2] = { NULL, NULL, };
+	const char *s;
+	char *strd, *sep = NULL, *lists[2] = { NULL, NULL, };
 	int len = strlen(str) + 1, err = -1, list, idx;
 	char *strace_groups_dir = system_path(STRACE_GROUPS_DIR);
 	char group_name[PATH_MAX];
@@ -5154,13 +5159,17 @@ static int trace__parse_events_option(const struct option *opt, const char *str,
 	if (strace_groups_dir == NULL)
 		return -1;
 
+	s = strd = strdup(str);
+	if (strd == NULL)
+		return -1;
+
 	if (*s == '!') {
 		++s;
 		trace->not_ev_qualifier = true;
 	}
 
 	while (1) {
-		if ((sep = strchr(s, ',')) != NULL)
+		if ((sep = strchr((char *)s, ',')) != NULL)
 			*sep = '\0';
 
 		list = 0;
@@ -5228,8 +5237,7 @@ out:
 	free(strace_groups_dir);
 	free(lists[0]);
 	free(lists[1]);
-	if (sep)
-		*sep = ',';
+	free(strd);
 
 	return err;
 }
@@ -5443,6 +5451,8 @@ int cmd_trace(int argc, const char **argv)
 	OPT_BOOLEAN(0, "force-btf", &trace.force_btf, "Prefer btf_dump general pretty printer"
 		       "to customized ones"),
 	OPT_BOOLEAN(0, "bpf-summary", &trace.summary_bpf, "Summary syscall stats in BPF"),
+	OPT_INTEGER(0, "max-summary", &trace.max_summary,
+		     "Max number of entries in the summary."),
 	OPTS_EVSWITCH(&trace.evswitch),
 	OPT_END()
 	};

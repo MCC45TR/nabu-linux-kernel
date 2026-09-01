@@ -7,6 +7,7 @@
 #define __IRIS_PLATFORM_COMMON_H__
 
 #include <linux/bits.h>
+#include "iris_buffer.h"
 
 struct iris_core;
 struct iris_inst;
@@ -22,7 +23,7 @@ struct iris_inst;
 #define DEFAULT_MAX_HOST_BURST_BUF_COUNT	256
 #define DEFAULT_FPS				30
 #define MAXIMUM_FPS				480
-#define NUM_MBS_8K				((8192 * 4352) / 256)
+#define NUM_MBS_8K                             ((8192 * 4352) / 256)
 #define MIN_QP_8BIT				1
 #define MAX_QP					51
 #define MAX_QP_HEVC				63
@@ -41,19 +42,18 @@ enum pipe_type {
 };
 
 extern struct iris_platform_data qcs8300_data;
-extern struct iris_platform_data sm8150_data;
 extern struct iris_platform_data sm8250_data;
 extern struct iris_platform_data sm8550_data;
 extern struct iris_platform_data sm8650_data;
+extern struct iris_platform_data sm8750_data;
 
 enum platform_clk_type {
-	IRIS_AXI_CLK,
-	IRIS_BUS_CLK,
+	IRIS_AXI_CLK, /* AXI0 in case of platforms with multiple AXI clocks */
 	IRIS_CTRL_CLK,
-	IRIS_HW_AXI_CLK,
 	IRIS_HW_CLK,
-	IRIS_AUX_HW_AXI_CLK,
-	IRIS_AUX_HW_CLK,
+	IRIS_AXI1_CLK,
+	IRIS_CTRL_FREERUN_CLK,
+	IRIS_HW_FREERUN_CLK,
 };
 
 struct platform_clk_data {
@@ -188,13 +188,13 @@ struct icc_vote_data {
 enum platform_pm_domain_type {
 	IRIS_CTRL_POWER_DOMAIN,
 	IRIS_HW_POWER_DOMAIN,
-	IRIS_AUX_HW_POWER_DOMAIN,
 };
 
 struct iris_platform_data {
 	void (*init_hfi_command_ops)(struct iris_core *core);
 	void (*init_hfi_response_ops)(struct iris_core *core);
 	struct iris_inst *(*get_instance)(void);
+	u32 (*get_vpu_buffer_size)(struct iris_inst *inst, enum iris_buffer_type buffer_type);
 	const struct vpu_ops *vpu_ops;
 	void (*set_preset_registers)(struct iris_core *core);
 	const struct icc_info *icc_tbl;
@@ -221,9 +221,6 @@ struct iris_platform_data {
 	u32 inst_fw_caps_enc_size;
 	struct tz_cp_config *tz_cp_config_data;
 	u32 core_arch;
-	bool use_vcodec_hw_control;
-	bool defer_vcodec_power;
-	bool legacy_vpu5;
 	u32 hw_response_timeout;
 	struct ubwc_config_data *ubwc_config;
 	u32 num_vpp_pipe;

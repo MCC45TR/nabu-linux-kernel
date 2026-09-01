@@ -46,7 +46,7 @@ static int bnge_aux_get_dflt_msix(struct bnge_dev *bd)
 	return min_t(int, roce_msix, num_online_cpus() + 1);
 }
 
-static u16 bnge_aux_get_msix(struct bnge_dev *bd)
+u16 bnge_aux_get_msix(struct bnge_dev *bd)
 {
 	if (bnge_is_roce_en(bd))
 		return bd->aux_num_msix;
@@ -151,7 +151,8 @@ static int bnge_adjust_rings(struct bnge_dev *bd, u16 *rx,
 	u16 tx_chunks = bnge_num_tx_to_cp(bd, *tx);
 
 	if (tx_chunks != *tx) {
-		u16 tx_saved = tx_chunks, rc;
+		u16 tx_saved = tx_chunks;
+		int rc;
 
 		rc = bnge_fix_rings_count(rx, &tx_chunks, max_nq, sh);
 		if (rc)
@@ -164,7 +165,7 @@ static int bnge_adjust_rings(struct bnge_dev *bd, u16 *rx,
 	return bnge_fix_rings_count(rx, tx, max_nq, sh);
 }
 
-static int bnge_cal_nr_rss_ctxs(u16 rx_rings)
+int bnge_cal_nr_rss_ctxs(u16 rx_rings)
 {
 	if (!rx_rings)
 		return 0;
@@ -184,7 +185,7 @@ static u16 bnge_get_total_vnics(struct bnge_dev *bd, u16 rx_rings)
 	return 1;
 }
 
-static u32 bnge_get_rxfh_indir_size(struct bnge_dev *bd)
+u32 bnge_get_rxfh_indir_size(struct bnge_dev *bd)
 {
 	return bnge_cal_nr_rss_ctxs(bd->rx_nr_rings) *
 	       BNGE_RSS_TABLE_ENTRIES;

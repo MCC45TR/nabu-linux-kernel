@@ -60,16 +60,17 @@ def run_one_stream(cfg, ipver, remote_v4, remote_v6, should_lso):
         sock_wait_drain(sock)
         qstat_new = cfg.netnl.qstats_get({"ifindex": cfg.ifindex}, dump=True)[0]
 
-        # No math behind the 10 here, but try to catch cases where
-        # TCP falls back to non-LSO.
-        ksft_lt(tcp_sock_get_retrans(sock), 10)
-        sock.close()
-
         # Check that at least 90% of the data was sent as LSO packets.
         # System noise may cause false negatives. Also header overheads
         # will add up to 5% of extra packes... The check is best effort.
         total_lso_wire  = len(buf) * 0.90 // cfg.dev["mtu"]
         total_lso_super = len(buf) * 0.90 // cfg.dev["tso_max_size"]
+
+        # Make sure we have order of magnitude more LSO packets than
+        # retransmits, in case TCP retransmitted all the LSO packets.
+        ksft_lt(tcp_sock_get_retrans(sock), total_lso_wire / 4)
+        sock.close()
+
         if should_lso:
             if cfg.have_stat_super_count:
                 ksft_ge(qstat_new['tx-hw-gso-packets'] -
@@ -183,28 +184,24 @@ def query_nic_features(cfg) -> None:
         cfg.wanted_features.add(f["name"])
 
     cfg.hw_features = set()
-    hw_all_features_cmd = ""
     for f in features["hw"]["bits"]["bit"]:
         if f.get("value", False):
-            feature = f["name"]
-            cfg.hw_features.add(feature)
-            hw_all_features_cmd += f" {feature} on"
-    try:
-        ethtool(f"-K {cfg.ifname} {hw_all_features_cmd}")
-    except Exception as e:
-        ksft_pr(f"WARNING: failure enabling all hw features: {e}")
-        ksft_pr("partial gso feature detection may be impacted")
+            cfg.hw_features.add(f["name"])
 
     # Check which features are supported via GSO partial
     cfg.partial_features = set()
     if 'tx-gso-partial' in cfg.hw_features:
+        seg_features = {f for f in cfg.hw_features if "segmentation" in f}
+        ethtool(f"-K {cfg.ifname} " +
+                " ".join(f"{f} on" for f in seg_features))
+
         ethtool(f"-K {cfg.ifname} tx-gso-partial off")
 
         no_partial = set()
         features = cfg.ethnl.features_get({"header": {"dev-index": cfg.ifindex}})
         for f in features["active"]["bits"]["bit"]:
             no_partial.add(f["name"])
-        cfg.partial_features = cfg.hw_features - no_partial
+        cfg.partial_features = seg_features - no_partial
         ethtool(f"-K {cfg.ifname} tx-gso-partial on")
 
     restore_wanted_features(cfg)

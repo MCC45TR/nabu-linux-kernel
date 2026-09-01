@@ -48,7 +48,7 @@ static struct file *ovl_open_realfile(const struct file *file,
 		if (!inode_owner_or_capable(real_idmap, realinode))
 			flags &= ~O_NOATIME;
 
-		realfile = backing_file_open(file_user_path(file),
+		realfile = backing_file_open(file,
 					     flags, realpath, current_cred());
 	}
 	ovl_revert_creds(old_cred);
@@ -120,7 +120,7 @@ static bool ovl_is_real_file(const struct file *realfile,
 }
 
 static struct file *ovl_real_file_path(const struct file *file,
-				       struct path *realpath)
+				       const struct path *realpath)
 {
 	struct ovl_file *of = file->private_data;
 	struct file *realfile = of->realfile;
@@ -369,11 +369,6 @@ static ssize_t ovl_write_iter(struct kiocb *iocb, struct iov_iter *iter)
 	if (!ovl_should_sync(OVL_FS(inode->i_sb)))
 		ifl &= ~(IOCB_DSYNC | IOCB_SYNC);
 
-	/*
-	 * Overlayfs doesn't support deferred completions, don't copy
-	 * this property in case it is set by the issuer.
-	 */
-	ifl &= ~IOCB_DIO_CALLER_COMP;
 	ret = backing_file_write_iter(realfile, iter, iocb, ifl, &ctx);
 
 out_unlock:
@@ -546,9 +541,9 @@ static loff_t ovl_copyfile(struct file *file_in, loff_t pos_in,
 			    struct file *file_out, loff_t pos_out,
 			    loff_t len, unsigned int flags, enum ovl_copyop op)
 {
+	struct inode *inode_in = file_inode(file_in);
 	struct inode *inode_out = file_inode(file_out);
 	struct file *realfile_in, *realfile_out;
-	const struct cred *old_cred;
 	loff_t ret;
 
 	inode_lock(inode_out);
@@ -570,25 +565,38 @@ static loff_t ovl_copyfile(struct file *file_in, loff_t pos_in,
 	if (IS_ERR(realfile_in))
 		goto out_unlock;
 
-	old_cred = ovl_override_creds(file_inode(file_out)->i_sb);
-	switch (op) {
-	case OVL_COPY:
-		ret = vfs_copy_file_range(realfile_in, pos_in,
-					  realfile_out, pos_out, len, flags);
-		break;
-
-	case OVL_CLONE:
-		ret = vfs_clone_file_range(realfile_in, pos_in,
-					   realfile_out, pos_out, len, flags);
-		break;
-
-	case OVL_DEDUPE:
-		ret = vfs_dedupe_file_range_one(realfile_in, pos_in,
-						realfile_out, pos_out, len,
-						flags);
-		break;
+	/*
+	 * For cross-sb copy, vfs_copy_file_range() will verify read access with
+	 * the mounter creds of the dest fs mounter, so we need to explicitly
+	 * verify read access with the source mounter creds.
+	 */
+	if (unlikely(inode_in->i_sb != inode_out->i_sb)) {
+		with_ovl_creds(inode_in->i_sb) {
+			ret = rw_verify_area(READ, realfile_in, &pos_in, len);
+			if (unlikely(ret))
+				goto out_unlock;
+		}
 	}
-	ovl_revert_creds(old_cred);
+
+	with_ovl_creds(inode_out->i_sb) {
+		switch (op) {
+		case OVL_COPY:
+			ret = vfs_copy_file_range(realfile_in, pos_in,
+						  realfile_out, pos_out, len, flags);
+			break;
+
+		case OVL_CLONE:
+			ret = vfs_clone_file_range(realfile_in, pos_in,
+						   realfile_out, pos_out, len, flags);
+			break;
+
+		case OVL_DEDUPE:
+			ret = vfs_dedupe_file_range_one(realfile_in, pos_in,
+							realfile_out, pos_out, len,
+							flags);
+			break;
+		}
+	}
 
 	/* Update size */
 	ovl_file_modified(file_out);

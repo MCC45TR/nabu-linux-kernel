@@ -183,6 +183,8 @@ static inline void __deactivate_cptr_traps_vhe(struct kvm_vcpu *vcpu)
 		val |= CPACR_EL1_ZEN;
 	if (cpus_have_final_cap(ARM64_SME))
 		val |= CPACR_EL1_SMEN;
+	if (cpus_have_final_cap(ARM64_HAS_S1POE))
+		val |= CPACR_EL1_E0POE;
 
 	write_sysreg(val, cpacr_el1);
 }
@@ -195,123 +197,6 @@ static inline void __deactivate_cptr_traps(struct kvm_vcpu *vcpu)
 		__deactivate_cptr_traps_nvhe(vcpu);
 }
 
-#define reg_to_fgt_masks(reg)						\
-	({								\
-		struct fgt_masks *m;					\
-		switch(reg) {						\
-		case HFGRTR_EL2:					\
-			m = &hfgrtr_masks;				\
-			break;						\
-		case HFGWTR_EL2:					\
-			m = &hfgwtr_masks;				\
-			break;						\
-		case HFGITR_EL2:					\
-			m = &hfgitr_masks;				\
-			break;						\
-		case HDFGRTR_EL2:					\
-			m = &hdfgrtr_masks;				\
-			break;						\
-		case HDFGWTR_EL2:					\
-			m = &hdfgwtr_masks;				\
-			break;						\
-		case HAFGRTR_EL2:					\
-			m = &hafgrtr_masks;				\
-			break;						\
-		case HFGRTR2_EL2:					\
-			m = &hfgrtr2_masks;				\
-			break;						\
-		case HFGWTR2_EL2:					\
-			m = &hfgwtr2_masks;				\
-			break;						\
-		case HFGITR2_EL2:					\
-			m = &hfgitr2_masks;				\
-			break;						\
-		case HDFGRTR2_EL2:					\
-			m = &hdfgrtr2_masks;				\
-			break;						\
-		case HDFGWTR2_EL2:					\
-			m = &hdfgwtr2_masks;				\
-			break;						\
-		default:						\
-			BUILD_BUG_ON(1);				\
-		}							\
-									\
-		m;							\
-	})
-
-#define compute_clr_set(vcpu, reg, clr, set)				\
-	do {								\
-		u64 hfg = __vcpu_sys_reg(vcpu, reg);			\
-		struct fgt_masks *m = reg_to_fgt_masks(reg);		\
-		set |= hfg & m->mask;					\
-		clr |= ~hfg & m->nmask;					\
-	} while(0)
-
-#define reg_to_fgt_group_id(reg)					\
-	({								\
-		enum fgt_group_id id;					\
-		switch(reg) {						\
-		case HFGRTR_EL2:					\
-		case HFGWTR_EL2:					\
-			id = HFGRTR_GROUP;				\
-			break;						\
-		case HFGITR_EL2:					\
-			id = HFGITR_GROUP;				\
-			break;						\
-		case HDFGRTR_EL2:					\
-		case HDFGWTR_EL2:					\
-			id = HDFGRTR_GROUP;				\
-			break;						\
-		case HAFGRTR_EL2:					\
-			id = HAFGRTR_GROUP;				\
-			break;						\
-		case HFGRTR2_EL2:					\
-		case HFGWTR2_EL2:					\
-			id = HFGRTR2_GROUP;				\
-			break;						\
-		case HFGITR2_EL2:					\
-			id = HFGITR2_GROUP;				\
-			break;						\
-		case HDFGRTR2_EL2:					\
-		case HDFGWTR2_EL2:					\
-			id = HDFGRTR2_GROUP;				\
-			break;						\
-		default:						\
-			BUILD_BUG_ON(1);				\
-		}							\
-									\
-		id;							\
-	})
-
-#define compute_undef_clr_set(vcpu, kvm, reg, clr, set)			\
-	do {								\
-		u64 hfg = kvm->arch.fgu[reg_to_fgt_group_id(reg)];	\
-		struct fgt_masks *m = reg_to_fgt_masks(reg);		\
-		set |= hfg & m->mask;					\
-		clr |= hfg & m->nmask;					\
-	} while(0)
-
-#define update_fgt_traps_cs(hctxt, vcpu, kvm, reg, clr, set)		\
-	do {								\
-		struct fgt_masks *m = reg_to_fgt_masks(reg);		\
-		u64 c = clr, s = set;					\
-		u64 val;						\
-									\
-		ctxt_sys_reg(hctxt, reg) = read_sysreg_s(SYS_ ## reg);	\
-		if (is_nested_ctxt(vcpu))				\
-			compute_clr_set(vcpu, reg, c, s);		\
-									\
-		compute_undef_clr_set(vcpu, kvm, reg, c, s);		\
-									\
-		val = m->nmask;						\
-		val |= s;						\
-		val &= ~c;						\
-		write_sysreg_s(val, SYS_ ## reg);			\
-	} while(0)
-
-#define update_fgt_traps(hctxt, vcpu, kvm, reg)		\
-	update_fgt_traps_cs(hctxt, vcpu, kvm, reg, 0, 0)
-
 static inline bool cpu_has_amu(void)
 {
        u64 pfr0 = read_sysreg_s(SYS_ID_AA64PFR0_EL1);
@@ -320,33 +205,36 @@ static inline bool cpu_has_amu(void)
                ID_AA64PFR0_EL1_AMU_SHIFT);
 }
 
+#define __activate_fgt(hctxt, vcpu, reg)				\
+	do {								\
+		ctxt_sys_reg(hctxt, reg) = read_sysreg_s(SYS_ ## reg);	\
+		write_sysreg_s(*vcpu_fgt(vcpu, reg), SYS_ ## reg);	\
+	} while (0)
+
 static inline void __activate_traps_hfgxtr(struct kvm_vcpu *vcpu)
 {
 	struct kvm_cpu_context *hctxt = host_data_ptr(host_ctxt);
-	struct kvm *kvm = kern_hyp_va(vcpu->kvm);
 
 	if (!cpus_have_final_cap(ARM64_HAS_FGT))
 		return;
 
-	update_fgt_traps(hctxt, vcpu, kvm, HFGRTR_EL2);
-	update_fgt_traps_cs(hctxt, vcpu, kvm, HFGWTR_EL2, 0,
-			    cpus_have_final_cap(ARM64_WORKAROUND_AMPERE_AC03_CPU_38) ?
-			    HFGWTR_EL2_TCR_EL1_MASK : 0);
-	update_fgt_traps(hctxt, vcpu, kvm, HFGITR_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HDFGRTR_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HDFGWTR_EL2);
+	__activate_fgt(hctxt, vcpu, HFGRTR_EL2);
+	__activate_fgt(hctxt, vcpu, HFGWTR_EL2);
+	__activate_fgt(hctxt, vcpu, HFGITR_EL2);
+	__activate_fgt(hctxt, vcpu, HDFGRTR_EL2);
+	__activate_fgt(hctxt, vcpu, HDFGWTR_EL2);
 
 	if (cpu_has_amu())
-		update_fgt_traps(hctxt, vcpu, kvm, HAFGRTR_EL2);
+		__activate_fgt(hctxt, vcpu, HAFGRTR_EL2);
 
 	if (!cpus_have_final_cap(ARM64_HAS_FGT2))
 	    return;
 
-	update_fgt_traps(hctxt, vcpu, kvm, HFGRTR2_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HFGWTR2_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HFGITR2_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HDFGRTR2_EL2);
-	update_fgt_traps(hctxt, vcpu, kvm, HDFGWTR2_EL2);
+	__activate_fgt(hctxt, vcpu, HFGRTR2_EL2);
+	__activate_fgt(hctxt, vcpu, HFGWTR2_EL2);
+	__activate_fgt(hctxt, vcpu, HFGITR2_EL2);
+	__activate_fgt(hctxt, vcpu, HDFGRTR2_EL2);
+	__activate_fgt(hctxt, vcpu, HDFGWTR2_EL2);
 }
 
 #define __deactivate_fgt(htcxt, vcpu, reg)				\
@@ -531,16 +419,19 @@ static inline bool __populate_fault_info(struct kvm_vcpu *vcpu)
 
 static inline bool kvm_hyp_handle_mops(struct kvm_vcpu *vcpu, u64 *exit_code)
 {
+	u64 spsr;
+
 	*vcpu_pc(vcpu) = read_sysreg_el2(SYS_ELR);
 	arm64_mops_reset_regs(vcpu_gp_regs(vcpu), vcpu->arch.fault.esr_el2);
 	write_sysreg_el2(*vcpu_pc(vcpu), SYS_ELR);
 
 	/*
 	 * Finish potential single step before executing the prologue
-	 * instruction.
+	 * instruction. Modify the hardware SPSR_EL2 directly, as vcpu_cpsr()
+	 * may hold a synthetic (vEL2) value for a guest hypervisor.
 	 */
-	*vcpu_cpsr(vcpu) &= ~DBG_SPSR_SS;
-	write_sysreg_el2(*vcpu_cpsr(vcpu), SYS_SPSR);
+	spsr = read_sysreg_el2(SYS_SPSR);
+	write_sysreg_el2(spsr & ~DBG_SPSR_SS, SYS_SPSR);
 
 	return true;
 }
@@ -680,8 +571,6 @@ static inline bool kvm_hyp_handle_fpsimd(struct kvm_vcpu *vcpu, u64 *exit_code)
 			return false;
 		break;
 	case ESR_ELx_EC_SYS64:
-		if (WARN_ON_ONCE(!is_hyp_ctxt(vcpu)))
-			return false;
 		fallthrough;
 	case ESR_ELx_EC_SVE:
 		if (!sve_guest)

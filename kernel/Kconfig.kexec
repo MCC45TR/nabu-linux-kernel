@@ -100,7 +100,6 @@ config KEXEC_HANDOVER
 	depends on !DEFERRED_STRUCT_PAGE_INIT
 	select MEMBLOCK_KHO_SCRATCH
 	select KEXEC_FILE
-	select DEBUG_FS
 	select LIBFDT
 	select CMA
 	help
@@ -108,6 +107,26 @@ config KEXEC_HANDOVER
 	  passing additional metadata to the target kernel. This is useful
 	  to keep data or state alive across the kexec. For this to work,
 	  both source and target kernels need to have this option enabled.
+
+config KEXEC_HANDOVER_DEBUG
+	bool "Enable Kexec Handover debug checks"
+	depends on KEXEC_HANDOVER
+	help
+	  This option enables extra sanity checks for the Kexec Handover
+	  subsystem. Since, KHO performance is crucial in live update
+	  scenarios and the extra code might be adding overhead it is
+	  only optionally enabled.
+
+config KEXEC_HANDOVER_DEBUGFS
+	bool "kexec handover debugfs interface"
+	default KEXEC_HANDOVER
+	depends on KEXEC_HANDOVER
+	select DEBUG_FS
+	help
+	  Allow to control kexec handover device tree via debugfs
+	  interface, i.e. finalize the state or aborting the finalization.
+	  Also, enables inspecting the KHO fdt trees with the debugfs binary
+	  blobs.
 
 config CRASH_DUMP
 	bool "kernel crash dumps"
@@ -147,6 +166,17 @@ config CRASH_DM_CRYPT_CONFIGS
 	help
 	  CRASH_DM_CRYPT cannot directly select CONFIGFS_FS, because that
 	  is required to be built-in.
+
+config CRASH_DUMP_KUNIT_TEST
+	tristate "Unit Tests for kernel crash dumps" if !KUNIT_ALL_TESTS
+	depends on CRASH_DUMP && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  This option builds KUnit unit tests for kernel crash dumps. The unit
+	  tests will be used to verify the correctness of covered functions and
+	  also prevent any regression.
+
+	  If unsure, say N.
 
 config CRASH_HOTPLUG
 	bool "Update the crash elfcorehdr on system configuration changes"

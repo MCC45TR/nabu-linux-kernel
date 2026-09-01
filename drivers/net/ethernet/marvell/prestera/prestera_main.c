@@ -373,7 +373,7 @@ static int prestera_port_sfp_bind(struct prestera_port *port)
 	struct device_node *ports, *node;
 	struct fwnode_handle *fwnode;
 	struct phylink *phy_link;
-	int err;
+	int err = 0;
 
 	if (!sw->np)
 		return 0;
@@ -1500,7 +1500,7 @@ EXPORT_SYMBOL(prestera_device_unregister);
 
 static int __init prestera_module_init(void)
 {
-	prestera_wq = alloc_workqueue("prestera", 0, 0);
+	prestera_wq = alloc_workqueue("prestera", WQ_PERCPU, 0);
 	if (!prestera_wq)
 		return -ENOMEM;
 

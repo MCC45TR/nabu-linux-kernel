@@ -60,20 +60,11 @@ static int iris_load_fw_to_memory(struct iris_core *core, const char *fw_name)
 
 	ret = qcom_mdt_load(dev, firmware, fw_name,
 			    pas_id, mem_virt, mem_phys, res_size, NULL);
+
 	memunmap(mem_virt);
-	release_firmware(firmware);
-	if (ret)
-		return ret;
-
-	dev_info(dev, "firmware image copied; starting PAS authentication (id %u)\n",
-		 pas_id);
-	ret = qcom_scm_pas_auth_and_reset(pas_id);
-	dev_info(dev, "PAS authentication returned %d\n", ret);
-
-	return ret;
-
 err_release_fw:
 	release_firmware(firmware);
+
 	return ret;
 }
 
@@ -88,11 +79,16 @@ int iris_fw_load(struct iris_core *core)
 	if (ret)
 		fwpath = core->iris_platform_data->fwname;
 
-	dev_info(core->dev, "requesting firmware '%s'\n", fwpath);
 	ret = iris_load_fw_to_memory(core, fwpath);
 	if (ret) {
 		dev_err(core->dev, "firmware download failed\n");
 		return -ENOMEM;
+	}
+
+	ret = qcom_scm_pas_auth_and_reset(core->iris_platform_data->pas_id);
+	if (ret)  {
+		dev_err(core->dev, "auth and reset failed: %d\n", ret);
+		return ret;
 	}
 
 	ret = qcom_scm_mem_protect_video_var(cp_config->cp_start,

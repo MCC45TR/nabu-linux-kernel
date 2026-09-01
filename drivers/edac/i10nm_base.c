@@ -79,6 +79,7 @@ static struct res_config *res_cfg;
 static int retry_rd_err_log;
 static int decoding_via_mca;
 static bool mem_cfg_2lm;
+static bool no_adxl;
 
 static struct reg_rrl icx_reg_rrl_ddr = {
 	.set_num = 2,
@@ -468,17 +469,18 @@ static int i10nm_get_imc_num(struct res_config *cfg)
 			return -ENODEV;
 		}
 
-		if (imc_num > I10NM_NUM_DDR_IMC) {
-			i10nm_printk(KERN_ERR, "Need to make I10NM_NUM_DDR_IMC >= %d\n", imc_num);
-			return -EINVAL;
-		}
-
 		if (cfg->ddr_imc_num != imc_num) {
 			/*
-			 * Store the number of present DDR memory controllers.
+			 * Update the configuration data to reflect the number of
+			 * present DDR memory controllers.
 			 */
 			cfg->ddr_imc_num = imc_num;
 			edac_dbg(2, "Set DDR MC number: %d", imc_num);
+
+			/* Release and reallocate skx_dev list with the updated number. */
+			skx_remove();
+			if (skx_get_all_bus_mappings(cfg, &i10nm_edac_list) <= 0)
+				return -ENODEV;
 		}
 
 		return 0;
@@ -1057,6 +1059,15 @@ static bool i10nm_check_ecc(struct skx_imc *imc, int chan)
 	return !!GET_BITFIELD(mcmtr, 2, 2);
 }
 
+static bool i10nm_channel_disabled(struct skx_imc *imc, int chan)
+{
+	u32 mcmtr = I10NM_GET_MCMTR(imc, chan);
+
+	edac_dbg(1, "mc%d ch%d mcmtr reg %x\n", imc->mc, chan, mcmtr);
+
+	return (mcmtr == ~0 || GET_BITFIELD(mcmtr, 18, 18));
+}
+
 static int i10nm_get_dimm_config(struct mem_ctl_info *mci,
 				 struct res_config *cfg)
 {
@@ -1069,6 +1080,11 @@ static int i10nm_get_dimm_config(struct mem_ctl_info *mci,
 	for (i = 0; i < imc->num_channels; i++) {
 		if (!imc->mbase)
 			continue;
+
+		if (i10nm_channel_disabled(imc, i)) {
+			edac_dbg(1, "mc%d ch%d is disabled.\n", imc->mc, i);
+			continue;
+		}
 
 		ndimms = 0;
 
@@ -1192,8 +1208,14 @@ static int __init i10nm_init(void)
 	}
 
 	rc = skx_adxl_get();
-	if (rc)
-		goto fail;
+	if (rc) {
+		/* Decoding errors via MCA banks for 2LM isn't supported yet */
+		if (rc != -ENODEV || mem_cfg_2lm)
+			goto fail;
+		i10nm_printk(KERN_INFO, "ADXL not found, falling back to MCA-based decoding.\n");
+		no_adxl = true;
+		decoding_via_mca = true;
+	}
 
 	opstate_init();
 	mce_register_decode_chain(&i10nm_mce_dec);
@@ -1227,7 +1249,8 @@ static void __exit i10nm_exit(void)
 
 	skx_teardown_debug();
 	mce_unregister_decode_chain(&i10nm_mce_dec);
-	skx_adxl_put();
+	if (!no_adxl)
+		skx_adxl_put();
 	skx_remove();
 }
 

@@ -524,7 +524,7 @@ static int at803x_config_init(struct phy_device *phydev)
 	 * behaviour but we still need to accommodate it. XNP is only needed
 	 * for 10Gbps support, so disable XNP.
 	 */
-	return phy_modify(phydev, MII_ADVERTISE, MDIO_AN_CTRL1_XNP, 0);
+	return phy_modify(phydev, MII_ADVERTISE, ADVERTISE_XNP, 0);
 }
 
 static void at803x_link_change_notify(struct phy_device *phydev)
@@ -771,10 +771,10 @@ static int at8031_register_regulators(struct phy_device *phydev)
 
 static int at8031_sfp_insert(void *upstream, const struct sfp_eeprom_id *id)
 {
-	struct phy_device *phydev = upstream;
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(phy_support);
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(sfp_support);
-	DECLARE_PHY_INTERFACE_MASK(interfaces);
+	struct phy_device *phydev = upstream;
+	const struct sfp_module_caps *caps;
 	phy_interface_t iface;
 
 	linkmode_zero(phy_support);
@@ -784,12 +784,11 @@ static int at8031_sfp_insert(void *upstream, const struct sfp_eeprom_id *id)
 	phylink_set(phy_support, Pause);
 	phylink_set(phy_support, Asym_Pause);
 
-	linkmode_zero(sfp_support);
-	sfp_parse_support(phydev->sfp_bus, id, sfp_support, interfaces);
+	caps = sfp_get_module_caps(phydev->sfp_bus);
 	/* Some modules support 10G modes as well as others we support.
 	 * Mask out non-supported modes so the correct interface is picked.
 	 */
-	linkmode_and(sfp_support, phy_support, sfp_support);
+	linkmode_and(sfp_support, phy_support, caps->link_modes);
 
 	if (linkmode_empty(sfp_support)) {
 		dev_err(&phydev->mdio.dev, "incompatible SFP module inserted\n");

@@ -4,34 +4,13 @@
  */
 
 #include <linux/bitfield.h>
-#include <linux/dma-mapping.h>
-#include <linux/string.h>
 #include <media/v4l2-mem2mem.h>
 
 #include "iris_hfi_gen1.h"
 #include "iris_hfi_gen1_defines.h"
 #include "iris_instance.h"
-#include "iris_utils.h"
-#include "iris_vb2.h"
 #include "iris_vdec.h"
 #include "iris_vpu_buffer.h"
-
-#define IRIS1_MAX_CORRUPT_OUTPUT_DROPS 8
-
-static u32
-iris_hfi_gen1_bufreq_count_min(struct iris_inst *inst,
-			       const struct hfi_buffer_requirements *bufreq)
-{
-	/*
-	 * HFI 4xx swaps the display hold count and minimum-count fields.
-	 * SM8150's VIDEO.IR.1.2 firmware uses that legacy layout, while
-	 * SM8250 uses the layout represented by the Iris Gen1 structure.
-	 */
-	if (inst->core->iris_platform_data->legacy_vpu5)
-		return bufreq->hold_count;
-
-	return bufreq->count_min;
-}
 
 static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 					      struct hfi_msg_event_notify_pkt *pkt)
@@ -100,13 +79,7 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 		case HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS:
 			data_ptr += sizeof(u32);
 			bufreq = (struct hfi_buffer_requirements *)data_ptr;
-			event.buf_count =
-				iris_hfi_gen1_bufreq_count_min(inst, bufreq);
-			if (inst->core->iris_platform_data->legacy_vpu5)
-				dev_info(inst->core->dev,
-					 "Iris1 v64: HFI 4xx buffer minimum=%u (raw hold=%u min=%u)\n",
-					 event.buf_count, bufreq->hold_count,
-					 bufreq->count_min);
+			event.buf_count = bufreq->count_min;
 			data_ptr += sizeof(*bufreq);
 			break;
 		case HFI_INDEX_EXTRADATA_INPUT_CROP:
@@ -135,8 +108,7 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 
 	pixmp_op->width = ALIGN(event.width, 128);
 	pixmp_op->height = ALIGN(event.height, 32);
-	pixmp_op->plane_fmt[0].bytesperline =
-		ALIGN(event.width * (pixmp_op->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1), 128);
+	pixmp_op->plane_fmt[0].bytesperline = ALIGN(event.width, 128);
 	pixmp_op->plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_OUTPUT);
 
 	matrix_coeff =  FIELD_GET(GENMASK(7, 0), event.colour_space);
@@ -193,11 +165,7 @@ static void iris_hfi_gen1_read_changed_params(struct iris_inst *inst,
 	dst_q = v4l2_m2m_get_dst_vq(inst->m2m_ctx);
 	dst_q->min_reqbufs_allocation = inst->buffers[BUF_OUTPUT].min_count;
 
-	if ((event.bit_depth != HFI_BIT_DEPTH_8 &&
-	     event.bit_depth != HFI_BIT_DEPTH_10) ||
-	    (event.bit_depth == HFI_BIT_DEPTH_10 &&
-	     pixmp_op->pixelformat != V4L2_PIX_FMT_P010) ||
-	    !event.pic_struct) {
+	if (event.bit_depth || !event.pic_struct) {
 		dev_err(core->dev, "unsupported content, bit depth: %x, pic_struct = %x\n",
 			event.bit_depth, event.pic_struct);
 		iris_inst_change_state(inst, IRIS_INST_ERROR);
@@ -232,14 +200,6 @@ static void iris_hfi_gen1_event_seq_changed(struct iris_inst *inst,
 
 	iris_hfi_gen1_read_changed_params(inst, pkt);
 
-	/*
-	 * Drop the VP9 high-IOVA placeholder now that the sequence is known,
-	 * so the top-down allocator hands the freed high region to the
-	 * CAPTURE/DPB buffers userspace and the capture-path internal-buffer
-	 * allocator are about to create.
-	 */
-	iris_vb2_vp9_release_high_iova_hole(inst);
-
 	if (inst->state != IRIS_INST_ERROR && !(inst->sub_state & IRIS_INST_SUB_FIRST_IPSC)) {
 
 		flush_pkt.shdr.hdr.size = sizeof(struct hfi_session_flush_pkt);
@@ -260,36 +220,10 @@ iris_hfi_gen1_sys_event_notify(struct iris_core *core, void *packet)
 	struct hfi_msg_event_notify_pkt *pkt = packet;
 	struct iris_inst *instance;
 
-	if (pkt->event_id == HFI_EVENT_SYS_ERROR) {
-		u32 sfr_size;
-		size_t message_len;
-		char *message;
-
+	if (pkt->event_id == HFI_EVENT_SYS_ERROR)
 		dev_err(core->dev, "sys error (type: %x, session id:%x, data1:%x, data2:%x)\n",
 			pkt->event_id, pkt->shdr.session_id, pkt->event_data1,
 			pkt->event_data2);
-
-		/*
-		 * The delayed recovery worker frees the SFR allocation.  Copy its
-		 * diagnostic to dmesg while the firmware-owned buffer is still
-		 * valid, following the downstream Venus driver's failure path.
-		 */
-		if (core->sfr_vaddr) {
-			dma_rmb();
-			sfr_size = READ_ONCE(*(u32 *)core->sfr_vaddr);
-			if (sfr_size > sizeof(u32) && sfr_size <= SZ_4K) {
-				message = core->sfr_vaddr + sizeof(u32);
-				message_len = strnlen(message,
-						     sfr_size - sizeof(u32));
-				dev_err(core->dev, "Iris1 v57 SFR: %.*s\n",
-					(int)message_len, message);
-			} else {
-				dev_err(core->dev,
-					"Iris1 v57 SFR has invalid size %u\n",
-					sfr_size);
-			}
-		}
-	}
 
 	core->state = IRIS_CORE_ERROR;
 
@@ -414,17 +348,9 @@ static void iris_hfi_gen1_session_etb_done(struct iris_inst *inst, void *packet)
 	struct iris_buffer *buf = NULL;
 	bool found = false;
 
-	/*
-	 * The EOS buffer sent by session_drain() is synthetic and is not in
-	 * the V4L2 source buffer list. H.264/HEVC use address zero while VP9
-	 * uses the legacy sentinel address.
-	 */
-	if (!pkt->packet_buffer || pkt->packet_buffer == 0xdeadb000) {
-		dev_dbg(inst->core->dev,
-			 "Iris1 ETB done: ignoring drain EOS tag=%u packet=%#x error=%#x\n",
-			 pkt->input_tag, pkt->packet_buffer, pkt->shdr.error_type);
+	/* EOS buffer sent via drain won't be in v4l2 buffer list */
+	if (pkt->packet_buffer == 0xdeadb000)
 		return;
-	}
 
 	v4l2_m2m_for_each_src_buf_safe(m2m_ctx, m2m_buffer, n) {
 		buf = to_iris_buffer(&m2m_buffer->vb);
@@ -435,11 +361,6 @@ static void iris_hfi_gen1_session_etb_done(struct iris_inst *inst, void *packet)
 	}
 	if (!found)
 		goto error;
-
-	dev_dbg(inst->core->dev,
-		 "Iris1 ETB done: tag=%u packet=%#x offset=%u filled=%u error=%#x\n",
-		 pkt->input_tag, pkt->packet_buffer, pkt->offset, pkt->filled_len,
-		 pkt->shdr.error_type);
 
 	if (pkt->shdr.error_type == HFI_ERR_SESSION_UNSUPPORTED_STREAM) {
 		buf->flags = V4L2_BUF_FLAG_ERROR;
@@ -461,10 +382,7 @@ static void iris_hfi_gen1_session_etb_done(struct iris_inst *inst, void *packet)
 
 error:
 	iris_inst_change_state(inst, IRIS_INST_ERROR);
-	dev_err(inst->core->dev,
-		"Iris1 ETB done unmatched: tag=%u packet=%#x offset=%u filled=%u error=%#x\n",
-		pkt->input_tag, pkt->packet_buffer, pkt->offset, pkt->filled_len,
-		pkt->shdr.error_type);
+	dev_err(inst->core->dev, "error in etb done\n");
 }
 
 static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
@@ -485,12 +403,8 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 	u32 hfi_flags;
 	u32 offset;
 	u64 timestamp_us = 0;
-	bool m2m_stopped;
-	bool recycle_output = false;
-	bool seek_was_pending = false;
 	bool found = false;
 	u32 flags = 0;
-	int ret;
 
 	if (inst->domain == DECODER) {
 		timestamp_hi = uncom_pkt->time_stamp_hi;
@@ -580,47 +494,6 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 	}
 	buf->timestamp = timestamp_us;
 
-	if (inst->domain == DECODER && buf->type == BUF_OUTPUT &&
-	    inst->core->iris_platform_data->legacy_vpu5) {
-		ret = iris_vdec_complete_pending_output(inst);
-		if (ret)
-			goto error;
-		seek_was_pending = inst->seek_timestamp_pending;
-		if (inst->seek_hold_frames)
-			inst->seek_hold_frames--;
-	}
-
-	if (inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len) {
-		if (inst->core->iris_platform_data->legacy_vpu5 &&
-		    (hfi_flags & (HFI_BUFFERFLAG_DATACORRUPT |
-				  HFI_BUFFERFLAG_DROP_FRAME)) &&
-		    inst->corrupt_output_drops < IRIS1_MAX_CORRUPT_OUTPUT_DROPS) {
-			inst->corrupt_output_drops++;
-			recycle_output = true;
-			dev_info(inst->core->dev,
-				 "Iris1 v137: recycling corrupt output timestamp %llu ns flags %#x (drop %u/%u)\n",
-				 timestamp_us, hfi_flags,
-				 inst->corrupt_output_drops,
-				 IRIS1_MAX_CORRUPT_OUTPUT_DROPS);
-		} else {
-			inst->corrupt_output_drops = 0;
-			recycle_output = iris_vdec_discard_stale_frame(inst,
-								timestamp_us);
-		}
-	}
-
-	if (recycle_output) {
-		buf->data_size = 0;
-		buf->flags = 0;
-		buf->timestamp = 0;
-		buf->attr &= ~(BUF_ATTR_QUEUED | BUF_ATTR_DEQUEUED |
-			       BUF_ATTR_BUFFER_DONE);
-		ret = iris_queue_buffer(inst, buf);
-		if (ret)
-			goto error;
-		return;
-	}
-
 	switch (pic_type) {
 	case HFI_GEN1_PICTURE_IDR:
 	case HFI_GEN1_PICTURE_I:
@@ -651,113 +524,13 @@ static void iris_hfi_gen1_session_ftb_done(struct iris_inst *inst, void *packet)
 
 	buf->flags |= flags;
 
-	if (inst->domain == DECODER && buf->type == BUF_OUTPUT && filled_len &&
-	    inst->core->iris_platform_data->legacy_vpu5 &&
-	    !(hfi_flags & (HFI_BUFFERFLAG_DATACORRUPT |
-			    HFI_BUFFERFLAG_DROP_FRAME)) &&
-	    !seek_was_pending && inst->seek_hold_frames) {
-		ret = iris_vdec_hold_output(inst, buf);
-		if (ret)
-			goto error;
-		return;
-	}
-
 	iris_vb2_buffer_done(inst, buf);
 
 	return;
 
 error:
-	/*
-	 * A terminal EOS/LAST or flush completion and its final FTB done can be
-	 * adjacent in the HFI response queue.  Once mem2mem has delivered LAST it
-	 * marks the context stopped, but userspace may not have issued STREAMOFF
-	 * yet.  The terminal buffer can therefore already be off the destination
-	 * list while streamoff_pending is still false.
-	 *
-	 * There is no userspace buffer left to complete after LAST/stopped or
-	 * during STREAMOFF.  Keep unmatched FTBs fatal in every other state so a
-	 * genuine buffer bookkeeping failure during playback is not hidden.
-	 */
-	m2m_stopped = v4l2_m2m_has_stopped(m2m_ctx);
-	if (inst->streamoff_pending || inst->last_buffer_dequeued || m2m_stopped) {
-		dev_info(core->dev,
-			 "Iris1 v99: ignoring terminal late FTB: tag=%u offset=%u filled=%u flags=%#x state=%u substate=%#x streamoff=%u last=%u stopped=%u\n",
-			 output_tag, offset, filled_len, hfi_flags, inst->state,
-			 inst->sub_state, inst->streamoff_pending,
-			 inst->last_buffer_dequeued, m2m_stopped);
-		return;
-	}
-
-	dev_err(core->dev,
-		"Iris1 v99: FTB done unmatched: tag=%u offset=%u filled=%u flags=%#x state=%u substate=%#x\n",
-		output_tag, offset, filled_len, hfi_flags, inst->state,
-		inst->sub_state);
 	iris_inst_change_state(inst, IRIS_INST_ERROR);
-}
-
-static void
-iris_hfi_gen1_session_property_info(struct iris_inst *inst, void *packet)
-{
-	struct hfi_msg_session_property_info_pkt *pkt = packet;
-	struct hfi_buffer_requirements *req;
-	enum iris_buffer_type buffer_type;
-	u32 req_bytes, count, i;
-
-	req_bytes = pkt->shdr.hdr.size - sizeof(*pkt);
-	dev_info(inst->core->dev,
-		 "Iris1 v58: SESSION_PROPERTY_INFO properties=%u property=%#x payload=%u bytes\n",
-		 pkt->num_properties, pkt->property, req_bytes);
-
-	if (pkt->num_properties != 1 ||
-	    pkt->property != HFI_PROPERTY_CONFIG_BUFFER_REQUIREMENTS ||
-	    !req_bytes || req_bytes % sizeof(*req)) {
-		dev_err(inst->core->dev,
-			"Iris1 v58: malformed buffer requirements response\n");
-		complete(&inst->completion);
-		return;
-	}
-
-	count = req_bytes / sizeof(*req);
-	req = (struct hfi_buffer_requirements *)pkt->data;
-	for (i = 0; i < count; i++, req++) {
-		dev_info(inst->core->dev,
-			 "Iris1 v58: bufreq[%u] type=%#x size=%u region=%u hold=%u min=%u actual=%u contiguous=%u align=%u\n",
-			 i, req->type, req->size, req->region_size,
-			 req->hold_count, req->count_min, req->count_actual,
-			 req->contiguous, req->alignment);
-
-		switch (req->type) {
-		case HFI_BUFFER_OUTPUT:
-			/*
-			 * In decoder split mode OUTPUT is the firmware-owned UBWC
-			 * DPB.  VIDEO.IR.1.2 reports its exact allocation size and
-			 * validates BUFFER_SIZE_ACTUAL strictly at SESSION_CONTINUE;
-			 * the generic layout helper includes newer-HFI tail padding
-			 * and can therefore be larger than the VPU5 requirement.
-			 */
-			if (inst->domain != DECODER ||
-			    !iris_split_mode_enabled(inst))
-				continue;
-			buffer_type = BUF_DPB;
-			break;
-		case HFI_BUFFER_INTERNAL_PERSIST_1:
-			buffer_type = BUF_PERSIST;
-			break;
-		case HFI_BUFFER_INTERNAL_SCRATCH:
-			buffer_type = BUF_BIN;
-			break;
-		case HFI_BUFFER_INTERNAL_SCRATCH_1:
-			buffer_type = BUF_SCRATCH_1;
-			break;
-		default:
-			continue;
-		}
-
-		inst->fw_buffer_sizes[buffer_type] =
-			max(inst->fw_buffer_sizes[buffer_type], req->size);
-	}
-
-	complete(&inst->completion);
+	dev_err(core->dev, "error in ftb done\n");
 }
 
 struct iris_hfi_gen1_response_pkt_info {
@@ -805,10 +578,6 @@ static const struct iris_hfi_gen1_response_pkt_info pkt_infos[] = {
 	{
 	 .pkt = HFI_MSG_SESSION_FILL_BUFFER,
 	 .pkt_sz = sizeof(struct hfi_msg_session_fbd_compressed_pkt),
-	},
-	{
-	 .pkt = HFI_MSG_SESSION_PROPERTY_INFO,
-	 .pkt_sz = sizeof(struct hfi_msg_session_property_info_pkt),
 	},
 	{
 	 .pkt = HFI_MSG_SESSION_FLUSH,
@@ -883,40 +652,12 @@ static void iris_hfi_gen1_handle_response(struct iris_core *core, void *response
 			iris_hfi_gen1_session_etb_done(inst, hdr);
 		} else if (hdr->pkt_type == HFI_MSG_SESSION_FILL_BUFFER) {
 			iris_hfi_gen1_session_ftb_done(inst, hdr);
-		} else if (hdr->pkt_type == HFI_MSG_SESSION_PROPERTY_INFO) {
-			iris_hfi_gen1_session_property_info(inst, hdr);
 		} else {
 			struct hfi_msg_session_hdr_pkt *shdr;
 
 			shdr = (struct hfi_msg_session_hdr_pkt *)hdr;
-			dev_dbg(dev,
-				 "Iris1 response: type=%#x size=%u session=%#x error=%#x\n",
-				 hdr->pkt_type, hdr->size, shdr->shdr.session_id,
-				 shdr->error_type);
-			/*
-			 * HFI teardown is idempotent.  SM8150 can report STOP as already
-			 * outside START after drain/flush, followed by RELEASE_RESOURCES
-			 * as already released.  Accept only these command/state-specific
-			 * statuses; the same errors remain fatal during normal streaming.
-			 */
-			if (shdr->error_type == HFI_ERR_SESSION_SAME_STATE_OPERATION &&
-			    inst->streamoff_pending) {
-				dev_dbg(dev,
-					 "Iris1 v99: idempotent response type=%#x error=%#x\n",
-					 hdr->pkt_type, shdr->error_type);
-			} else if (hdr->pkt_type == HFI_MSG_SESSION_STOP &&
-				   shdr->error_type ==
-					   HFI_ERR_SESSION_INCORRECT_STATE_OPERATION &&
-				   inst->streamoff_pending) {
-				dev_dbg(dev,
-					 "Iris1 v99: STOP already complete during streamoff\n");
-			} else if (shdr->error_type != HFI_ERR_NONE) {
-				dev_err(dev,
-					"Iris1 response error: type=%#x session=%#x error=%#x\n",
-					hdr->pkt_type, shdr->shdr.session_id,
-					shdr->error_type);
+			if (shdr->error_type != HFI_ERR_NONE)
 				iris_inst_change_state(inst, IRIS_INST_ERROR);
-			}
 
 			if (pkt_info->pkt == HFI_MSG_SESSION_FLUSH) {
 				if (!(--inst->flush_responses_pending))
@@ -941,21 +682,8 @@ static void iris_hfi_gen1_flush_debug_queue(struct iris_core *core, u8 *packet)
 		if (pkt->hdr.pkt_type != HFI_MSG_SYS_COV) {
 			struct hfi_msg_sys_debug_pkt *pkt =
 				(struct hfi_msg_sys_debug_pkt *)packet;
-			u32 msg_size;
 
-			/*
-			 * VPU5 reports the useful reason for a deferred session
-			 * failure on the debug queue. Keep it visible while
-			 * bringing up SM8150: dev_dbg() consumes the packet but
-			 * normally hides it unless dynamic debug was enabled
-			 * before the interrupt arrived.
-			 */
-			if (pkt->hdr.size <= sizeof(*pkt))
-				continue;
-			msg_size = min_t(u32, pkt->msg_size,
-					 pkt->hdr.size - sizeof(*pkt));
-			dev_dbg(core->dev, "Iris1 FW: %.*s",
-				 (int)msg_size, pkt->msg_data);
+			dev_dbg(core->dev, "%s", pkt->msg_data);
 		}
 	}
 }

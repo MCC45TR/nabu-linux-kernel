@@ -3,16 +3,12 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include <linux/dma-buf.h>
-#include <linux/dma-fence.h>
-#include <linux/dma-resv.h>
 #include <linux/pm_runtime.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
-#include "iris_common.h"
 #include "iris_vidc.h"
 #include "iris_instance.h"
 #include "iris_vdec.h"
@@ -26,167 +22,19 @@
 #define STEP_WIDTH 1
 #define STEP_HEIGHT 1
 
-static bool allow_fw_boot;
-module_param(allow_fw_boot, bool, 0644);
-MODULE_PARM_DESC(allow_fw_boot,
-		 "Allow opening the video node to boot Iris firmware");
-
-static inline struct iris_inst *iris_get_inst(struct file *filp, void *fh)
-{
-	return container_of(filp->private_data, struct iris_inst, fh);
-}
-
-struct iris_surface_fence {
-	struct dma_fence base;
-	spinlock_t lock; /* protects dma_fence signaling state */
-	struct list_head list;
-	u64 token;
-};
-
-static const char *iris_surface_fence_get_name(struct dma_fence *fence)
-{
-	return "qcom-iris-cpu-copy";
-}
-
-static void iris_surface_fence_release(struct dma_fence *fence)
-{
-	struct iris_surface_fence *surface_fence =
-		container_of(fence, struct iris_surface_fence, base);
-
-	kfree(surface_fence);
-}
-
-static const struct dma_fence_ops iris_surface_fence_ops = {
-	.get_driver_name = iris_surface_fence_get_name,
-	.get_timeline_name = iris_surface_fence_get_name,
-	.release = iris_surface_fence_release,
-};
-
-static void iris_surface_fence_complete(struct iris_surface_fence *surface_fence)
-{
-	bool cookie;
-
-	cookie = dma_fence_begin_signalling();
-	dma_fence_signal(&surface_fence->base);
-	dma_fence_end_signalling(cookie);
-	dma_fence_put(&surface_fence->base);
-}
-
-static int iris_surface_fence_attach(struct iris_inst *inst,
-				     const struct iris_surface_fence_cmd *cmd)
-{
-	struct iris_surface_fence *surface_fence, *pending;
-	struct dma_buf *dmabuf;
-	int ret;
-
-	if (cmd->dmabuf_fd < 0 || !cmd->token)
-		return -EINVAL;
-
-	list_for_each_entry(pending, &inst->surface_fences, list)
-		if (pending->token == cmd->token)
-			return -EEXIST;
-
-	dmabuf = dma_buf_get(cmd->dmabuf_fd);
-	if (IS_ERR(dmabuf))
-		return PTR_ERR(dmabuf);
-
-	surface_fence = kzalloc(sizeof(*surface_fence), GFP_KERNEL);
-	if (!surface_fence) {
-		ret = -ENOMEM;
-		goto put_dmabuf;
-	}
-
-	spin_lock_init(&surface_fence->lock);
-	surface_fence->token = cmd->token;
-	dma_fence_init(&surface_fence->base, &iris_surface_fence_ops,
-		       &surface_fence->lock, inst->surface_fence_context,
-		       ++inst->surface_fence_seqno);
-
-	ret = dma_resv_lock_interruptible(dmabuf->resv, NULL);
-	if (ret)
-		goto put_fence;
-	ret = dma_resv_reserve_fences(dmabuf->resv, 1);
-	if (!ret)
-		dma_resv_add_fence(dmabuf->resv, &surface_fence->base,
-				   DMA_RESV_USAGE_WRITE);
-	dma_resv_unlock(dmabuf->resv);
-	if (ret)
-		goto put_fence;
-
-	list_add_tail(&surface_fence->list, &inst->surface_fences);
-	dma_buf_put(dmabuf);
-	return 0;
-
-put_fence:
-	dma_fence_put(&surface_fence->base);
-put_dmabuf:
-	dma_buf_put(dmabuf);
-	return ret;
-}
-
-static int iris_surface_fence_signal(struct iris_inst *inst, u64 token)
-{
-	struct iris_surface_fence *surface_fence;
-
-	list_for_each_entry(surface_fence, &inst->surface_fences, list) {
-		if (surface_fence->token != token)
-			continue;
-		list_del(&surface_fence->list);
-		iris_surface_fence_complete(surface_fence);
-		return 0;
-	}
-
-	return -ENOENT;
-}
-
-static void iris_surface_fence_signal_all(struct iris_inst *inst)
-{
-	struct iris_surface_fence *surface_fence, *next;
-
-	list_for_each_entry_safe(surface_fence, next,
-				 &inst->surface_fences, list) {
-		list_del(&surface_fence->list);
-		iris_surface_fence_complete(surface_fence);
-	}
-}
-
-static long iris_vidioc_default(struct file *file, void *fh, bool valid_prio,
-				unsigned int cmd, void *arg)
-{
-	struct iris_surface_fence_cmd *fence_cmd = arg;
-	struct iris_inst *inst = iris_get_inst(file, fh);
-	int ret;
-
-	if (cmd != VIDIOC_IRIS_SURFACE_FENCE || inst->domain != DECODER)
-		return -ENOTTY;
-	if (!valid_prio)
-		return -EBUSY;
-
-	mutex_lock(&inst->lock);
-	if (fence_cmd->op == IRIS_SURFACE_FENCE_ATTACH)
-		ret = iris_surface_fence_attach(inst, fence_cmd);
-	else if (fence_cmd->op == IRIS_SURFACE_FENCE_SIGNAL)
-		ret = iris_surface_fence_signal(inst, fence_cmd->token);
-	else
-		ret = -EINVAL;
-	mutex_unlock(&inst->lock);
-
-	return ret;
-}
-
-static void iris_v4l2_fh_init(struct iris_inst *inst)
+static void iris_v4l2_fh_init(struct iris_inst *inst, struct file *filp)
 {
 	if (inst->domain == ENCODER)
 		v4l2_fh_init(&inst->fh, inst->core->vdev_enc);
 	else if (inst->domain == DECODER)
 		v4l2_fh_init(&inst->fh, inst->core->vdev_dec);
 	inst->fh.ctrl_handler = &inst->ctrl_handler;
-	v4l2_fh_add(&inst->fh);
+	v4l2_fh_add(&inst->fh, filp);
 }
 
-static void iris_v4l2_fh_deinit(struct iris_inst *inst)
+static void iris_v4l2_fh_deinit(struct iris_inst *inst, struct file *filp)
 {
-	v4l2_fh_del(&inst->fh);
+	v4l2_fh_del(&inst->fh, filp);
 	inst->fh.ctrl_handler = NULL;
 	v4l2_fh_exit(&inst->fh);
 }
@@ -194,19 +42,38 @@ static void iris_v4l2_fh_deinit(struct iris_inst *inst)
 static void iris_add_session(struct iris_inst *inst)
 {
 	struct iris_core *core = inst->core;
+	struct iris_inst *iter;
+	u32 count = 0;
 
 	mutex_lock(&core->lock);
-	list_add_tail(&inst->list, &core->instances);
+
+	list_for_each_entry(iter, &core->instances, list)
+		count++;
+
+	if (count < core->iris_platform_data->max_session_count)
+		list_add_tail(&inst->list, &core->instances);
+
 	mutex_unlock(&core->lock);
 }
 
 static void iris_remove_session(struct iris_inst *inst)
 {
 	struct iris_core *core = inst->core;
+	struct iris_inst *iter, *temp;
 
 	mutex_lock(&core->lock);
-	list_del_init(&inst->list);
+	list_for_each_entry_safe(iter, temp, &core->instances, list) {
+		if (iter->session_id == inst->session_id) {
+			list_del_init(&iter->list);
+			break;
+		}
+	}
 	mutex_unlock(&core->lock);
+}
+
+static inline struct iris_inst *iris_get_inst(struct file *filp)
+{
+	return container_of(file_to_v4l2_fh(filp), struct iris_inst, fh);
 }
 
 static void iris_m2m_device_run(void *priv)
@@ -268,9 +135,6 @@ int iris_open(struct file *filp)
 	u32 session_type;
 	int ret;
 
-	if (!READ_ONCE(allow_fw_boot))
-		return -EACCES;
-
 	vdev = video_devdata(filp);
 	if (strcmp(vdev->name, "qcom-iris-decoder") == 0)
 		session_type = DECODER;
@@ -300,9 +164,6 @@ int iris_open(struct file *filp)
 	inst->domain = session_type;
 	inst->session_id = hash32_ptr(inst);
 	inst->state = IRIS_INST_DEINIT;
-	INIT_LIST_HEAD(&inst->list);
-	INIT_LIST_HEAD(&inst->surface_fences);
-	inst->surface_fence_context = dma_fence_context_alloc(1);
 
 	mutex_init(&inst->lock);
 	mutex_init(&inst->ctx_q_lock);
@@ -320,7 +181,7 @@ int iris_open(struct file *filp)
 	init_completion(&inst->completion);
 	init_completion(&inst->flush_completion);
 
-	iris_v4l2_fh_init(inst);
+	iris_v4l2_fh_init(inst, filp);
 
 	inst->m2m_dev = v4l2_m2m_init(&iris_m2m_ops);
 	if (IS_ERR_OR_NULL(inst->m2m_dev)) {
@@ -344,7 +205,6 @@ int iris_open(struct file *filp)
 	iris_add_session(inst);
 
 	inst->fh.m2m_ctx = inst->m2m_ctx;
-	filp->private_data = &inst->fh;
 
 	return 0;
 
@@ -353,12 +213,31 @@ fail_m2m_ctx_release:
 fail_m2m_release:
 	v4l2_m2m_release(inst->m2m_dev);
 fail_v4l2_fh_deinit:
-	iris_v4l2_fh_deinit(inst);
+	iris_v4l2_fh_deinit(inst, filp);
 	mutex_destroy(&inst->ctx_q_lock);
 	mutex_destroy(&inst->lock);
 	kfree(inst);
 
 	return ret;
+}
+
+static void iris_session_close(struct iris_inst *inst)
+{
+	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
+	bool wait_for_response = true;
+	int ret;
+
+	if (inst->state == IRIS_INST_DEINIT)
+		return;
+
+	reinit_completion(&inst->completion);
+
+	ret = hfi_ops->session_close(inst);
+	if (ret)
+		wait_for_response = false;
+
+	if (wait_for_response)
+		iris_wait_for_session_response(inst, false);
 }
 
 static void iris_check_num_queued_internal_buffers(struct iris_inst *inst, u32 plane)
@@ -403,39 +282,35 @@ static void iris_check_num_queued_internal_buffers(struct iris_inst *inst, u32 p
 
 int iris_close(struct file *filp)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
-
-	mutex_lock(&inst->lock);
-	iris_surface_fence_signal_all(inst);
-	mutex_unlock(&inst->lock);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	v4l2_ctrl_handler_free(&inst->ctrl_handler);
 	v4l2_m2m_ctx_release(inst->m2m_ctx);
 	v4l2_m2m_release(inst->m2m_dev);
 	mutex_lock(&inst->lock);
-	iris_hfi_session_close(inst);
-	iris_v4l2_fh_deinit(inst);
+	if (inst->domain == DECODER)
+		iris_vdec_inst_deinit(inst);
+	else if (inst->domain == ENCODER)
+		iris_venc_inst_deinit(inst);
+	iris_session_close(inst);
+	iris_inst_change_state(inst, IRIS_INST_DEINIT);
+	iris_v4l2_fh_deinit(inst, filp);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	iris_remove_session(inst);
 	mutex_unlock(&inst->lock);
-	if (inst->domain == DECODER)
-		iris_vdec_inst_deinit(inst);
-	else if (inst->domain == ENCODER)
-		iris_venc_inst_deinit(inst);
 	mutex_destroy(&inst->ctx_q_lock);
 	mutex_destroy(&inst->lock);
 	kfree(inst);
-	filp->private_data = NULL;
 
 	return 0;
 }
 
 static int iris_enum_fmt(struct file *filp, void *fh, struct v4l2_fmtdesc *f)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	if (inst->domain == DECODER)
 		return iris_vdec_enum_fmt(inst, f);
@@ -447,7 +322,7 @@ static int iris_enum_fmt(struct file *filp, void *fh, struct v4l2_fmtdesc *f)
 
 static int iris_try_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format *f)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	int ret = 0;
 
 	mutex_lock(&inst->lock);
@@ -464,7 +339,7 @@ static int iris_try_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_form
 
 static int iris_s_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format *f)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	int ret = 0;
 
 	mutex_lock(&inst->lock);
@@ -481,7 +356,7 @@ static int iris_s_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format
 
 static int iris_g_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format *f)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	int ret = 0;
 
 	mutex_lock(&inst->lock);
@@ -500,7 +375,7 @@ static int iris_g_fmt_vid_mplane(struct file *filp, void *fh, struct v4l2_format
 static int iris_enum_framesizes(struct file *filp, void *fh,
 				struct v4l2_frmsizeenum *fsize)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	struct platform_inst_caps *caps;
 	int ret = 0;
 
@@ -532,7 +407,7 @@ static int iris_enum_frameintervals(struct file *filp, void *fh,
 				    struct v4l2_frmivalenum *fival)
 
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	struct iris_core *core = inst->core;
 	struct platform_inst_caps *caps;
 	u32 fps, mbpf;
@@ -575,7 +450,7 @@ static int iris_enum_frameintervals(struct file *filp, void *fh,
 
 static int iris_querycap(struct file *filp, void *fh, struct v4l2_capability *cap)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	strscpy(cap->driver, IRIS_DRV_NAME, sizeof(cap->driver));
 
@@ -589,7 +464,7 @@ static int iris_querycap(struct file *filp, void *fh, struct v4l2_capability *ca
 
 static int iris_g_selection(struct file *filp, void *fh, struct v4l2_selection *s)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	if (s->type != V4L2_BUF_TYPE_VIDEO_CAPTURE &&
 	    inst->domain == DECODER)
@@ -639,7 +514,7 @@ static int iris_g_selection(struct file *filp, void *fh, struct v4l2_selection *
 
 static int iris_s_selection(struct file *filp, void *fh, struct v4l2_selection *s)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	if (inst->domain == DECODER)
 		return -EINVAL;
@@ -663,7 +538,7 @@ static int iris_subscribe_event(struct v4l2_fh *fh, const struct v4l2_event_subs
 
 static int iris_s_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
 {
-	struct iris_inst *inst = container_of(fh, struct iris_inst, fh);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
 	    a->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
@@ -677,7 +552,7 @@ static int iris_s_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
 
 static int iris_g_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
 {
-	struct iris_inst *inst = container_of(fh, struct iris_inst, fh);
+	struct iris_inst *inst = iris_get_inst(filp);
 
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE &&
 	    a->type != V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
@@ -692,7 +567,7 @@ static int iris_g_parm(struct file *filp, void *fh, struct v4l2_streamparm *a)
 static int iris_dec_cmd(struct file *filp, void *fh,
 			struct v4l2_decoder_cmd *dec)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	int ret = 0;
 
 	mutex_lock(&inst->lock);
@@ -726,7 +601,7 @@ unlock:
 static int iris_enc_cmd(struct file *filp, void *fh,
 			struct v4l2_encoder_cmd *enc)
 {
-	struct iris_inst *inst = iris_get_inst(filp, NULL);
+	struct iris_inst *inst = iris_get_inst(filp);
 	int ret = 0;
 
 	mutex_lock(&inst->lock);
@@ -802,7 +677,6 @@ static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops_dec = {
 	.vidioc_streamoff               = v4l2_m2m_ioctl_streamoff,
 	.vidioc_try_decoder_cmd         = v4l2_m2m_ioctl_try_decoder_cmd,
 	.vidioc_decoder_cmd             = iris_dec_cmd,
-	.vidioc_default                 = iris_vidioc_default,
 };
 
 static const struct v4l2_ioctl_ops iris_v4l2_ioctl_ops_enc = {

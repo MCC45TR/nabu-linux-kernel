@@ -12,6 +12,7 @@
 #include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/pm_runtime.h>
+#include <linux/string_choices.h>
 #include <linux/uaccess.h>
 
 #include "tb.h"
@@ -691,7 +692,7 @@ static int margining_caps_show(struct seq_file *s, void *not_used)
 		seq_printf(s, "0x%08x\n", margining->caps[i]);
 
 	seq_printf(s, "# software margining: %s\n",
-		   supports_software(margining) ? "yes" : "no");
+		   str_yes_no(supports_software(margining)));
 	if (supports_hardware(margining)) {
 		seq_puts(s, "# hardware margining: yes\n");
 		seq_puts(s, "# minimum BER level contour: ");
@@ -955,7 +956,9 @@ margining_error_counter_write(struct file *file, const char __user *user_buf,
 	else if (!strcmp(buf, "stop"))
 		error_counter = USB4_MARGIN_SW_ERROR_COUNTER_STOP;
 	else
-		return -EINVAL;
+		goto err_free;
+
+	free_page((unsigned long)buf);
 
 	scoped_cond_guard(mutex_intr, return -ERESTARTSYS, &tb->lock) {
 		if (!margining->software)
@@ -965,6 +968,10 @@ margining_error_counter_write(struct file *file, const char __user *user_buf,
 	}
 
 	return count;
+
+err_free:
+	free_page((unsigned long)buf);
+	return -EINVAL;
 }
 
 static int margining_error_counter_show(struct seq_file *s, void *not_used)

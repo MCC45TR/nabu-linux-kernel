@@ -492,19 +492,28 @@ fcloop_t2h_xmt_ls_rsp(struct nvme_fc_local_port *localport,
 	struct fcloop_rport *rport = remoteport->private;
 	struct nvmet_fc_target_port *targetport = rport->targetport;
 	struct fcloop_tport *tport;
+	int ret = 0;
 
 	if (!targetport) {
 		/*
 		 * The target port is gone. The target doesn't expect any
-		 * response anymore and the ->done call is not valid
-		 * because the resources have been freed by
-		 * nvmet_fc_free_pending_reqs.
+		 * response anymore and thus lsreq can't be accessed anymore.
 		 *
 		 * We end up here from delete association exchange:
 		 * nvmet_fc_xmt_disconnect_assoc sends an async request.
+		 *
+		 * Return success when remoteport is still online because this
+		 * is what LLDDs do and silently drop the response.  Otherwise,
+		 * return with error to signal upper layer to perform the lsrsp
+		 * resource cleanup.
 		 */
+		if (remoteport->port_state == FC_OBJSTATE_ONLINE)
+			lsrsp->done(lsrsp);
+		else
+			ret = -ENODEV;
+
 		kmem_cache_free(lsreq_cache, tls_req);
-		return 0;
+		return ret;
 	}
 
 	memcpy(lsreq->rspaddr, lsrsp->rspbuf,

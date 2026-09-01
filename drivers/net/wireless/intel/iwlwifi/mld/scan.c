@@ -473,6 +473,9 @@ iwl_mld_scan_get_cmd_gen_flags(struct iwl_mld *mld,
 	    params->flags & NL80211_SCAN_FLAG_COLOCATED_6GHZ)
 		flags |= IWL_UMAC_SCAN_GEN_FLAGS_V2_TRIGGER_UHB_SCAN;
 
+	if (scan_status == IWL_MLD_SCAN_INT_MLO)
+		flags |= IWL_UMAC_SCAN_GEN_FLAGS_V2_NTF_START;
+
 	if (params->enable_6ghz_passive)
 		flags |= IWL_UMAC_SCAN_GEN_FLAGS_V2_6GHZ_PASSIVE_SCAN;
 
@@ -504,9 +507,7 @@ iwl_mld_scan_get_cmd_gen_flags2(struct iwl_mld *mld,
 	 */
 	if (scan_status == IWL_MLD_SCAN_REGULAR &&
 	    ieee80211_vif_type_p2p(vif) == NL80211_IFTYPE_AP &&
-	    gen_flags & IWL_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE &&
-	    iwl_fw_lookup_notif_ver(mld->fw, SCAN_GROUP,
-				    CHANNEL_SURVEY_NOTIF, 0) >= 1)
+	    gen_flags & IWL_UMAC_SCAN_GEN_FLAGS_V2_FORCE_PASSIVE)
 		flags |= IWL_UMAC_SCAN_GEN_FLAGS2_COLLECT_CHANNEL_STATS;
 
 	return flags;
@@ -1819,9 +1820,6 @@ static void iwl_mld_int_mlo_scan_start(struct iwl_mld *mld,
 	ret = _iwl_mld_single_scan_start(mld, vif, req, &ies,
 					 IWL_MLD_SCAN_INT_MLO);
 
-	if (!ret)
-		mld->scan.last_mlo_scan_time = ktime_get_boottime_ns();
-
 	IWL_DEBUG_SCAN(mld, "Internal MLO scan: ret=%d\n", ret);
 }
 
@@ -1904,6 +1902,30 @@ void iwl_mld_handle_match_found_notif(struct iwl_mld *mld,
 {
 	IWL_DEBUG_SCAN(mld, "Scheduled scan results\n");
 	ieee80211_sched_scan_results(mld->hw);
+}
+
+void iwl_mld_handle_scan_start_notif(struct iwl_mld *mld,
+				     struct iwl_rx_packet *pkt)
+{
+	struct iwl_umac_scan_complete *notif = (void *)pkt->data;
+	u32 uid = le32_to_cpu(notif->uid);
+
+	if (IWL_FW_CHECK(mld, uid >= ARRAY_SIZE(mld->scan.uid_status),
+			 "FW reports out-of-range scan UID %d\n", uid))
+		return;
+
+	if (IWL_FW_CHECK(mld, !(mld->scan.uid_status[uid] & mld->scan.status),
+			 "FW reports scan UID %d we didn't trigger\n", uid))
+		return;
+
+	IWL_DEBUG_SCAN(mld, "Scan started: uid=%u type=%u\n", uid,
+		       mld->scan.uid_status[uid]);
+	if (IWL_FW_CHECK(mld, mld->scan.uid_status[uid] != IWL_MLD_SCAN_INT_MLO,
+			 "FW reports scan start notification %d we didn't trigger\n",
+			 mld->scan.uid_status[uid]))
+		return;
+
+	mld->scan.last_mlo_scan_start_time = ktime_get_boottime_ns();
 }
 
 void iwl_mld_handle_scan_complete_notif(struct iwl_mld *mld,

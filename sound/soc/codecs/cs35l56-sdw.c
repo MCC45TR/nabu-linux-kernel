@@ -527,15 +527,15 @@ static int cs35l56_sdw_probe(struct sdw_slave *peripheral, const struct sdw_devi
 	case 0x3556:
 	case 0x3557:
 		regmap_config = &cs35l56_regmap_sdw;
-		cs35l56->base.fw_reg = &cs35l56_fw_reg;
 		break;
 	case 0x3563:
 		regmap_config = &cs35l63_regmap_sdw;
-		cs35l56->base.fw_reg = &cs35l63_fw_reg;
 		break;
 	default:
 		return -ENODEV;
 	}
+
+	cs35l56->base.type = ((unsigned int)id->driver_data) & 0xff;
 
 	cs35l56->base.regmap = devm_regmap_init(dev, &cs35l56_regmap_bus_sdw,
 					   peripheral, regmap_config);
@@ -560,10 +560,11 @@ static int cs35l56_sdw_remove(struct sdw_slave *peripheral)
 
 	/* Disable SoundWire interrupts */
 	cs35l56->sdw_irq_no_unmask = true;
-	cancel_work_sync(&cs35l56->sdw_irq_work);
+	flush_work(&cs35l56->sdw_irq_work);
 	sdw_write_no_pm(peripheral, CS35L56_SDW_GEN_INT_MASK_1, 0);
 	sdw_read_no_pm(peripheral, CS35L56_SDW_GEN_INT_STAT_1);
 	sdw_write_no_pm(peripheral, CS35L56_SDW_GEN_INT_STAT_1, 0xFF);
+	flush_work(&cs35l56->sdw_irq_work);
 
 	cs35l56_remove(cs35l56);
 

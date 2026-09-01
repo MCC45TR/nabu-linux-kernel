@@ -283,21 +283,33 @@ invalid:
 	goto out;
 }
 
-#if BITS_PER_LONG < 64
 static int fuse_dentry_init(struct dentry *dentry)
 {
+	int ret = 0;
+
+	/*
+	 * Initialising d_time (epoch) to '0' ensures the dentry is invalid
+	 * if compared to fc->epoch, which is initialized to '1'.
+	 */
+	dentry->d_time = 0;
+
+#if BITS_PER_LONG < 64
 	dentry->d_fsdata = kzalloc(sizeof(union fuse_dentry),
 				   GFP_KERNEL_ACCOUNT | __GFP_RECLAIMABLE);
 
-	return dentry->d_fsdata ? 0 : -ENOMEM;
+	ret = dentry->d_fsdata ? 0 : -ENOMEM;
+#endif
+
+	return ret;
 }
 static void fuse_dentry_release(struct dentry *dentry)
 {
+#if BITS_PER_LONG < 64
 	union fuse_dentry *fd = dentry->d_fsdata;
 
 	kfree_rcu(fd, rcu);
-}
 #endif
+}
 
 static int fuse_dentry_delete(const struct dentry *dentry)
 {
@@ -331,10 +343,8 @@ static struct vfsmount *fuse_dentry_automount(struct path *path)
 const struct dentry_operations fuse_dentry_operations = {
 	.d_revalidate	= fuse_dentry_revalidate,
 	.d_delete	= fuse_dentry_delete,
-#if BITS_PER_LONG < 64
 	.d_init		= fuse_dentry_init,
 	.d_release	= fuse_dentry_release,
-#endif
 	.d_automount	= fuse_dentry_automount,
 };
 
@@ -739,22 +749,18 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 	int err;
 	struct mnt_idmap *idmap = file_mnt_idmap(file);
 	struct fuse_conn *fc = get_fuse_conn(dir);
-	struct dentry *res = NULL;
 
 	if (fuse_is_bad(dir))
 		return -EIO;
 
 	if (d_in_lookup(entry)) {
-		res = fuse_lookup(dir, entry, 0);
-		if (IS_ERR(res))
-			return PTR_ERR(res);
-
-		if (res)
-			entry = res;
+		struct dentry *res = fuse_lookup(dir, entry, 0);
+		if (res || d_really_is_positive(entry))
+			return finish_no_open(file, res);
 	}
 
-	if (!(flags & O_CREAT) || d_really_is_positive(entry))
-		goto no_open;
+	if (!(flags & O_CREAT))
+		return finish_no_open(file, NULL);
 
 	/* Only creates */
 	file->f_mode |= FMODE_CREATED;
@@ -768,16 +774,13 @@ static int fuse_atomic_open(struct inode *dir, struct dentry *entry,
 		goto mknod;
 	} else if (err == -EEXIST)
 		fuse_invalidate_entry(entry);
-out_dput:
-	dput(res);
 	return err;
 
 mknod:
 	err = fuse_mknod(idmap, dir, entry, mode, 0);
 	if (err)
-		goto out_dput;
-no_open:
-	return finish_no_open(file, res);
+		return err;
+	return finish_no_open(file, NULL);
 }
 
 /*

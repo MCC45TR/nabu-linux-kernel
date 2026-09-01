@@ -138,8 +138,23 @@ void	xdr_terminate_string(const struct xdr_buf *, const u32);
 size_t	xdr_buf_pagecount(const struct xdr_buf *buf);
 int	xdr_alloc_bvec(struct xdr_buf *buf, gfp_t gfp);
 void	xdr_free_bvec(struct xdr_buf *buf);
-unsigned int xdr_buf_to_bvec(struct bio_vec *bvec, unsigned int bvec_size,
-			     const struct xdr_buf *xdr);
+int xdr_buf_to_bvec(struct bio_vec *bvec, unsigned int bvec_size,
+		    const struct xdr_buf *xdr);
+int xdr_buf_to_sg(const struct xdr_buf *buf, unsigned int offset,
+		  unsigned int len, struct scatterlist *sg, unsigned int nsg);
+int xdr_buf_to_sg_alloc(const struct xdr_buf *buf, unsigned int offset,
+			unsigned int len, struct scatterlist *sg_head,
+			unsigned int sg_head_nents,
+			struct scatterlist **sg_overflow, gfp_t gfp);
+
+/*
+ * Inline scatterlist entries for xdr_buf_to_sg_alloc().  Sized to cover the
+ * head kvec, tail kvec, and a few page fragments without any heap allocation.
+ */
+enum {
+	XDR_BUF_TO_SG_NENTS	= 8,
+};
+
 
 static inline __be32 *xdr_encode_array(__be32 *p, const void *s, unsigned int len)
 {
@@ -288,16 +303,16 @@ xdr_set_scratch_buffer(struct xdr_stream *xdr, void *buf, size_t buflen)
 }
 
 /**
- * xdr_set_scratch_page - Attach a scratch buffer for decoding data
+ * xdr_set_scratch_folio - Attach a scratch buffer for decoding data
  * @xdr: pointer to xdr_stream struct
- * @page: an anonymous page
+ * @page: an anonymous folio
  *
  * See xdr_set_scratch_buffer().
  */
 static inline void
-xdr_set_scratch_page(struct xdr_stream *xdr, struct page *page)
+xdr_set_scratch_folio(struct xdr_stream *xdr, struct folio *folio)
 {
-	xdr_set_scratch_buffer(xdr, page_address(page), PAGE_SIZE);
+	xdr_set_scratch_buffer(xdr, folio_address(folio), folio_size(folio));
 }
 
 /**
@@ -721,7 +736,7 @@ xdr_stream_decode_u64(struct xdr_stream *xdr, __u64 *ptr)
  * @len: size of buffer pointed to by @ptr
  *
  * Return values:
- *   On success, returns size of object stored in @ptr
+ *   %0 on success
  *   %-EBADMSG on XDR buffer overflow
  */
 static inline ssize_t
@@ -732,7 +747,7 @@ xdr_stream_decode_opaque_fixed(struct xdr_stream *xdr, void *ptr, size_t len)
 	if (unlikely(!p))
 		return -EBADMSG;
 	xdr_decode_opaque_fixed(p, ptr, len);
-	return len;
+	return 0;
 }
 
 /**

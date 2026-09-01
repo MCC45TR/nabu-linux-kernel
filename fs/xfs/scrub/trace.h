@@ -972,20 +972,12 @@ TRACE_EVENT(xfile_create,
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(unsigned long, ino)
-		__array(char, pathname, MAXNAMELEN)
 	),
 	TP_fast_assign(
-		char		*path;
-
 		__entry->ino = file_inode(xf->file)->i_ino;
-		path = file_path(xf->file, __entry->pathname, MAXNAMELEN);
-		if (IS_ERR(path))
-			strncpy(__entry->pathname, "(unknown)",
-					sizeof(__entry->pathname));
 	),
-	TP_printk("xfino 0x%lx path '%s'",
-		  __entry->ino,
-		  __entry->pathname)
+	TP_printk("xfino 0x%lx",
+		  __entry->ino)
 );
 
 TRACE_EVENT(xfile_destroy,
@@ -2000,6 +1992,51 @@ DEFINE_REPAIR_EXTENT_EVENT(xreap_agextent_binval);
 DEFINE_REPAIR_EXTENT_EVENT(xreap_bmapi_binval);
 DEFINE_REPAIR_EXTENT_EVENT(xrep_agfl_insert);
 
+DECLARE_EVENT_CLASS(xrep_reap_limits_class,
+	TP_PROTO(const struct xfs_trans *tp, unsigned int per_binval,
+		 unsigned int max_binval, unsigned int step_size,
+		 unsigned int per_intent,
+		 unsigned int max_deferred),
+	TP_ARGS(tp, per_binval, max_binval, step_size, per_intent, max_deferred),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(unsigned int, log_res)
+		__field(unsigned int, per_binval)
+		__field(unsigned int, max_binval)
+		__field(unsigned int, step_size)
+		__field(unsigned int, per_intent)
+		__field(unsigned int, max_deferred)
+	),
+	TP_fast_assign(
+		__entry->dev = tp->t_mountp->m_super->s_dev;
+		__entry->log_res = tp->t_log_res;
+		__entry->per_binval = per_binval;
+		__entry->max_binval = max_binval;
+		__entry->step_size = step_size;
+		__entry->per_intent = per_intent;
+		__entry->max_deferred = max_deferred;
+	),
+	TP_printk("dev %d:%d logres %u per_binval %u max_binval %u step_size %u per_intent %u max_deferred %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->log_res,
+		  __entry->per_binval,
+		  __entry->max_binval,
+		  __entry->step_size,
+		  __entry->per_intent,
+		  __entry->max_deferred)
+);
+#define DEFINE_REPAIR_REAP_LIMITS_EVENT(name) \
+DEFINE_EVENT(xrep_reap_limits_class, name, \
+	TP_PROTO(const struct xfs_trans *tp, unsigned int per_binval, \
+		 unsigned int max_binval, unsigned int step_size, \
+		 unsigned int per_intent, \
+		 unsigned int max_deferred), \
+	TP_ARGS(tp, per_binval, max_binval, step_size, per_intent, max_deferred))
+DEFINE_REPAIR_REAP_LIMITS_EVENT(xreap_agextent_limits);
+DEFINE_REPAIR_REAP_LIMITS_EVENT(xreap_agcow_limits);
+DEFINE_REPAIR_REAP_LIMITS_EVENT(xreap_rgcow_limits);
+DEFINE_REPAIR_REAP_LIMITS_EVENT(xreap_bmapi_limits);
+
 DECLARE_EVENT_CLASS(xrep_reap_find_class,
 	TP_PROTO(const struct xfs_group *xg, xfs_agblock_t agbno,
 		 xfs_extlen_t len, bool crosslinked),
@@ -2635,9 +2672,9 @@ TRACE_EVENT(xrep_cow_mark_file_range,
 );
 
 TRACE_EVENT(xrep_cow_replace_mapping,
-	TP_PROTO(struct xfs_inode *ip, const struct xfs_bmbt_irec *irec,
-		 xfs_fsblock_t new_startblock, xfs_extlen_t new_blockcount),
-	TP_ARGS(ip, irec, new_startblock, new_blockcount),
+	TP_PROTO(struct xfs_inode *ip, const struct xfs_bmbt_irec *got,
+		 const struct xfs_bmbt_irec *rep),
+	TP_ARGS(ip, got, rep),
 	TP_STRUCT__entry(
 		__field(dev_t, dev)
 		__field(xfs_ino_t, ino)
@@ -2645,28 +2682,34 @@ TRACE_EVENT(xrep_cow_replace_mapping,
 		__field(xfs_fileoff_t, startoff)
 		__field(xfs_filblks_t, blockcount)
 		__field(xfs_exntst_t, state)
+		__field(xfs_fileoff_t, new_startoff)
 		__field(xfs_fsblock_t, new_startblock)
 		__field(xfs_extlen_t, new_blockcount)
+		__field(xfs_exntst_t, new_state)
 	),
 	TP_fast_assign(
 		__entry->dev = ip->i_mount->m_super->s_dev;
 		__entry->ino = ip->i_ino;
-		__entry->startoff = irec->br_startoff;
-		__entry->startblock = irec->br_startblock;
-		__entry->blockcount = irec->br_blockcount;
-		__entry->state = irec->br_state;
-		__entry->new_startblock = new_startblock;
-		__entry->new_blockcount = new_blockcount;
+		__entry->startoff = got->br_startoff;
+		__entry->startblock = got->br_startblock;
+		__entry->blockcount = got->br_blockcount;
+		__entry->state = got->br_state;
+		__entry->new_startoff = rep->br_startoff;
+		__entry->new_startblock = rep->br_startblock;
+		__entry->new_blockcount = rep->br_blockcount;
+		__entry->new_state = rep->br_state;
 	),
-	TP_printk("dev %d:%d ino 0x%llx startoff 0x%llx startblock 0x%llx fsbcount 0x%llx state 0x%x new_startblock 0x%llx new_fsbcount 0x%x",
+	TP_printk("dev %d:%d ino 0x%llx startoff 0x%llx startblock 0x%llx fsbcount 0x%llx state 0x%x new_startoff 0x%llx new_startblock 0x%llx new_fsbcount 0x%x new_state 0x%x",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  __entry->ino,
 		  __entry->startoff,
 		  __entry->startblock,
 		  __entry->blockcount,
 		  __entry->state,
+		  __entry->new_startoff,
 		  __entry->new_startblock,
-		  __entry->new_blockcount)
+		  __entry->new_blockcount,
+		  __entry->new_state)
 );
 
 TRACE_EVENT(xrep_cow_free_staging,
@@ -3536,10 +3579,12 @@ DEFINE_EVENT(xrep_iunlink_resolve_class, name, \
 	TP_PROTO(const struct xfs_perag *pag, unsigned int bucket, \
 		 xfs_agino_t prev_agino, xfs_agino_t next_agino), \
 	TP_ARGS(pag, bucket, prev_agino, next_agino))
+DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_infinite_loop);
 DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_uncached);
 DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_wronglist);
 DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_nolist);
 DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_ok);
+DEFINE_REPAIR_IUNLINK_RESOLVE_EVENT(xrep_iunlink_resolve_allocated);
 
 TRACE_EVENT(xrep_iunlink_relink_next,
 	TP_PROTO(struct xfs_inode *ip, xfs_agino_t next_agino),

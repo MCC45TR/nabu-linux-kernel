@@ -97,11 +97,7 @@ static int dsi_get_version(const void __iomem *base, u32 *major, u32 *minor)
 		(DSI_CLK_CTRL_AHBS_HCLK_ON | DSI_CLK_CTRL_AHBM_SCLK_ON | \
 		DSI_CLK_CTRL_PCLK_ON | DSI_CLK_CTRL_DSICLK_ON | \
 		DSI_CLK_CTRL_BYTECLK_ON | DSI_CLK_CTRL_ESCCLK_ON | \
-		 DSI_CLK_CTRL_FORCE_ON_DYN_AHBM_HCLK)
-
-/* DSI 6G v2.x timing shadow database used for porch-only DFPS updates. */
-#define REG_DSI_TIMING_DB_TRIGGER		0x01e4
-#define REG_DSI_TIMING_DB_MODE			0x01e8
+		DSI_CLK_CTRL_FORCE_ON_DYN_AHBM_HCLK)
 
 struct msm_dsi_host {
 	struct mipi_dsi_host base;
@@ -169,9 +165,6 @@ struct msm_dsi_host {
 	struct regmap *sfpb;
 
 	struct drm_display_mode *mode;
-	/* Timing staged in the 6G shadow database, not active on the link yet. */
-	struct drm_display_mode *seamless_mode;
-	bool seamless_staged;
 	struct drm_dsc_config *dsc;
 
 	/* connected device info */
@@ -576,6 +569,7 @@ void dsi_link_clk_disable_v2(struct msm_dsi_host *msm_host)
  * dsi_adjust_pclk_for_compression() - Adjust the pclk rate for compression case
  * @mode: The selected mode for the DSI output
  * @dsc: DRM DSC configuration for this DSI output
+ * @is_bonded_dsi: True if two DSI controllers are bonded
  *
  * Adjust the pclk rate by calculating a new hdisplay proportional to
  * the compression ratio such that:
@@ -591,13 +585,30 @@ void dsi_link_clk_disable_v2(struct msm_dsi_host *msm_host)
  *  FIXME: Reconsider this if/when CMD mode handling is rewritten to use
  *  transfer time and data overhead as a starting point of the calculations.
  */
-static unsigned long dsi_adjust_pclk_for_compression(const struct drm_display_mode *mode,
-		const struct drm_dsc_config *dsc)
+static unsigned long
+dsi_adjust_pclk_for_compression(const struct drm_display_mode *mode,
+				const struct drm_dsc_config *dsc,
+				bool is_bonded_dsi)
 {
-	int new_hdisplay = DIV_ROUND_UP(mode->hdisplay * drm_dsc_get_bpp_int(dsc),
-			dsc->bits_per_component * 3);
+	int hdisplay, new_hdisplay, new_htotal;
 
-	int new_htotal = mode->htotal - mode->hdisplay + new_hdisplay;
+	/*
+	 * For bonded DSI, split hdisplay across two links and round up each
+	 * half separately, passing the full hdisplay would only round up once.
+	 * This also aligns with the hdisplay we program later in
+	 * dsi_timing_setup()
+	 */
+	hdisplay = mode->hdisplay;
+	if (is_bonded_dsi)
+		hdisplay /= 2;
+
+	new_hdisplay = DIV_ROUND_UP(hdisplay * drm_dsc_get_bpp_int(dsc),
+				    dsc->bits_per_component * 3);
+
+	if (is_bonded_dsi)
+		new_hdisplay *= 2;
+
+	new_htotal = mode->htotal - mode->hdisplay + new_hdisplay;
 
 	return mult_frac(mode->clock * 1000u, new_htotal, mode->htotal);
 }
@@ -610,7 +621,7 @@ static unsigned long dsi_get_pclk_rate(const struct drm_display_mode *mode,
 	pclk_rate = mode->clock * 1000u;
 
 	if (dsc)
-		pclk_rate = dsi_adjust_pclk_for_compression(mode, dsc);
+		pclk_rate = dsi_adjust_pclk_for_compression(mode, dsc, is_bonded_dsi);
 
 	/*
 	 * For bonded DSI mode, the current DRM mode has the complete width of the
@@ -1000,7 +1011,7 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 
 	if (msm_host->dsc) {
 		struct drm_dsc_config *dsc = msm_host->dsc;
-		u32 bytes_per_pclk;
+		u32 bits_per_pclk;
 
 		/* update dsc params with timing params */
 		if (!dsc || !mode->hdisplay || !mode->vdisplay) {
@@ -1022,7 +1033,10 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 
 		/*
 		 * DPU sends 3 bytes per pclk cycle to DSI. If widebus is
-		 * enabled, bus width is extended to 6 bytes.
+		 * enabled, MDP always sends out 48-bit compressed data per
+		 * pclk and on average, for video mode, DSI consumes only an
+		 * amount of compressed data equivalent to the uncompressed
+		 * pixel depth per pclk.
 		 *
 		 * Calculate the number of pclks needed to transmit one line of
 		 * the compressed data.
@@ -1034,12 +1048,16 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 		 * unused anyway.
 		 */
 		h_total -= hdisplay;
-		if (wide_bus_enabled && !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
-			bytes_per_pclk = 6;
-		else
-			bytes_per_pclk = 3;
+		if (wide_bus_enabled) {
+			if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)
+				bits_per_pclk = dsc->bits_per_component * 3;
+			else
+				bits_per_pclk = 48;
+		} else {
+			bits_per_pclk = 24;
+		}
 
-		hdisplay = DIV_ROUND_UP(msm_dsc_get_bytes_per_line(msm_host->dsc), bytes_per_pclk);
+		hdisplay = DIV_ROUND_UP(msm_dsc_get_bytes_per_line(msm_host->dsc) * 8, bits_per_pclk);
 
 		h_total += hdisplay;
 		ha_end = ha_start + hdisplay;
@@ -1185,24 +1203,9 @@ static void dsi_wait4video_done(struct msm_dsi_host *msm_host)
 
 static void dsi_wait4video_eng_busy(struct msm_dsi_host *msm_host)
 {
-	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	u32 data;
 
 	if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
-		return;
-
-	/*
-	 * DSI 6G v1.2 and newer can hold a command DMA trigger until the
-	 * active video frame has finished.  dsi_host_config() enables that
-	 * behaviour with DSI_TRIG_CTRL_BLOCK_DMA_WITHIN_FRAME.  Waiting for a
-	 * VIDEO_DONE interrupt in software as well is both redundant and
-	 * unreliable during a porch-only timing database switch: the interrupt
-	 * can belong to the frame which latched the new timing and be observed
-	 * before this waiter is armed.  Let the hardware place the command in
-	 * the following blanking interval instead.
-	 */
-	if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G &&
-	    cfg_hnd->minor >= MSM_DSI_6G_VER_MINOR_V1_2)
 		return;
 
 	data = dsi_read(msm_host, REG_DSI_STATUS0);
@@ -2000,6 +2003,7 @@ int msm_dsi_host_init(struct msm_dsi *msm_dsi)
 
 	/* fixup base address by io offset */
 	msm_host->ctrl_base += cfg->io_offset;
+	msm_host->ctrl_size -= cfg->io_offset;
 
 	ret = devm_regulator_bulk_get_const(&pdev->dev, cfg->num_regulators,
 					    cfg->regulator_data,
@@ -2556,144 +2560,6 @@ int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 	}
 
 	return 0;
-}
-
-int msm_dsi_host_set_display_mode_seamless(struct mipi_dsi_host *host,
-					   const struct drm_display_mode *mode,
-					   bool is_bonded_dsi)
-{
-	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
-	struct drm_display_mode *new_mode;
-	struct drm_display_mode *active_mode;
-	int ret = 0;
-
-	new_mode = drm_mode_duplicate(msm_host->dev, mode);
-	if (!new_mode)
-		return -ENOMEM;
-
-	mutex_lock(&msm_host->dev_mutex);
-	active_mode = msm_host->mode;
-	if (!active_mode || active_mode->clock != mode->clock ||
-	    active_mode->hdisplay != mode->hdisplay ||
-	    active_mode->hsync_start != mode->hsync_start ||
-	    active_mode->hsync_end != mode->hsync_end ||
-	    active_mode->htotal != mode->htotal ||
-	    active_mode->vdisplay != mode->vdisplay ||
-	    active_mode->vsync_end - active_mode->vsync_start !=
-		mode->vsync_end - mode->vsync_start ||
-	    active_mode->vtotal - active_mode->vsync_end !=
-		mode->vtotal - mode->vsync_end ||
-	    active_mode->vsync_start == mode->vsync_start) {
-		ret = -EOPNOTSUPP;
-		goto out_destroy;
-	}
-
-	if (msm_host->seamless_mode) {
-		ret = -EBUSY;
-		goto out_destroy;
-	}
-
-	if (!msm_host->power_on || !msm_host->enabled) {
-		ret = -EPIPE;
-		goto out_destroy;
-	}
-
-	/*
-	 * Queue the new timing only. The panel bridge follows this bridge in
-	 * drm_bridge_chain_mode_set() and must still issue its TDDI scan-rate
-	 * DCS commands while the normal video-done interrupt is live. The
-	 * shadow timing database is armed after the complete bridge chain.
-	 */
-	msm_host->seamless_mode = new_mode;
-	mutex_unlock(&msm_host->dev_mutex);
-
-	return 0;
-
-out_destroy:
-	mutex_unlock(&msm_host->dev_mutex);
-	drm_mode_destroy(msm_host->dev, new_mode);
-	return ret;
-}
-
-bool msm_dsi_host_seamless_ready(struct mipi_dsi_host *host)
-{
-	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
-	bool ready;
-
-	mutex_lock(&msm_host->dev_mutex);
-	ready = msm_host->power_on && msm_host->enabled &&
-		msm_host->seamless_mode && !msm_host->seamless_staged;
-	mutex_unlock(&msm_host->dev_mutex);
-
-	return ready;
-}
-
-int msm_dsi_host_stage_seamless(struct mipi_dsi_host *host,
-					bool is_bonded_dsi)
-{
-	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
-	struct drm_display_mode *active_mode;
-	int ret = 0;
-
-	mutex_lock(&msm_host->dev_mutex);
-	if (!msm_host->power_on || !msm_host->enabled ||
-	    !msm_host->seamless_mode) {
-		ret = -EPIPE;
-		goto out;
-	}
-	if (msm_host->seamless_staged) {
-		ret = -EBUSY;
-		goto out;
-	}
-
-	active_mode = msm_host->mode;
-	msm_host->mode = msm_host->seamless_mode;
-	dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 1);
-	dsi_timing_setup(msm_host, is_bonded_dsi);
-	msm_host->mode = active_mode;
-
-	/*
-	 * Enabling the timing database only redirects timing writes to the
-	 * shadow bank.  DSI 6G requires a separate trigger at 0x1e4 to arm
-	 * those values for the next video frame boundary.  Without this write
-	 * DRM reports the new mode while scanout remains at the old refresh.
-	 */
-	wmb();
-	dsi_write(msm_host, REG_DSI_TIMING_DB_TRIGGER, 1);
-	wmb();
-	msm_host->seamless_staged = true;
-
-out:
-	mutex_unlock(&msm_host->dev_mutex);
-	return ret;
-}
-
-void msm_dsi_host_complete_seamless(struct mipi_dsi_host *host)
-{
-	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
-
-	mutex_lock(&msm_host->dev_mutex);
-	if (msm_host->power_on && msm_host->seamless_mode &&
-	    msm_host->seamless_staged) {
-		/*
-		 * The atomic commit tail has waited for a real CRTC vblank after
-		 * the DPU flush. Release the DSI timing database at that proven
-		 * frame boundary instead of relying on a refresh-rate-dependent
-		 * fixed delay.
-		 */
-		dsi_write(msm_host, REG_DSI_TIMING_DB_MODE, 0);
-		wmb();
-
-		drm_mode_destroy(msm_host->dev, msm_host->mode);
-		msm_host->mode = msm_host->seamless_mode;
-		msm_host->seamless_mode = NULL;
-		msm_host->seamless_staged = false;
-	} else if (msm_host->seamless_mode) {
-		drm_mode_destroy(msm_host->dev, msm_host->seamless_mode);
-		msm_host->seamless_mode = NULL;
-		msm_host->seamless_staged = false;
-	}
-	mutex_unlock(&msm_host->dev_mutex);
 }
 
 enum drm_mode_status msm_dsi_host_check_dsc(struct mipi_dsi_host *host,

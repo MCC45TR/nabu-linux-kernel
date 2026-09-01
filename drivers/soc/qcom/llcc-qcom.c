@@ -3394,7 +3394,7 @@ static const struct llcc_slice_config x1e80100_data[] = {
 static const struct llcc_edac_reg_offset llcc_v1_edac_reg_offset = {
 	.trp_ecc_error_status0 = 0x20344,
 	.trp_ecc_error_status1 = 0x20348,
-	.trp_ecc_sb_err_syn0 = 0x2304c,
+	.trp_ecc_sb_err_syn0 = 0x2034c,
 	.trp_ecc_db_err_syn0 = 0x20370,
 	.trp_ecc_error_cntr_clear = 0x20440,
 	.trp_interrupt_0_status = 0x20480,
@@ -4409,7 +4409,6 @@ static struct regmap *qcom_llcc_init_mmio(struct platform_device *pdev, u8 index
 		.reg_bits = 32,
 		.reg_stride = 4,
 		.val_bits = 32,
-		.fast_io = true,
 	};
 
 	base = devm_platform_ioremap_resource(pdev, index);

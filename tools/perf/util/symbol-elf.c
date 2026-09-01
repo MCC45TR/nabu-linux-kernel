@@ -9,6 +9,7 @@
 
 #include "compress.h"
 #include "dso.h"
+#include "libbfd.h"
 #include "map.h"
 #include "maps.h"
 #include "symbol.h"
@@ -23,18 +24,6 @@
 #include <linux/string.h>
 #include <symbol/kallsyms.h>
 #include <internal/lib.h>
-
-#ifdef HAVE_LIBBFD_SUPPORT
-#define PACKAGE 'perf'
-#include <bfd.h>
-#endif
-
-#if defined(HAVE_LIBBFD_SUPPORT) || defined(HAVE_CPLUS_DEMANGLE_SUPPORT)
-#ifndef DMGL_PARAMS
-#define DMGL_PARAMS     (1 << 0)  /* Include function args */
-#define DMGL_ANSI       (1 << 1)  /* Include const, volatile, etc */
-#endif
-#endif
 
 #ifndef EM_AARCH64
 #define EM_AARCH64	183  /* ARM 64 bit */
@@ -228,7 +217,7 @@ bool filename__has_section(const char *filename, const char *sec)
 	GElf_Shdr shdr;
 	bool found = false;
 
-	fd = open(filename, O_RDONLY);
+	fd = open(filename, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return false;
 
@@ -847,9 +836,23 @@ static int elf_read_build_id(Elf *elf, void *bf, size_t size)
 	ptr = data->d_buf;
 	while (ptr < (data->d_buf + data->d_size)) {
 		GElf_Nhdr *nhdr = ptr;
-		size_t namesz = NOTE_ALIGN(nhdr->n_namesz),
-		       descsz = NOTE_ALIGN(nhdr->n_descsz);
+		size_t namesz, descsz, remaining;
 		const char *name;
+
+		/* ensure the note header fits within the section */
+		if (ptr + sizeof(*nhdr) > data->d_buf + data->d_size)
+			break;
+
+		namesz = NOTE_ALIGN(nhdr->n_namesz);
+		descsz = NOTE_ALIGN(nhdr->n_descsz);
+
+		/* validate individually to avoid size_t overflow on 32-bit */
+		remaining = data->d_buf + data->d_size - ptr - sizeof(*nhdr);
+		if (namesz > remaining || descsz > remaining - namesz) {
+			pr_warning("%s: oversized note: n_namesz=%u, n_descsz=%u\n",
+				   __func__, nhdr->n_namesz, nhdr->n_descsz);
+			break;
+		}
 
 		ptr += sizeof(*nhdr);
 		name = ptr;
@@ -871,51 +874,20 @@ out:
 	return err;
 }
 
-#ifdef HAVE_LIBBFD_BUILDID_SUPPORT
-
-static int read_build_id(const char *filename, struct build_id *bid, bool block)
+static int read_build_id(const char *filename, struct build_id *bid)
 {
 	size_t size = sizeof(bid->data);
-	int err = -1, fd;
-	bfd *abfd;
-
-	fd = open(filename, block ? O_RDONLY : (O_RDONLY | O_NONBLOCK));
-	if (fd < 0)
-		return -1;
-
-	abfd = bfd_fdopenr(filename, /*target=*/NULL, fd);
-	if (!abfd)
-		return -1;
-
-	if (!bfd_check_format(abfd, bfd_object)) {
-		pr_debug2("%s: cannot read %s bfd file.\n", __func__, filename);
-		goto out_close;
-	}
-
-	if (!abfd->build_id || abfd->build_id->size > size)
-		goto out_close;
-
-	memcpy(bid->data, abfd->build_id->data, abfd->build_id->size);
-	memset(bid->data + abfd->build_id->size, 0, size - abfd->build_id->size);
-	err = bid->size = abfd->build_id->size;
-
-out_close:
-	bfd_close(abfd);
-	return err;
-}
-
-#else // HAVE_LIBBFD_BUILDID_SUPPORT
-
-static int read_build_id(const char *filename, struct build_id *bid, bool block)
-{
-	size_t size = sizeof(bid->data);
-	int fd, err = -1;
+	int fd, err;
 	Elf *elf;
+
+	err = libbfd__read_build_id(filename, bid);
+	if (err >= 0)
+		goto out;
 
 	if (size < BUILD_ID_SIZE)
 		goto out;
 
-	fd = open(filename, block ? O_RDONLY : (O_RDONLY | O_NONBLOCK));
+	fd = open(filename, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		goto out;
 
@@ -936,9 +908,7 @@ out:
 	return err;
 }
 
-#endif // HAVE_LIBBFD_BUILDID_SUPPORT
-
-int filename__read_build_id(const char *filename, struct build_id *bid, bool block)
+int filename__read_build_id(const char *filename, struct build_id *bid)
 {
 	struct kmod_path m = { .name = NULL, };
 	char path[PATH_MAX];
@@ -946,6 +916,10 @@ int filename__read_build_id(const char *filename, struct build_id *bid, bool blo
 
 	if (!filename)
 		return -EFAULT;
+
+	errno = 0;
+	if (!is_regular_file(filename))
+		return errno == 0 ? -EWOULDBLOCK : -errno;
 
 	err = kmod_path__parse(&m, filename);
 	if (err)
@@ -961,13 +935,14 @@ int filename__read_build_id(const char *filename, struct build_id *bid, bool blo
 			return -1;
 		}
 		close(fd);
-		filename = path;
-		block = true;
+		/* non-empty path means a temp file was created */
+		if (path[0] != '\0')
+			filename = path;
 	}
 
-	err = read_build_id(filename, bid, block);
+	err = read_build_id(filename, bid);
 
-	if (m.comp)
+	if (m.comp && filename == path)
 		unlink(filename);
 	return err;
 }
@@ -977,7 +952,7 @@ int sysfs__read_build_id(const char *filename, struct build_id *bid)
 	size_t size = sizeof(bid->data);
 	int fd, err = -1;
 
-	fd = open(filename, O_RDONLY);
+	fd = open(filename, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		goto out;
 
@@ -1003,17 +978,28 @@ int sysfs__read_build_id(const char *filename, struct build_id *bid)
 					err = 0;
 					break;
 				}
-			} else if (read(fd, bf, descsz) != (ssize_t)descsz)
-				break;
+			} else {
+				/* descsz from untrusted file — clamp to buffer */
+				if (descsz > sizeof(bf))
+					break;
+				if (read(fd, bf, descsz) != (ssize_t)descsz)
+					break;
+			}
 		} else {
-			int n = namesz + descsz;
+			size_t n;
 
-			if (n > (int)sizeof(bf)) {
+			/* int sum of namesz+descsz can overflow negative, bypassing size check */
+			if (namesz > sizeof(bf) || descsz > sizeof(bf) - namesz) {
 				n = sizeof(bf);
 				pr_debug("%s: truncating reading of build id in sysfs file %s: n_namesz=%u, n_descsz=%u.\n",
 					 __func__, filename, nhdr.n_namesz, nhdr.n_descsz);
+			} else {
+				n = namesz + descsz;
 			}
-			if (read(fd, bf, n) != n)
+			/* no valid note has both namesz and descsz zero */
+			if (n == 0)
+				break;
+			if (read(fd, bf, n) != (ssize_t)n)
 				break;
 		}
 	}
@@ -1021,44 +1007,6 @@ int sysfs__read_build_id(const char *filename, struct build_id *bid)
 out:
 	return err;
 }
-
-#ifdef HAVE_LIBBFD_SUPPORT
-
-int filename__read_debuglink(const char *filename, char *debuglink,
-			     size_t size)
-{
-	int err = -1;
-	asection *section;
-	bfd *abfd;
-
-	abfd = bfd_openr(filename, NULL);
-	if (!abfd)
-		return -1;
-
-	if (!bfd_check_format(abfd, bfd_object)) {
-		pr_debug2("%s: cannot read %s bfd file.\n", __func__, filename);
-		goto out_close;
-	}
-
-	section = bfd_get_section_by_name(abfd, ".gnu_debuglink");
-	if (!section)
-		goto out_close;
-
-	if (section->size > size)
-		goto out_close;
-
-	if (!bfd_get_section_contents(abfd, section, debuglink, 0,
-				      section->size))
-		goto out_close;
-
-	err = 0;
-
-out_close:
-	bfd_close(abfd);
-	return err;
-}
-
-#else
 
 int filename__read_debuglink(const char *filename, char *debuglink,
 			     size_t size)
@@ -1071,7 +1019,11 @@ int filename__read_debuglink(const char *filename, char *debuglink,
 	Elf_Scn *sec;
 	Elf_Kind ek;
 
-	fd = open(filename, O_RDONLY);
+	err = libbfd_filename__read_debuglink(filename, debuglink, size);
+	if (err >= 0)
+		goto out;
+
+	fd = open(filename, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		goto out;
 
@@ -1100,7 +1052,14 @@ int filename__read_debuglink(const char *filename, char *debuglink,
 		goto out_elf_end;
 
 	/* the start of this section is a zero-terminated string */
-	strncpy(debuglink, data->d_buf, size);
+	if (data->d_size > 0) {
+		size_t len = min(size - 1, data->d_size);
+
+		memcpy(debuglink, data->d_buf, len);
+		debuglink[len] = '\0';
+	} else {
+		debuglink[0] = '\0';
+	}
 
 	err = 0;
 
@@ -1111,8 +1070,6 @@ out_close:
 out:
 	return err;
 }
-
-#endif
 
 bool symsrc__possibly_runtime(struct symsrc *ss)
 {
@@ -1182,14 +1139,14 @@ static Elf *read_gnu_debugdata(struct dso *dso, Elf *elf, const char *name, int 
 
 	wrapped = fmemopen(scn_data->d_buf, scn_data->d_size, "r");
 	if (!wrapped) {
-		pr_debug("%s: fmemopen: %s\n", __func__, strerror(errno));
+		pr_debug("%s: fmemopen: %m\n", __func__);
 		*dso__load_errno(dso) = -errno;
 		return NULL;
 	}
 
 	temp_fd = mkstemp(temp_filename);
 	if (temp_fd < 0) {
-		pr_debug("%s: mkstemp: %s\n", __func__, strerror(errno));
+		pr_debug("%s: mkstemp: %m\n", __func__);
 		*dso__load_errno(dso) = -errno;
 		fclose(wrapped);
 		return NULL;
@@ -1231,7 +1188,7 @@ int symsrc__init(struct symsrc *ss, struct dso *dso, const char *name,
 
 		type = dso__symtab_type(dso);
 	} else {
-		fd = open(name, O_RDONLY);
+		fd = open(name, O_RDONLY | O_CLOEXEC);
 		if (fd < 0) {
 			*dso__load_errno(dso) = errno;
 			return -1;
@@ -1250,7 +1207,7 @@ int symsrc__init(struct symsrc *ss, struct dso *dso, const char *name,
 		Elf *embedded = read_gnu_debugdata(dso, elf, name, &new_fd);
 
 		if (!embedded)
-			goto out_close;
+			goto out_elf_end;
 
 		elf_end(elf);
 		close(fd);
@@ -1433,8 +1390,12 @@ static int dso__process_kernel_symbol(struct dso *dso, struct map *map,
 	char dso_name[PATH_MAX];
 
 	/* Adjust symbol to map to file offset */
-	if (adjust_kernel_syms)
-		sym->st_value -= shdr->sh_addr - shdr->sh_offset;
+	if (adjust_kernel_syms) {
+		if (dso__rel(dso))
+			sym->st_value += shdr->sh_offset;
+		else
+			sym->st_value -= shdr->sh_addr - shdr->sh_offset;
+	}
 
 	if (strcmp(section_name, (dso__short_name(curr_dso) + dso__short_name_len(dso))) == 0)
 		return 0;
@@ -2017,7 +1978,7 @@ static int kcore__open(struct kcore *kcore, const char *filename)
 {
 	GElf_Ehdr *ehdr;
 
-	kcore->fd = open(filename, O_RDONLY);
+	kcore->fd = open(filename, O_RDONLY | O_CLOEXEC);
 	if (kcore->fd == -1)
 		return -1;
 
@@ -2050,7 +2011,7 @@ static int kcore__init(struct kcore *kcore, char *filename, int elfclass,
 	if (temp)
 		kcore->fd = mkstemp(filename);
 	else
-		kcore->fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0400);
+		kcore->fd = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0400);
 	if (kcore->fd == -1)
 		return -1;
 
@@ -2526,11 +2487,11 @@ static int kcore_copy__compare_files(const char *from_filename,
 {
 	int from, to, err = -1;
 
-	from = open(from_filename, O_RDONLY);
+	from = open(from_filename, O_RDONLY | O_CLOEXEC);
 	if (from < 0)
 		return -1;
 
-	to = open(to_filename, O_RDONLY);
+	to = open(to_filename, O_RDONLY | O_CLOEXEC);
 	if (to < 0)
 		goto out_close_from;
 
@@ -2948,7 +2909,7 @@ int get_sdt_note_list(struct list_head *head, const char *target)
 	Elf *elf;
 	int fd, ret;
 
-	fd = open(target, O_RDONLY);
+	fd = open(target, O_RDONLY | O_CLOEXEC);
 	if (fd < 0)
 		return -EBADF;
 

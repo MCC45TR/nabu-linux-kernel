@@ -1485,6 +1485,8 @@ static const struct ptp_clock_info ptp_ocp_clock_info = {
 	.pps		= true,
 	.n_ext_ts	= 6,
 	.n_per_out	= 5,
+	.supported_extts_flags = PTP_STRICT_FLAGS | PTP_RISING_EDGE,
+	.supported_perout_flags = PTP_PEROUT_DUTY_CYCLE | PTP_PEROUT_PHASE,
 };
 
 static void
@@ -1914,9 +1916,11 @@ ptp_ocp_devlink_info_get(struct devlink *devlink, struct devlink_info_req *req,
 	if (err)
 		return err;
 
+	snprintf(buf, sizeof(buf), "%.*s", OCP_BOARD_ID_LEN,
+		 (const char *)bp->board_id);
 	err = devlink_info_version_fixed_put(req,
 			DEVLINK_INFO_VERSION_GENERIC_BOARD_ID,
-			bp->board_id);
+			buf);
 	if (err)
 		return err;
 
@@ -2094,10 +2098,6 @@ ptp_ocp_signal_from_perout(struct ptp_ocp *bp, int gen,
 			   struct ptp_perout_request *req)
 {
 	struct ptp_ocp_signal s = { };
-
-	if (req->flags & ~(PTP_PEROUT_DUTY_CYCLE |
-			   PTP_PEROUT_PHASE))
-		return -EOPNOTSUPP;
 
 	s.polarity = bp->signal[gen].polarity;
 	s.period = ktime_set(req->period.sec, req->period.nsec);
@@ -2550,7 +2550,7 @@ ptp_ocp_sma_fb_init(struct ptp_ocp *bp)
 		for (i = 0; i < OCP_SMA_NUM; i++) {
 			bp->sma[i].fixed_fcn = true;
 			bp->sma[i].fixed_dir = true;
-			bp->sma[1].dpll_prop.capabilities &=
+			bp->sma[i].dpll_prop.capabilities &=
 				~DPLL_PIN_CAPABILITIES_DIRECTION_CAN_CHANGE;
 		}
 		return;

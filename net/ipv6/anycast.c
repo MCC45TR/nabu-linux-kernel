@@ -104,7 +104,7 @@ int ipv6_sock_ac_join(struct sock *sk, int ifindex, const struct in6_addr *addr)
 		rcu_read_lock();
 		rt = rt6_lookup(net, addr, NULL, 0, NULL, 0);
 		if (rt) {
-			dev = dst_dev(&rt->dst);
+			dev = dst_dev_rcu(&rt->dst);
 			netdev_hold(dev, &dev_tracker, GFP_ATOMIC);
 			ip6_rt_put(rt);
 		} else if (ishost) {
@@ -243,16 +243,16 @@ static void ipv6_add_acaddr_hash(struct net *net, struct ifacaddr6 *aca)
 {
 	unsigned int hash = inet6_acaddr_hash(net, &aca->aca_addr);
 
-	spin_lock(&acaddr_hash_lock);
+	spin_lock_bh(&acaddr_hash_lock);
 	hlist_add_head_rcu(&aca->aca_addr_lst, &inet6_acaddr_lst[hash]);
-	spin_unlock(&acaddr_hash_lock);
+	spin_unlock_bh(&acaddr_hash_lock);
 }
 
 static void ipv6_del_acaddr_hash(struct ifacaddr6 *aca)
 {
-	spin_lock(&acaddr_hash_lock);
+	spin_lock_bh(&acaddr_hash_lock);
 	hlist_del_init_rcu(&aca->aca_addr_lst);
-	spin_unlock(&acaddr_hash_lock);
+	spin_unlock_bh(&acaddr_hash_lock);
 }
 
 static void aca_get(struct ifacaddr6 *aca)
@@ -371,9 +371,9 @@ int __ipv6_dev_ac_inc(struct inet6_dev *idev, const struct in6_addr *addr)
 	aca->aca_next = idev->ac_list;
 	rcu_assign_pointer(idev->ac_list, aca);
 
-	write_unlock_bh(&idev->lock);
-
 	ipv6_add_acaddr_hash(net, aca);
+
+	write_unlock_bh(&idev->lock);
 
 	ip6_ins_rt(net, f6i);
 
@@ -649,8 +649,8 @@ void ipv6_anycast_cleanup(void)
 {
 	int i;
 
-	spin_lock(&acaddr_hash_lock);
+	spin_lock_bh(&acaddr_hash_lock);
 	for (i = 0; i < IN6_ADDR_HSIZE; i++)
 		WARN_ON(!hlist_empty(&inet6_acaddr_lst[i]));
-	spin_unlock(&acaddr_hash_lock);
+	spin_unlock_bh(&acaddr_hash_lock);
 }

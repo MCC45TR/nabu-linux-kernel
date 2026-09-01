@@ -34,10 +34,7 @@ int iris_get_mbpf(struct iris_inst *inst)
 
 bool iris_split_mode_enabled(struct iris_inst *inst)
 {
-	u32 pixelformat = inst->fmt_dst->fmt.pix_mp.pixelformat;
-
-	return pixelformat == V4L2_PIX_FMT_NV12 ||
-	       pixelformat == V4L2_PIX_FMT_P010;
+	return inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_NV12;
 }
 
 void iris_helper_buffers_done(struct iris_inst *inst, unsigned int type,
@@ -99,12 +96,8 @@ int iris_check_core_mbpf(struct iris_inst *inst)
 	u32 total_mbpf = 0;
 
 	mutex_lock(&core->lock);
-	list_for_each_entry(instance, &core->instances, list) {
-		if (instance != inst && !instance->hfi_session_opened)
-			continue;
-
+	list_for_each_entry(instance, &core->instances, list)
 		total_mbpf += iris_get_mbpf(instance);
-	}
 	mutex_unlock(&core->lock);
 
 	if (total_mbpf > core->iris_platform_data->max_core_mbpf)
@@ -121,9 +114,6 @@ int iris_check_core_mbps(struct iris_inst *inst)
 
 	mutex_lock(&core->lock);
 	list_for_each_entry(instance, &core->instances, list) {
-		if (instance != inst && !instance->hfi_session_opened)
-			continue;
-
 		fps = max(instance->frame_rate, instance->operating_rate);
 		total_mbps += iris_get_mbpf(instance) * fps;
 	}

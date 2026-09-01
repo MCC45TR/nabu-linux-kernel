@@ -323,7 +323,6 @@ static struct super_block *alloc_super(struct file_system_type *type, int flags,
 	if (!s)
 		return NULL;
 
-	INIT_LIST_HEAD(&s->s_mounts);
 	s->s_user_ns = get_user_ns(user_ns);
 	init_rwsem(&s->s_umount);
 	lockdep_set_class(&s->s_umount, &type->s_umount_key);
@@ -408,7 +407,7 @@ static void __put_super(struct super_block *s)
 		list_del_init(&s->s_list);
 		WARN_ON(s->s_dentry_lru.node);
 		WARN_ON(s->s_inode_lru.node);
-		WARN_ON(!list_empty(&s->s_mounts));
+		WARN_ON(s->s_mounts);
 		call_rcu(&s->rcu, destroy_super_rcu);
 	}
 }
@@ -738,12 +737,13 @@ struct super_block *sget_fc(struct fs_context *fc,
 	int err;
 
 	/*
-	 * Never allow s_user_ns != &init_user_ns when FS_USERNS_MOUNT is
-	 * not set, as the filesystem is likely unprepared to handle it.
-	 * This can happen when fsconfig() is called from init_user_ns with
-	 * an fs_fd opened in another user namespace.
+	 * Never allow s_user_ns != &init_user_ns when FS_USERNS_MOUNT or
+	 * FS_USERNS_DELEGATABLE is not set, as the filesystem is likely
+	 * unprepared to handle it. This can happen when fsconfig() is called
+	 * from init_user_ns with an fs_fd opened in another user namespace.
 	 */
-	if (user_ns != &init_user_ns && !(fc->fs_type->fs_flags & FS_USERNS_MOUNT)) {
+	if (user_ns != &init_user_ns &&
+	    !(fc->fs_type->fs_flags & (FS_USERNS_MOUNT | FS_USERNS_DELEGATABLE))) {
 		errorfc(fc, "VFS: Mounting from non-initial user namespace is not allowed");
 		return ERR_PTR(-EPERM);
 	}
@@ -1139,18 +1139,35 @@ void emergency_remount(void)
 	}
 }
 
+static inline bool get_active_super(struct super_block *sb)
+{
+	bool active = false;
+
+	if (super_lock_excl(sb)) {
+		active = atomic_inc_not_zero(&sb->s_active);
+		super_unlock_excl(sb);
+	}
+	return active;
+}
+
 static void do_thaw_all_callback(struct super_block *sb, void *unused)
 {
+	if (!get_active_super(sb))
+		return;
+
+	/* fs_bdev_thaw() acquires s_umount so it must not be held here */
 	if (IS_ENABLED(CONFIG_BLOCK))
 		while (sb->s_bdev && !bdev_thaw(sb->s_bdev))
 			pr_warn("Emergency Thaw on %pg\n", sb->s_bdev);
-	thaw_super_locked(sb, FREEZE_HOLDER_USERSPACE, NULL);
-	return;
+
+	if (super_lock_excl(sb))
+		thaw_super_locked(sb, FREEZE_HOLDER_USERSPACE, NULL);
+	deactivate_super(sb);
 }
 
 static void do_thaw_all(struct work_struct *work)
 {
-	__iterate_supers(do_thaw_all_callback, NULL, SUPER_ITER_EXCL);
+	__iterate_supers(do_thaw_all_callback, NULL, SUPER_ITER_UNLOCKED);
 	kfree(work);
 	printk(KERN_WARNING "Emergency Thaw complete\n");
 }
@@ -1171,22 +1188,14 @@ void emergency_thaw_all(void)
 	}
 }
 
-static inline bool get_active_super(struct super_block *sb)
-{
-	bool active = false;
-
-	if (super_lock_excl(sb)) {
-		active = atomic_inc_not_zero(&sb->s_active);
-		super_unlock_excl(sb);
-	}
-	return active;
-}
-
 static const char *filesystems_freeze_ptr = "filesystems_freeze";
 
-static void filesystems_freeze_callback(struct super_block *sb, void *unused)
+static void filesystems_freeze_callback(struct super_block *sb, void *freeze_all_ptr)
 {
 	if (!sb->s_op->freeze_fs && !sb->s_op->freeze_super)
+		return;
+
+	if (!freeze_all_ptr && !(sb->s_type->fs_flags & FS_POWER_FREEZE))
 		return;
 
 	if (!get_active_super(sb))
@@ -1202,9 +1211,13 @@ static void filesystems_freeze_callback(struct super_block *sb, void *unused)
 	deactivate_super(sb);
 }
 
-void filesystems_freeze(void)
+void filesystems_freeze(bool freeze_all)
 {
-	__iterate_supers(filesystems_freeze_callback, NULL,
+	void *freeze_all_ptr = NULL;
+
+	if (freeze_all)
+		freeze_all_ptr = &freeze_all;
+	__iterate_supers(filesystems_freeze_callback, freeze_all_ptr,
 			 SUPER_ITER_UNLOCKED | SUPER_ITER_REVERSE);
 }
 
@@ -1716,49 +1729,6 @@ int get_tree_bdev(struct fs_context *fc,
 }
 EXPORT_SYMBOL(get_tree_bdev);
 
-static int test_bdev_super(struct super_block *s, void *data)
-{
-	return !(s->s_iflags & SB_I_RETIRED) && s->s_dev == *(dev_t *)data;
-}
-
-struct dentry *mount_bdev(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data,
-	int (*fill_super)(struct super_block *, void *, int))
-{
-	struct super_block *s;
-	int error;
-	dev_t dev;
-
-	error = lookup_bdev(dev_name, &dev);
-	if (error)
-		return ERR_PTR(error);
-
-	flags |= SB_NOSEC;
-	s = sget(fs_type, test_bdev_super, set_bdev_super, flags, &dev);
-	if (IS_ERR(s))
-		return ERR_CAST(s);
-
-	if (s->s_root) {
-		if ((flags ^ s->s_flags) & SB_RDONLY) {
-			deactivate_locked_super(s);
-			return ERR_PTR(-EBUSY);
-		}
-	} else {
-		error = setup_bdev_super(s, flags, NULL);
-		if (!error)
-			error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
-		if (error) {
-			deactivate_locked_super(s);
-			return ERR_PTR(error);
-		}
-
-		s->s_flags |= SB_ACTIVE;
-	}
-
-	return dget(s->s_root);
-}
-EXPORT_SYMBOL(mount_bdev);
-
 void kill_block_super(struct super_block *sb)
 {
 	struct block_device *bdev = sb->s_bdev;
@@ -1772,26 +1742,6 @@ void kill_block_super(struct super_block *sb)
 
 EXPORT_SYMBOL(kill_block_super);
 #endif
-
-struct dentry *mount_nodev(struct file_system_type *fs_type,
-	int flags, void *data,
-	int (*fill_super)(struct super_block *, void *, int))
-{
-	int error;
-	struct super_block *s = sget(fs_type, NULL, set_anon_super, flags, NULL);
-
-	if (IS_ERR(s))
-		return ERR_CAST(s);
-
-	error = fill_super(s, data, flags & SB_SILENT ? 1 : 0);
-	if (error) {
-		deactivate_locked_super(s);
-		return ERR_PTR(error);
-	}
-	s->s_flags |= SB_ACTIVE;
-	return dget(s->s_root);
-}
-EXPORT_SYMBOL(mount_nodev);
 
 /**
  * vfs_get_tree - Get the mountable root
@@ -2314,17 +2264,20 @@ int sb_init_dio_done_wq(struct super_block *sb)
 {
 	struct workqueue_struct *old;
 	struct workqueue_struct *wq = alloc_workqueue("dio/%s",
-						      WQ_MEM_RECLAIM, 0,
+						      WQ_MEM_RECLAIM | WQ_PERCPU,
+						      0,
 						      sb->s_id);
 	if (!wq)
 		return -ENOMEM;
+
+	old = NULL;
 	/*
 	 * This has to be atomic as more DIOs can race to create the workqueue
 	 */
-	old = cmpxchg(&sb->s_dio_done_wq, NULL, wq);
-	/* Someone created workqueue before us? Free ours... */
-	if (old)
+	if (!try_cmpxchg(&sb->s_dio_done_wq, &old, wq)) {
+		/* Someone created workqueue before us? Free ours... */
 		destroy_workqueue(wq);
+	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(sb_init_dio_done_wq);

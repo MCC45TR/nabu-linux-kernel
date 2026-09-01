@@ -218,8 +218,10 @@ static void amdgpu_dm_idle_worker(struct work_struct *work)
 			break;
 		}
 
-		if (idle_work->enable)
+		if (idle_work->enable) {
+			dc_post_update_surfaces_to_stream(idle_work->dm->dc);
 			dc_allow_idle_optimizations(idle_work->dm->dc, true);
+		}
 		mutex_unlock(&idle_work->dm->dc_lock);
 	}
 	idle_work->dm->idle_workqueue->running = false;
@@ -273,8 +275,10 @@ static void amdgpu_dm_crtc_vblank_control_worker(struct work_struct *work)
 			vblank_work->acrtc->dm_irq_params.allow_sr_entry);
 	}
 
-	if (dm->active_vblank_irq_count == 0)
+	if (dm->active_vblank_irq_count == 0) {
+		dc_post_update_surfaces_to_stream(dm->dc);
 		dc_allow_idle_optimizations(dm->dc, true);
+	}
 
 	mutex_unlock(&dm->dc_lock);
 
@@ -293,12 +297,16 @@ static inline int amdgpu_dm_crtc_set_vblank(struct drm_crtc *crtc, bool enable)
 	int irq_type;
 	int rc = 0;
 
-	if (acrtc->otg_inst == -1)
-		goto skip;
+	if (enable && !acrtc->base.enabled) {
+		drm_dbg_vbl(crtc->dev,
+				"Reject vblank enable on unconfigured CRTC %d (enabled=%d)\n",
+				acrtc->crtc_id, acrtc->base.enabled);
+		return -EINVAL;
+	}
 
 	irq_type = amdgpu_display_crtc_idx_to_irq_type(adev, acrtc->crtc_id);
 
-	if (enable) {
+	if (enable && acrtc_state->stream) {
 		struct dc *dc = adev->dm.dc;
 		struct drm_vblank_crtc *vblank = drm_crtc_vblank_crtc(crtc);
 		struct psr_settings *psr = &acrtc_state->stream->link->psr_settings;
@@ -317,48 +325,75 @@ static inline int amdgpu_dm_crtc_set_vblank(struct drm_crtc *crtc, bool enable)
 			dc->config.disable_ips != DMUB_IPS_DISABLE_ALL &&
 			sr_supported && vblank->config.disable_immediate)
 			drm_crtc_vblank_restore(crtc);
-
-		/* vblank irq on -> Only need vupdate irq in vrr mode */
-		if (amdgpu_dm_crtc_vrr_active(acrtc_state))
-			rc = amdgpu_dm_crtc_set_vupdate_irq(crtc, true);
-	} else {
-		/* vblank irq off -> vupdate irq off */
-		rc = amdgpu_dm_crtc_set_vupdate_irq(crtc, false);
 	}
 
-	if (rc)
-		return rc;
-
-	/* crtc vblank or vstartup interrupt */
-	if (enable) {
-		rc = amdgpu_irq_get(adev, &adev->crtc_irq, irq_type);
-		drm_dbg_vbl(crtc->dev, "Get crtc_irq ret=%d\n", rc);
-	} else {
-		rc = amdgpu_irq_put(adev, &adev->crtc_irq, irq_type);
-		drm_dbg_vbl(crtc->dev, "Put crtc_irq ret=%d\n", rc);
+	/*
+	 * On DCN, VUPDATE_NO_LOCK is the single OTG interrupt used to deliver
+	 * vblank and pageflip completion events, so enable it whenever vblank
+	 * is enabled. On DCE, vupdate is only needed in VRR mode.
+	 */
+	if (amdgpu_ip_version(adev, DCE_HWIP, 0) != 0) {
+		if (enable) {
+			rc = amdgpu_irq_get(adev, &adev->vupdate_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Get vupdate_irq ret=%d\n", rc);
+		} else {
+			rc = amdgpu_irq_put(adev, &adev->vupdate_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Put vupdate_irq ret=%d\n", rc);
+		}
+	} else if (dc_supports_vrr(dm->dc->ctx->dce_version)) {
+		if (enable) {
+			/* vblank irq on -> Only need vupdate irq in vrr mode
+			 * Not ref-counted since we need explicit enable/disable
+			 * for DCE VRR handling
+			 */
+			if (amdgpu_dm_crtc_vrr_active(acrtc_state))
+				rc = amdgpu_dm_crtc_set_vupdate_irq(crtc, true);
+		} else {
+			/* vblank irq off -> vupdate irq off */
+			rc = amdgpu_dm_crtc_set_vupdate_irq(crtc, false);
+		}
 	}
 
 	if (rc)
 		return rc;
 
 	/*
-	 * hubp surface flip interrupt
-	 *
-	 * We have no guarantee that the frontend index maps to the same
-	 * backend index - some even map to more than one.
-	 *
-	 * TODO: Use a different interrupt or check DC itself for the mapping.
+	 * VLINE0 (crtc_irq) and GRPH_PFLIP (pageflip_irq) are only used on
+	 * DCE. On DCN, vblank and pageflip completion are delivered from
+	 * VUPDATE_NO_LOCK (enabled above), so don't touch them here.
 	 */
-	if (enable) {
-		rc = amdgpu_irq_get(adev, &adev->pageflip_irq, irq_type);
-		drm_dbg_vbl(crtc->dev, "Get pageflip_irq ret=%d\n", rc);
-	} else {
-		rc = amdgpu_irq_put(adev, &adev->pageflip_irq, irq_type);
-		drm_dbg_vbl(crtc->dev, "Put pageflip_irq ret=%d\n", rc);
-	}
+	if (amdgpu_ip_version(adev, DCE_HWIP, 0) == 0) {
+		/* crtc vblank or vstartup interrupt */
+		if (enable) {
+			rc = amdgpu_irq_get(adev, &adev->crtc_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Get crtc_irq ret=%d\n", rc);
+		} else {
+			rc = amdgpu_irq_put(adev, &adev->crtc_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Put crtc_irq ret=%d\n", rc);
+		}
 
-	if (rc)
-		return rc;
+		if (rc)
+			return rc;
+
+		/*
+		 * hubp surface flip interrupt
+		 *
+		 * We have no guarantee that the frontend index maps to the same
+		 * backend index - some even map to more than one.
+		 *
+		 * TODO: Use a different interrupt or check DC itself for the mapping.
+		 */
+		if (enable) {
+			rc = amdgpu_irq_get(adev, &adev->pageflip_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Get pageflip_irq ret=%d\n", rc);
+		} else {
+			rc = amdgpu_irq_put(adev, &adev->pageflip_irq, irq_type);
+			drm_dbg_vbl(crtc->dev, "Put pageflip_irq ret=%d\n", rc);
+		}
+
+		if (rc)
+			return rc;
+	}
 
 #if defined(CONFIG_DRM_AMD_SECURE_DISPLAY)
 	/* crtc vline0 interrupt, only available on DCN+ */
@@ -375,7 +410,7 @@ static inline int amdgpu_dm_crtc_set_vblank(struct drm_crtc *crtc, bool enable)
 			return rc;
 	}
 #endif
-skip:
+
 	if (amdgpu_in_reset(adev))
 		return 0;
 

@@ -28,10 +28,16 @@
     unsafe_op_in_unsafe_fn
 )]
 #![cfg_attr(CONFIG_RUSTC_HAS_UNNECESSARY_TRANSMUTES, allow(unnecessary_transmutes))]
+#![cfg_attr(
+    CONFIG_RUSTC_HAS_SUSPICIOUS_RUNTIME_SYMBOL_DEFINITIONS,
+    allow(suspicious_runtime_symbol_definitions)
+)]
 
 // Manual definition of blocklisted types.
 type __kernel_size_t = usize;
 type __kernel_ssize_t = isize;
 type __kernel_ptrdiff_t = isize;
+
+use pin_init::MaybeZeroable;
 
 include!(concat!(env!("OBJTREE"), "/rust/uapi/uapi_generated.rs"));

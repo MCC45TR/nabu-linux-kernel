@@ -4,7 +4,8 @@
 #ifndef _IDPF_VIRTCHNL_H_
 #define _IDPF_VIRTCHNL_H_
 
-#define IDPF_VC_XN_MIN_TIMEOUT_MSEC	2000
+#include "virtchnl2.h"
+
 #define IDPF_VC_XN_DEFAULT_TIMEOUT_MSEC	(60 * 1000)
 #define IDPF_VC_XN_IDX_M		GENMASK(7, 0)
 #define IDPF_VC_XN_SALT_M		GENMASK(15, 8)
@@ -41,8 +42,8 @@ typedef int (*async_vc_cb) (struct idpf_adapter *, struct idpf_vc_xn *,
  * struct idpf_vc_xn - Data structure representing virtchnl transactions
  * @completed: virtchnl event loop uses that to signal when a reply is
  *	       available, uses kernel completion API
- * @state: virtchnl event loop stores the data below, protected by the
- *	   completion's lock.
+ * @lock: protects the transaction state fields below
+ * @state: virtchnl event loop stores the data below, protected by @lock
  * @reply_sz: Original size of reply, may be > reply_buf.iov_len; it will be
  *	      truncated on its way to the receiver thread according to
  *	      reply_buf.iov_len.
@@ -57,6 +58,7 @@ typedef int (*async_vc_cb) (struct idpf_adapter *, struct idpf_vc_xn *,
  */
 struct idpf_vc_xn {
 	struct completion completed;
+	spinlock_t lock;
 	enum idpf_vc_xn_state state;
 	size_t reply_sz;
 	struct kvec reply;
@@ -115,6 +117,33 @@ int idpf_recv_mb_msg(struct idpf_adapter *adapter);
 int idpf_send_mb_msg(struct idpf_adapter *adapter, u32 op,
 		     u16 msg_size, u8 *msg, u16 cookie);
 
+struct idpf_queue_ptr {
+	enum virtchnl2_queue_type	type;
+	union {
+		struct idpf_rx_queue		*rxq;
+		struct idpf_tx_queue		*txq;
+		struct idpf_buf_queue		*bufq;
+		struct idpf_compl_queue		*complq;
+	};
+};
+
+struct idpf_queue_set {
+	struct idpf_vport		*vport;
+
+	u32				num;
+	struct idpf_queue_ptr		qs[] __counted_by(num);
+};
+
+struct idpf_queue_set *idpf_alloc_queue_set(struct idpf_vport *vport, u32 num);
+
+int idpf_send_enable_queue_set_msg(const struct idpf_queue_set *qs);
+int idpf_send_disable_queue_set_msg(const struct idpf_queue_set *qs);
+int idpf_send_config_queue_set_msg(const struct idpf_queue_set *qs);
+
+int idpf_send_disable_queues_msg(struct idpf_vport *vport);
+int idpf_send_config_queues_msg(struct idpf_vport *vport);
+int idpf_send_enable_queues_msg(struct idpf_vport *vport);
+
 void idpf_vport_init(struct idpf_vport *vport, struct idpf_vport_max_q *max_q);
 u32 idpf_get_vport_id(struct idpf_vport *vport);
 int idpf_send_create_vport_msg(struct idpf_adapter *adapter,
@@ -131,9 +160,6 @@ void idpf_vport_dealloc_max_qs(struct idpf_adapter *adapter,
 int idpf_send_add_queues_msg(const struct idpf_vport *vport, u16 num_tx_q,
 			     u16 num_complq, u16 num_rx_q, u16 num_rx_bufq);
 int idpf_send_delete_queues_msg(struct idpf_vport *vport);
-int idpf_send_enable_queues_msg(struct idpf_vport *vport);
-int idpf_send_disable_queues_msg(struct idpf_vport *vport);
-int idpf_send_config_queues_msg(struct idpf_vport *vport);
 
 int idpf_vport_alloc_vec_indexes(struct idpf_vport *vport);
 int idpf_get_vec_ids(struct idpf_adapter *adapter,

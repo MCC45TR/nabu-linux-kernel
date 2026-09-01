@@ -363,7 +363,7 @@ static void *chain_alloc(struct chain_allocator *ca, unsigned int size)
  *
  * One radix tree is represented by one struct mem_zone_bm_rtree. There are
  * two linked lists for the nodes of the tree, one for the inner nodes and
- * one for the leave nodes. The linked leave nodes are used for fast linear
+ * one for the leaf nodes. The linked leaf nodes are used for fast linear
  * access of the memory bitmap.
  *
  * The struct rtree_node represents one node of the radix tree.
@@ -2856,6 +2856,17 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
 {
 	int error;
 
+	/*
+	 * Call snapshot_write_next() to drain any trailing zero pages,
+	 * but make sure we're in the data page region first.
+	 * This function can return PAGE_SIZE if the kernel was expecting
+	 * another copy page. Return -ENODATA in that situation.
+	 */
+	if (handle->cur > nr_meta_pages + 1) {
+		error = snapshot_write_next(handle);
+		if (error)
+			return error > 0 ? -ENODATA : error;
+	}
 	copy_last_highmem_page();
 	error = hibernate_restore_protect_page(handle->buffer);
 	/* Do that only if we have loaded the image entirely */

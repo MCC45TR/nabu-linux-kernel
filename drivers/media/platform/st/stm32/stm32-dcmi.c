@@ -1701,8 +1701,8 @@ static int dcmi_framesizes_init(struct stm32_dcmi *dcmi)
 		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
 		.code = dcmi->sd_format->mbus_code,
 	};
-	unsigned int ret;
 	unsigned int i;
+	int ret;
 
 	/* Allocate discrete framesizes array */
 	while (!v4l2_subdev_call(subdev, pad, enum_frame_size,
@@ -1808,8 +1808,8 @@ static int dcmi_graph_notify_bound(struct v4l2_async_notifier *notifier,
 				   struct v4l2_async_connection *asd)
 {
 	struct stm32_dcmi *dcmi = notifier_to_dcmi(notifier);
-	unsigned int ret;
 	int src_pad;
+	int ret;
 
 	dev_dbg(dcmi->dev, "Subdev \"%s\" bound\n", subdev->name);
 
@@ -2063,6 +2063,7 @@ static int dcmi_probe(struct platform_device *pdev)
 	return 0;
 
 err_cleanup:
+	v4l2_async_nf_unregister(&dcmi->notifier);
 	v4l2_async_nf_cleanup(&dcmi->notifier);
 err_media_entity_cleanup:
 	media_entity_cleanup(&dcmi->vdev->entity);

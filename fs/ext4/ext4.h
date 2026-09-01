@@ -1182,6 +1182,14 @@ struct ext4_inode_info {
 	__u32 i_csum_seed;
 
 	kprojid_t i_projid;
+
+#ifdef CONFIG_FS_ENCRYPTION
+	struct fscrypt_inode_info *i_crypt_info;
+#endif
+
+#ifdef CONFIG_FS_VERITY
+	struct fsverity_info *i_verity_info;
+#endif
 };
 
 /*
@@ -1442,7 +1450,9 @@ struct ext4_super_block {
 	__le16  s_encoding;		/* Filename charset encoding */
 	__le16  s_encoding_flags;	/* Filename charset encoding flags */
 	__le32  s_orphan_file_inum;	/* Inode for tracking orphan inodes */
-	__le32	s_reserved[94];		/* Padding to the end of the block */
+	__le16	s_def_resuid_hi;
+	__le16	s_def_resgid_hi;
+	__le32	s_reserved[93];		/* Padding to the end of the block */
 	__le32	s_checksum;		/* crc32c(superblock) */
 };
 
@@ -1554,6 +1564,7 @@ struct ext4_sb_info {
 	struct proc_dir_entry *s_proc;
 	struct kobject s_kobj;
 	struct completion s_kobj_unregister;
+	struct mutex s_error_notify_mutex; /* protects sysfs_notify vs kobject_del */
 	struct super_block *s_sb;
 	struct buffer_head *s_mmp_bh;
 
@@ -1761,6 +1772,10 @@ struct ext4_sb_info {
 	 * Main fast commit lock. This lock protects accesses to the
 	 * following fields:
 	 * ei->i_fc_list, s_fc_dentry_q, s_fc_q, s_fc_bytes, s_fc_bh.
+	 *
+	 * s_fc_lock can be taken from reclaim context (inode eviction) and is
+	 * thus reclaim unsafe. Use ext4_fc_lock()/ext4_fc_unlock() helpers
+	 * when acquiring / releasing the lock.
 	 */
 	struct mutex s_fc_lock;
 	struct buffer_head *s_fc_bh;
@@ -1805,11 +1820,35 @@ static inline void ext4_writepages_up_write(struct super_block *sb, int ctx)
 	percpu_up_write(&EXT4_SB(sb)->s_writepages_rwsem);
 }
 
+static inline int ext4_fc_lock(struct super_block *sb)
+{
+	mutex_lock(&EXT4_SB(sb)->s_fc_lock);
+	return memalloc_nofs_save();
+}
+
+static inline void ext4_fc_unlock(struct super_block *sb, int ctx)
+{
+	memalloc_nofs_restore(ctx);
+	mutex_unlock(&EXT4_SB(sb)->s_fc_lock);
+}
+
 static inline int ext4_valid_inum(struct super_block *sb, unsigned long ino)
 {
 	return ino == EXT4_ROOT_INO ||
 		(ino >= EXT4_FIRST_INO(sb) &&
 		 ino <= le32_to_cpu(EXT4_SB(sb)->s_es->s_inodes_count));
+}
+
+static inline int ext4_get_resuid(struct ext4_super_block *es)
+{
+	return le16_to_cpu(es->s_def_resuid) |
+		le16_to_cpu(es->s_def_resuid_hi) << 16;
+}
+
+static inline int ext4_get_resgid(struct ext4_super_block *es)
+{
+	return le16_to_cpu(es->s_def_resgid) |
+		le16_to_cpu(es->s_def_resgid_hi) << 16;
 }
 
 /*
@@ -1951,6 +1990,8 @@ EXT4_INODE_BIT_FNS(flag, flags, 0)
 static inline int ext4_test_inode_state(struct inode *inode, int bit);
 static inline void ext4_set_inode_state(struct inode *inode, int bit);
 static inline void ext4_clear_inode_state(struct inode *inode, int bit);
+static inline unsigned long *ext4_inode_state_wait_word(struct inode *inode);
+static inline int ext4_inode_state_wait_bit(int bit);
 #if (BITS_PER_LONG < 64)
 EXT4_INODE_BIT_FNS(state, state_flags, 0)
 
@@ -1966,6 +2007,24 @@ static inline void ext4_clear_state_flags(struct ext4_inode_info *ei)
 	/* We depend on the fact that callers will set i_flags */
 }
 #endif
+
+static inline unsigned long *ext4_inode_state_wait_word(struct inode *inode)
+{
+#if (BITS_PER_LONG < 64)
+	return &EXT4_I(inode)->i_state_flags;
+#else
+	return &EXT4_I(inode)->i_flags;
+#endif
+}
+
+static inline int ext4_inode_state_wait_bit(int bit)
+{
+#if (BITS_PER_LONG < 64)
+	return bit;
+#else
+	return bit + 32;
+#endif
+}
 #else
 /* Assume that user mode programs are passing in an ext4fs superblock, not
  * a kernel struct super_block.  This will allow us to call the feature-test
@@ -1980,6 +2039,16 @@ static inline bool ext4_verity_in_progress(struct inode *inode)
 }
 
 #define NEXT_ORPHAN(inode) EXT4_I(inode)->i_dtime
+
+/*
+ * Check whether the inode is tracked as orphan (either in orphan file or
+ * orphan list).
+ */
+static inline bool ext4_inode_orphan_tracked(struct inode *inode)
+{
+	return ext4_test_inode_state(inode, EXT4_STATE_ORPHAN_FILE) ||
+		!list_empty(&EXT4_I(inode)->i_orphan);
+}
 
 /*
  * Codes for operating systems
@@ -3134,6 +3203,8 @@ extern struct buffer_head *ext4_sb_bread(struct super_block *sb,
 					 sector_t block, blk_opf_t op_flags);
 extern struct buffer_head *ext4_sb_bread_unmovable(struct super_block *sb,
 						   sector_t block);
+extern struct buffer_head *ext4_sb_bread_nofail(struct super_block *sb,
+						sector_t block);
 extern void ext4_read_bh_nowait(struct buffer_head *bh, blk_opf_t op_flags,
 				bh_end_io_t *end_io, bool simu_fail);
 extern int ext4_read_bh(struct buffer_head *bh, blk_opf_t op_flags,

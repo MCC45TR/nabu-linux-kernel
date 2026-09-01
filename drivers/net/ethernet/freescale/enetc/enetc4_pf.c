@@ -49,10 +49,10 @@ static void enetc4_pf_set_si_primary_mac(struct enetc_hw *hw, int si,
 
 	if (si != 0) {
 		__raw_writel(upper, hw->port + ENETC4_PSIPMAR0(si));
-		__raw_writew(lower, hw->port + ENETC4_PSIPMAR1(si));
+		__raw_writel(lower, hw->port + ENETC4_PSIPMAR1(si));
 	} else {
 		__raw_writel(upper, hw->port + ENETC4_PMAR0);
-		__raw_writew(lower, hw->port + ENETC4_PMAR1);
+		__raw_writel(lower, hw->port + ENETC4_PMAR1);
 	}
 }
 
@@ -63,7 +63,7 @@ static void enetc4_pf_get_si_primary_mac(struct enetc_hw *hw, int si,
 	u16 lower;
 
 	upper = __raw_readl(hw->port + ENETC4_PSIPMAR0(si));
-	lower = __raw_readw(hw->port + ENETC4_PSIPMAR1(si));
+	lower = __raw_readl(hw->port + ENETC4_PSIPMAR1(si));
 
 	put_unaligned_le32(upper, addr);
 	put_unaligned_le16(lower, addr + 4);
@@ -569,6 +569,9 @@ static const struct net_device_ops enetc4_ndev_ops = {
 	.ndo_set_features	= enetc4_pf_set_features,
 	.ndo_vlan_rx_add_vid	= enetc_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid	= enetc_vlan_rx_del_vid,
+	.ndo_eth_ioctl		= enetc_ioctl,
+	.ndo_hwtstamp_get	= enetc_hwtstamp_get,
+	.ndo_hwtstamp_set	= enetc_hwtstamp_set,
 };
 
 static struct phylink_pcs *
@@ -1016,8 +1019,7 @@ static int enetc4_pf_probe(struct pci_dev *pdev,
 
 	err = devm_add_action_or_reset(dev, enetc4_pci_remove, pdev);
 	if (err)
-		return dev_err_probe(dev, err,
-				     "Add enetc4_pci_remove() action failed\n");
+		return err;
 
 	/* si is the private data. */
 	si = pci_get_drvdata(pdev);
@@ -1030,7 +1032,7 @@ static int enetc4_pf_probe(struct pci_dev *pdev,
 	err = enetc_get_driver_data(si);
 	if (err)
 		return dev_err_probe(dev, err,
-				     "Could not get VF driver data\n");
+				     "Could not get PF driver data\n");
 
 	err = enetc4_pf_struct_init(si);
 	if (err)

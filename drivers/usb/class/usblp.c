@@ -34,6 +34,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/minmax.h>
 #include <linux/sched/signal.h>
 #include <linux/signal.h>
 #include <linux/poll.h>
@@ -871,7 +872,7 @@ static ssize_t usblp_read(struct file *file, char __user *buffer, size_t len, lo
 		goto done;
 	}
 
-	count = len < avail - usblp->readcount ? len : avail - usblp->readcount;
+	count = min_t(ssize_t, len, avail - usblp->readcount);
 	if (count != 0 &&
 	    copy_to_user(buffer, usblp->readbuf + usblp->readcount, count)) {
 		count = -EFAULT;
@@ -1177,7 +1178,7 @@ static int usblp_probe(struct usb_interface *intf,
 	}
 
 	/* Allocate buffer for printer status */
-	usblp->statusbuf = kmalloc(STATUS_BUF_SIZE, GFP_KERNEL);
+	usblp->statusbuf = kzalloc(STATUS_BUF_SIZE, GFP_KERNEL);
 	if (!usblp->statusbuf) {
 		retval = -ENOMEM;
 		goto abort;
@@ -1376,6 +1377,7 @@ static int usblp_cache_device_id_string(struct usblp *usblp)
 {
 	int err, length;
 
+	memset(usblp->device_id_string, 0, USBLP_DEVICE_ID_SIZE);
 	err = usblp_get_id(usblp, 0, usblp->device_id_string, USBLP_DEVICE_ID_SIZE - 1);
 	if (err < 0) {
 		dev_dbg(&usblp->intf->dev,

@@ -273,7 +273,8 @@ struct gpib_board {
 	struct mutex big_gpib_mutex;
 	/* pid of last process to lock the board mutex */
 	pid_t locking_pid;
-	spinlock_t locking_pid_spinlock; // lock for setting locking pid
+	/* lock for setting locking pid */
+	spinlock_t locking_pid_spinlock;
 	/* Spin lock for dealing with races with the interrupt handler */
 	spinlock_t spinlock;
 	/* Watchdog timer to enable timeouts */
@@ -363,6 +364,14 @@ struct gpib_descriptor {
 	unsigned int pad;	/* primary gpib address */
 	int sad;	/* secondary gpib address (negative means disabled) */
 	atomic_t io_in_progress;
+	/*
+	 * Kernel-only reference count to prevent descriptor from being
+	 * freed while IO handlers hold a pointer to it.  Incremented
+	 * before each IO operation, decremented when done.  Unlike
+	 * io_in_progress, this cannot be modified from userspace via
+	 * general_ibstatus().
+	 */
+	atomic_t descriptor_busy;
 	unsigned is_board : 1;
 	unsigned autopoll_enabled : 1;
 };

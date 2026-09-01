@@ -1494,7 +1494,8 @@ static int mlx5e_get_rxfh(struct net_device *netdev, struct ethtool_rxfh_param *
 }
 
 static int mlx5e_rxfh_hfunc_check(struct mlx5e_priv *priv,
-				  const struct ethtool_rxfh_param *rxfh)
+				  const struct ethtool_rxfh_param *rxfh,
+				  struct netlink_ext_ack *extack)
 {
 	unsigned int count;
 
@@ -1504,8 +1505,10 @@ static int mlx5e_rxfh_hfunc_check(struct mlx5e_priv *priv,
 		unsigned int xor8_max_channels = mlx5e_rqt_max_num_channels_allowed_for_xor8();
 
 		if (count > xor8_max_channels) {
-			netdev_err(priv->netdev, "%s: Cannot set RSS hash function to XOR, current number of channels (%d) exceeds the maximum allowed for XOR8 RSS hfunc (%d)\n",
-				   __func__, count, xor8_max_channels);
+			NL_SET_ERR_MSG_FMT_MOD(
+				extack,
+				"Number of channels (%u) exceeds the max for XOR8 RSS (%u)",
+				count, xor8_max_channels);
 			return -EINVAL;
 		}
 	}
@@ -1524,7 +1527,7 @@ static int mlx5e_set_rxfh(struct net_device *dev,
 
 	mutex_lock(&priv->state_lock);
 
-	err = mlx5e_rxfh_hfunc_check(priv, rxfh);
+	err = mlx5e_rxfh_hfunc_check(priv, rxfh, extack);
 	if (err)
 		goto unlock;
 
@@ -1550,7 +1553,7 @@ static int mlx5e_create_rxfh_context(struct net_device *dev,
 
 	mutex_lock(&priv->state_lock);
 
-	err = mlx5e_rxfh_hfunc_check(priv, rxfh);
+	err = mlx5e_rxfh_hfunc_check(priv, rxfh, extack);
 	if (err)
 		goto unlock;
 
@@ -1590,7 +1593,7 @@ static int mlx5e_modify_rxfh_context(struct net_device *dev,
 
 	mutex_lock(&priv->state_lock);
 
-	err = mlx5e_rxfh_hfunc_check(priv, rxfh);
+	err = mlx5e_rxfh_hfunc_check(priv, rxfh, extack);
 	if (err)
 		goto unlock;
 
@@ -1927,11 +1930,12 @@ static int mlx5e_set_wol(struct net_device *netdev, struct ethtool_wolinfo *wol)
 }
 
 static void mlx5e_get_fec_stats(struct net_device *netdev,
-				struct ethtool_fec_stats *fec_stats)
+				struct ethtool_fec_stats *fec_stats,
+				struct ethtool_fec_hist *hist)
 {
 	struct mlx5e_priv *priv = netdev_priv(netdev);
 
-	mlx5e_stats_fec_get(priv, fec_stats);
+	mlx5e_stats_fec_get(priv, fec_stats, hist);
 }
 
 static int mlx5e_get_fecparam(struct net_device *netdev,
@@ -2023,7 +2027,7 @@ static int mlx5e_get_module_info(struct net_device *netdev,
 	int size_read = 0;
 	u8 data[4] = {0};
 
-	size_read = mlx5_query_module_eeprom(dev, 0, 2, data);
+	size_read = mlx5_query_module_eeprom(dev, 0, 2, data, NULL);
 	if (size_read < 2)
 		return -EIO;
 
@@ -2065,6 +2069,7 @@ static int mlx5e_get_module_eeprom(struct net_device *netdev,
 	struct mlx5_core_dev *mdev = priv->mdev;
 	int offset = ee->offset;
 	int size_read;
+	u8 status = 0;
 	int i = 0;
 
 	if (!ee->len)
@@ -2074,15 +2079,15 @@ static int mlx5e_get_module_eeprom(struct net_device *netdev,
 
 	while (i < ee->len) {
 		size_read = mlx5_query_module_eeprom(mdev, offset, ee->len - i,
-						     data + i);
-
+						     data + i, &status);
 		if (!size_read)
 			/* Done reading */
 			return 0;
 
 		if (size_read < 0) {
-			netdev_err(priv->netdev, "%s: mlx5_query_eeprom failed:0x%x\n",
-				   __func__, size_read);
+			netdev_err(netdev,
+				   "%s: mlx5_query_eeprom failed:0x%x, status %u\n",
+				   __func__, size_read, status);
 			return size_read;
 		}
 
@@ -2102,6 +2107,7 @@ static int mlx5e_get_module_eeprom_by_page(struct net_device *netdev,
 	struct mlx5_core_dev *mdev = priv->mdev;
 	u8 *data = page_data->data;
 	int size_read;
+	u8 status = 0;
 	int i = 0;
 
 	if (!page_data->length)
@@ -2115,20 +2121,19 @@ static int mlx5e_get_module_eeprom_by_page(struct net_device *netdev,
 	query.page = page_data->page;
 	while (i < page_data->length) {
 		query.size = page_data->length - i;
-		size_read = mlx5_query_module_eeprom_by_page(mdev, &query, data + i);
+		size_read = mlx5_query_module_eeprom_by_page(mdev, &query,
+							     data + i, &status);
 
 		/* Done reading, return how many bytes was read */
 		if (!size_read)
 			return i;
 
-		if (size_read == -EINVAL)
-			return -EINVAL;
 		if (size_read < 0) {
 			NL_SET_ERR_MSG_FMT_MOD(
 				extack,
-				"Query module eeprom by page failed, read %u bytes, err %d",
-				i, size_read);
-			return i;
+				"Query module eeprom by page failed, read %u bytes, err %d, status %u",
+				i, size_read, status);
+			return size_read;
 		}
 
 		i += size_read;

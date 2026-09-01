@@ -1366,19 +1366,9 @@ void q6afe_tdm_port_prepare(struct q6afe_port *port,
 	pcfg->tdm_cfg.sync_mode = cfg->sync_mode;
 	pcfg->tdm_cfg.sync_src = cfg->sync_src;
 	pcfg->tdm_cfg.nslots_per_frame = cfg->nslots_per_frame;
-	pcfg->tdm_cfg.ctrl_data_out_enable = cfg->data_out_enable;
-	pcfg->tdm_cfg.ctrl_invert_sync_pulse = cfg->invert_sync;
-	pcfg->tdm_cfg.ctrl_sync_data_delay = cfg->data_delay;
 
 	pcfg->tdm_cfg.slot_width = cfg->slot_width;
 	pcfg->tdm_cfg.slot_mask = cfg->slot_mask;
-	dev_info_once(port->afe->dev,
-		      "TDM port 0x%x: channels=%u rate=%u bits=%u sync=%u/%u data=%u/%u/%u slots=%u width=%u mask=0x%x (frame=0x%x)\n",
-		      port->id, cfg->num_channels, cfg->sample_rate,
-		      cfg->bit_width, cfg->sync_mode, cfg->sync_src,
-		      cfg->data_out_enable, cfg->invert_sync, cfg->data_delay,
-		      cfg->nslots_per_frame, cfg->slot_width,
-		      pcfg->tdm_cfg.slot_mask, cfg->slot_mask);
 	port->scfg = kzalloc(sizeof(*port->scfg), GFP_KERNEL);
 	if (!port->scfg)
 		return;

@@ -85,7 +85,9 @@
 #define CS35L56_DSP1_XMEM_UNPACKED24_0			0x2800000
 #define CS35L56_DSP1_FW_VER				0x2800010
 #define CS35L56_DSP1_HALO_STATE				0x28021E0
+#define CS35L56_B2_DSP1_HALO_STATE			0x2803D20
 #define CS35L56_DSP1_PM_CUR_STATE			0x2804308
+#define CS35L56_B2_DSP1_PM_CUR_STATE			0x2804678
 #define CS35L56_DSP1_XMEM_UNPACKED24_8191		0x2807FFC
 #define CS35L56_DSP1_CORE_BASE				0x2B80000
 #define CS35L56_DSP1_SCRATCH1				0x2B805C0
@@ -337,14 +339,12 @@ extern const struct regmap_config cs35l56_regmap_sdw;
 extern const struct regmap_config cs35l63_regmap_i2c;
 extern const struct regmap_config cs35l63_regmap_sdw;
 
-extern const struct cs35l56_fw_reg cs35l56_fw_reg;
-extern const struct cs35l56_fw_reg cs35l63_fw_reg;
-
 extern const struct cirrus_amp_cal_controls cs35l56_calibration_controls;
 
 extern const char * const cs35l56_tx_input_texts[CS35L56_NUM_INPUT_SRC];
 extern const unsigned int cs35l56_tx_input_values[CS35L56_NUM_INPUT_SRC];
 
+int cs35l56_set_asp_patch(struct cs35l56_base *cs35l56_base);
 int cs35l56_set_patch(struct cs35l56_base *cs35l56_base);
 int cs35l56_mbox_send(struct cs35l56_base *cs35l56_base, unsigned int command);
 int cs35l56_firmware_shutdown(struct cs35l56_base *cs35l56_base);

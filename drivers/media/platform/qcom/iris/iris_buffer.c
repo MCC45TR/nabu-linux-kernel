@@ -80,21 +80,6 @@ static u32 iris_yuv_buffer_size_nv12(struct iris_inst *inst)
 	return ALIGN(y_plane + uv_plane, PIXELS_4K);
 }
 
-static u32 iris_yuv_buffer_size_p010(struct iris_inst *inst)
-{
-	u32 y_plane, uv_plane, y_stride, uv_stride, y_scanlines, uv_scanlines;
-	struct v4l2_format *f = inst->fmt_dst;
-
-	y_stride = ALIGN(f->fmt.pix_mp.width * 2, Y_STRIDE_ALIGN);
-	uv_stride = ALIGN(f->fmt.pix_mp.width * 2, UV_STRIDE_ALIGN);
-	y_scanlines = ALIGN(f->fmt.pix_mp.height, Y_SCANLINE_ALIGN);
-	uv_scanlines = ALIGN((f->fmt.pix_mp.height + 1) >> 1, UV_SCANLINE_ALIGN);
-	y_plane = y_stride * y_scanlines;
-	uv_plane = uv_stride * uv_scanlines;
-
-	return ALIGN(y_plane + uv_plane, PIXELS_4K);
-}
-
 /*
  * QC08C:
  * Compressed Macro-tile format for NV12.
@@ -214,39 +199,6 @@ static u32 iris_yuv_buffer_size_qc08c(struct iris_inst *inst)
 	return ALIGN(y_meta_plane + y_plane + uv_meta_plane + uv_plane, PIXELS_4K);
 }
 
-/*
- * TP10 UBWC is the firmware-owned DPB used while linear P010 is exposed on
- * OUTPUT2.  The layout matches the legacy Venus HFI contract used by VPU5.
- */
-static u32 iris_yuv_buffer_size_qc10c(struct iris_inst *inst)
-{
-	u32 y_stride, uv_stride, y_scanlines, uv_scanlines;
-	u32 y_plane, uv_plane, y_meta_stride, y_meta_scanlines;
-	u32 uv_meta_stride, uv_meta_scanlines, y_meta_plane, uv_meta_plane;
-	struct v4l2_format *f = inst->fmt_dst;
-	u32 extradata = SZ_16K;
-	u32 size;
-
-	y_stride = ALIGN(f->fmt.pix_mp.width * 4 / 3, 256);
-	uv_stride = ALIGN(f->fmt.pix_mp.width * 4 / 3, 256);
-	y_scanlines = ALIGN(f->fmt.pix_mp.height, 16);
-	uv_scanlines = ALIGN((f->fmt.pix_mp.height + 1) >> 1, 16);
-	y_plane = ALIGN(y_stride * y_scanlines, SZ_4K);
-	uv_plane = ALIGN(uv_stride * uv_scanlines, SZ_4K);
-
-	y_meta_stride = ALIGN(DIV_ROUND_UP(f->fmt.pix_mp.width, 48), 64);
-	y_meta_scanlines = ALIGN(DIV_ROUND_UP(f->fmt.pix_mp.height, 4), 16);
-	y_meta_plane = ALIGN(y_meta_stride * y_meta_scanlines, SZ_4K);
-	uv_meta_stride = ALIGN(DIV_ROUND_UP((f->fmt.pix_mp.width + 1) >> 1, 24), 64);
-	uv_meta_scanlines = ALIGN(DIV_ROUND_UP((f->fmt.pix_mp.height + 1) >> 1, 4), 16);
-	uv_meta_plane = ALIGN(uv_meta_stride * uv_meta_scanlines, SZ_4K);
-
-	size = y_plane + uv_plane + y_meta_plane + uv_meta_plane;
-	size += max(extradata + SZ_8K, y_stride * 48);
-
-	return ALIGN(size, SZ_4K);
-}
-
 static u32 iris_dec_bitstream_buffer_size(struct iris_inst *inst)
 {
 	struct platform_inst_caps *caps = inst->core->iris_platform_data->inst_caps;
@@ -309,12 +261,8 @@ int iris_get_buffer_size(struct iris_inst *inst,
 		case BUF_INPUT:
 			return iris_dec_bitstream_buffer_size(inst);
 		case BUF_OUTPUT:
-			if (inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010)
-				return iris_yuv_buffer_size_p010(inst);
 			return iris_yuv_buffer_size_nv12(inst);
 		case BUF_DPB:
-			if (inst->fmt_dst->fmt.pix_mp.pixelformat == V4L2_PIX_FMT_P010)
-				return iris_yuv_buffer_size_qc10c(inst);
 			return iris_yuv_buffer_size_qc08c(inst);
 		default:
 			return 0;
@@ -335,40 +283,9 @@ static void iris_fill_internal_buf_info(struct iris_inst *inst,
 					enum iris_buffer_type buffer_type)
 {
 	struct iris_buffers *buffers = &inst->buffers[buffer_type];
-	bool exact_firmware_size;
-	u32 calculated_size;
 
-	calculated_size = iris_vpu_buf_size(inst, buffer_type);
-	exact_firmware_size = inst->domain == DECODER &&
-		inst->core->iris_platform_data->legacy_vpu5 &&
-		inst->fw_buffer_sizes[buffer_type];
-	/*
-	 * VIDEO.IR.1.2 reports the exact internal allocation sizes after the
-	 * session properties have been applied.  The generic Iris formulas are
-	 * for newer hardware and substantially overestimate VPU5 decoder scratch
-	 * memory (272 MiB instead of 20 MiB for 4K HEVC), preventing two legal
-	 * sessions from coexisting.  Qualcomm's downstream VPU5 driver likewise
-	 * allocates the firmware-reported size directly.  Keep the formula as a
-	 * fallback when no requirement was returned and for non-VPU5 hardware.
-	 */
-	if (exact_firmware_size) {
-		buffers->size = inst->fw_buffer_sizes[buffer_type];
-		if (buffers->size != calculated_size)
-			dev_info(inst->core->dev,
-				 "Iris1 v145: buffer type %u using exact firmware size %u instead of calculated %u\n",
-				 buffer_type, buffers->size, calculated_size);
-	} else {
-		buffers->size = max(calculated_size,
-				    inst->fw_buffer_sizes[buffer_type]);
-	}
+	buffers->size = inst->core->iris_platform_data->get_vpu_buffer_size(inst, buffer_type);
 	buffers->min_count = iris_vpu_buf_count(inst, buffer_type);
-
-	if (!exact_firmware_size &&
-	    inst->fw_buffer_sizes[buffer_type] > calculated_size)
-		dev_info(inst->core->dev,
-			 "Iris1 v58: buffer type %u using firmware size %u instead of calculated %u\n",
-			 buffer_type, inst->fw_buffer_sizes[buffer_type],
-			 calculated_size);
 }
 
 void iris_get_internal_buffers(struct iris_inst *inst, u32 plane)
@@ -420,24 +337,13 @@ static int iris_create_internal_buffer(struct iris_inst *inst,
 
 	INIT_LIST_HEAD(&buffer->list);
 	buffer->type = buffer_type;
-	/*
-	 * Split-mode DPBs and client capture buffers share the HFI output-tag
-	 * namespace.  Keep their tags disjoint, as the Venus driver does with
-	 * ida_alloc_min(VB2_MAX_FRAME), or VP9 rejects both streams' FTBs.
-	 */
-	if (buffer_type == BUF_DPB)
-		buffer->index = VIDEO_MAX_FRAME + index;
-	else
-		buffer->index = index;
+	buffer->index = index;
 	buffer->buffer_size = buffers->size;
 	buffer->dma_attrs = DMA_ATTR_WRITE_COMBINE | DMA_ATTR_NO_KERNEL_MAPPING;
 
 	buffer->kvaddr = dma_alloc_attrs(core->dev, buffer->buffer_size,
 					 &buffer->device_addr, GFP_KERNEL, buffer->dma_attrs);
 	if (!buffer->kvaddr) {
-		dev_err(core->dev,
-			"Iris1 v121: internal DMA allocation failed type=%u index=%u size=%zu\n",
-			buffer_type, index, buffer->buffer_size);
 		kfree(buffer);
 		return -ENOMEM;
 	}
@@ -665,10 +571,12 @@ static int iris_release_internal_buffers(struct iris_inst *inst,
 			continue;
 		if (!(buffer->attr & BUF_ATTR_QUEUED))
 			continue;
-		ret = hfi_ops->session_release_buf(inst, buffer);
-		if (ret)
-			return ret;
 		buffer->attr |= BUF_ATTR_PENDING_RELEASE;
+		ret = hfi_ops->session_release_buf(inst, buffer);
+		if (ret) {
+			buffer->attr &= ~BUF_ATTR_PENDING_RELEASE;
+			return ret;
+		}
 	}
 
 	return 0;
@@ -844,11 +752,6 @@ int iris_vb2_buffer_done(struct iris_inst *inst, struct iris_buffer *buf)
 		return -EINVAL;
 
 	vb2 = &vbuf->vb2_buf;
-	if (inst->start_streaming_rollback_type == type) {
-		/* A failed start_streaming() must return every buffer as QUEUED. */
-		v4l2_m2m_buf_done(vbuf, VB2_BUF_STATE_QUEUED);
-		return 0;
-	}
 
 	vbuf->flags |= buf->flags;
 

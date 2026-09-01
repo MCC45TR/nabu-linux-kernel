@@ -9,18 +9,17 @@
 
 #include "display/intel_display_reset.h"
 #include "display/intel_overlay.h"
-
 #include "gem/i915_gem_context.h"
-
 #include "gt/intel_gt_regs.h"
-
 #include "gt/uc/intel_gsc_fw.h"
+#include "uc/intel_guc.h"
 
 #include "i915_drv.h"
 #include "i915_file_private.h"
 #include "i915_gpu_error.h"
 #include "i915_irq.h"
 #include "i915_reg.h"
+#include "i915_wait_util.h"
 #include "intel_breadcrumbs.h"
 #include "intel_engine_pm.h"
 #include "intel_engine_regs.h"
@@ -31,8 +30,6 @@
 #include "intel_mchbar_regs.h"
 #include "intel_pci_config.h"
 #include "intel_reset.h"
-
-#include "uc/intel_guc.h"
 
 #define RESET_MAX_RETRIES 3
 
@@ -135,7 +132,8 @@ void __i915_request_reset(struct i915_request *rq, bool guilty)
 	rcu_read_lock(); /* protect the GEM context */
 	if (guilty) {
 		i915_request_set_error_once(rq, -EIO);
-		__i915_request_skip(rq);
+		if (!i915_request_signaled(rq))
+			__i915_request_skip(rq);
 		banned = mark_guilty(rq);
 	} else {
 		i915_request_set_error_once(rq, -EAGAIN);

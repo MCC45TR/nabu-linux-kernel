@@ -11,6 +11,7 @@
 #define __MXC_ISI_CORE_H__
 
 #include <linux/list.h>
+#include <linux/math.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -202,9 +203,8 @@ struct mxc_isi_video {
 	struct video_device		vdev;
 	struct media_pad		pad;
 
-	/* Protects is_streaming, and the vdev and vb2_q operations */
+	/* Protects the vdev and vb2_q operations */
 	struct mutex			lock;
-	bool				is_streaming;
 
 	struct v4l2_pix_format_mplane	pix;
 	const struct mxc_isi_format_info *fmtinfo;
@@ -343,6 +343,8 @@ int mxc_isi_video_buffer_prepare(struct mxc_isi_dev *isi, struct vb2_buffer *vb2
 #ifdef CONFIG_VIDEO_IMX8_ISI_M2M
 int mxc_isi_m2m_register(struct mxc_isi_dev *isi, struct v4l2_device *v4l2_dev);
 int mxc_isi_m2m_unregister(struct mxc_isi_dev *isi);
+void mxc_isi_m2m_suspend(struct mxc_isi_m2m *m2m);
+int mxc_isi_m2m_resume(struct mxc_isi_m2m *m2m);
 #else
 static inline int mxc_isi_m2m_register(struct mxc_isi_dev *isi,
 				       struct v4l2_device *v4l2_dev)
@@ -350,6 +352,13 @@ static inline int mxc_isi_m2m_register(struct mxc_isi_dev *isi,
 	return 0;
 }
 static inline int mxc_isi_m2m_unregister(struct mxc_isi_dev *isi)
+{
+	return 0;
+}
+static inline void mxc_isi_m2m_suspend(struct mxc_isi_m2m *m2m)
+{
+}
+static inline int mxc_isi_m2m_resume(struct mxc_isi_m2m *m2m)
 {
 	return 0;
 }
@@ -362,7 +371,7 @@ void mxc_isi_channel_get(struct mxc_isi_pipe *pipe);
 void mxc_isi_channel_put(struct mxc_isi_pipe *pipe);
 void mxc_isi_channel_enable(struct mxc_isi_pipe *pipe);
 void mxc_isi_channel_disable(struct mxc_isi_pipe *pipe);
-int mxc_isi_channel_chain(struct mxc_isi_pipe *pipe, bool bypass);
+int mxc_isi_channel_chain(struct mxc_isi_pipe *pipe);
 void mxc_isi_channel_unchain(struct mxc_isi_pipe *pipe);
 
 void mxc_isi_channel_config(struct mxc_isi_pipe *pipe,
@@ -403,5 +412,20 @@ static inline void mxc_isi_debug_cleanup(struct mxc_isi_dev *isi)
 {
 }
 #endif
+
+/*
+ * ISI scaling engine works in two parts: it performs pre-decimation of
+ * the image followed by bilinear filtering to achieve the desired
+ * downscaling factor.
+ *
+ * The decimation filter provides a maximum downscaling factor of 8, and
+ * the subsequent bilinear filter provides a maximum downscaling factor
+ * of 2. Combined, the maximum scaling factor can be up to 16.
+ */
+static inline unsigned int
+mxc_isi_clamp_downscale_16(unsigned int val, unsigned int max_val)
+{
+	return clamp(val, max(1U, DIV_ROUND_UP(max_val, 16)), max_val);
+}
 
 #endif /* __MXC_ISI_CORE_H__ */

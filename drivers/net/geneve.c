@@ -53,7 +53,6 @@ struct geneve_dev_node {
 };
 
 struct geneve_config {
-	struct ip_tunnel_info	info;
 	bool			collect_md;
 	bool			use_udp6_rx_checksums;
 	bool			ttl_inherit;
@@ -61,6 +60,9 @@ struct geneve_config {
 	bool			inner_proto_inherit;
 	u16			port_min;
 	u16			port_max;
+
+	/* Must be last --ends in a flexible-array member. */
+	struct ip_tunnel_info	info;
 };
 
 /* Pseudo network device */
@@ -1733,6 +1735,9 @@ static int geneve_changelink(struct net_device *dev, struct nlattr *tb[],
 	struct geneve_sock *gs4, *gs6;
 	struct geneve_config cfg;
 	int err;
+
+	if (!rtnl_dev_link_net_capable(dev, geneve->net))
+		return -EPERM;
 
 	/* If the geneve device is configured for metadata (or externally
 	 * controlled, for example, OVS), then nothing can be changed.

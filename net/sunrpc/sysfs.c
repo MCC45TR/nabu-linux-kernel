@@ -326,7 +326,7 @@ static ssize_t rpc_sysfs_xprt_switch_add_xprt_store(struct kobject *kobj,
 {
 	struct rpc_xprt_switch *xprt_switch =
 		rpc_sysfs_xprt_switch_kobj_get_xprt(kobj);
-	struct xprt_create xprt_create_args;
+	struct xprt_create xprt_create_args = {};
 	struct rpc_xprt *xprt, *new;
 
 	if (!xprt_switch)
@@ -347,7 +347,7 @@ static ssize_t rpc_sysfs_xprt_switch_add_xprt_store(struct kobject *kobj,
 	xprt_create_args.reconnect_timeout = xprt->max_reconnect_timeout;
 
 	new = xprt_create_transport(&xprt_create_args);
-	if (IS_ERR_OR_NULL(new)) {
+	if (IS_ERR(new)) {
 		count = PTR_ERR(new);
 		goto out_put_xprt;
 	}
@@ -389,7 +389,7 @@ static ssize_t rpc_sysfs_xprt_dstaddr_store(struct kobject *kobj,
 	saddr = (struct sockaddr *)&xprt->addr;
 	port = rpc_get_port(saddr);
 
-	/* buf_len is the len until the first occurence of either
+	/* buf_len is the len until the first occurrence of either
 	 * '\n' or '\0'
 	 */
 	buf_len = strcspn(buf, "\n");

@@ -13,7 +13,7 @@
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
 #include <linux/remoteproc/qcom_rproc.h>
-#include <linux/of_address.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/iommu.h>
 
 #include "ce.h"
@@ -1559,19 +1559,11 @@ static void ath10k_modem_deinit(struct ath10k *ar)
 static int ath10k_setup_msa_resources(struct ath10k *ar, u32 msa_size)
 {
 	struct device *dev = ar->dev;
-	struct device_node *node;
 	struct resource r;
 	int ret;
 
-	node = of_parse_phandle(dev->of_node, "memory-region", 0);
-	if (node) {
-		ret = of_address_to_resource(node, 0, &r);
-		of_node_put(node);
-		if (ret) {
-			dev_err(dev, "failed to resolve msa fixed region\n");
-			return ret;
-		}
-
+	ret = of_reserved_mem_region_to_resource(dev->of_node, 0, &r);
+	if (!ret) {
 		ar->msa.paddr = r.start;
 		ar->msa.mem_size = resource_size(&r);
 		ar->msa.vaddr = devm_memremap(dev, ar->msa.paddr,
@@ -1823,18 +1815,9 @@ static int ath10k_snoc_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_qmi_deinit;
 
-	ret = device_init_wakeup(dev, true);
-	if (ret) {
-		ath10k_warn(ar, "failed to enable wakeup support: %d\n", ret);
-		goto err_modem_deinit;
-	}
-
 	ath10k_dbg(ar, ATH10K_DBG_SNOC, "snoc probe\n");
 
 	return 0;
-
-err_modem_deinit:
-	ath10k_modem_deinit(ar);
 
 err_qmi_deinit:
 	ath10k_qmi_deinit(ar);
@@ -1861,7 +1844,6 @@ static int ath10k_snoc_free_resources(struct ath10k *ar)
 	ath10k_dbg(ar, ATH10K_DBG_SNOC, "snoc free resources\n");
 
 	set_bit(ATH10K_SNOC_FLAG_UNREGISTERING, &ar_snoc->flags);
-	device_init_wakeup(ar->dev, false);
 
 	ath10k_core_unregister(ar);
 	ath10k_fw_deinit(ar);

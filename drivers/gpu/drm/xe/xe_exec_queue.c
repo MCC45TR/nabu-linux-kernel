@@ -10,8 +10,10 @@
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
+#include <drm/drm_syncobj.h>
 #include <uapi/drm/xe_drm.h>
 
+#include "xe_dep_scheduler.h"
 #include "xe_device.h"
 #include "xe_gt.h"
 #include "xe_hw_engine_class_sysfs.h"
@@ -39,6 +41,12 @@ static int exec_queue_user_extensions(struct xe_device *xe, struct xe_exec_queue
 
 static void __xe_exec_queue_free(struct xe_exec_queue *q)
 {
+	int i;
+
+	for (i = 0; i < XE_EXEC_QUEUE_TLB_INVAL_COUNT; ++i)
+		if (q->tlb_inval[i].dep_scheduler)
+			xe_dep_scheduler_fini(q->tlb_inval[i].dep_scheduler);
+
 	if (xe_exec_queue_uses_pxp(q))
 		xe_pxp_exec_queue_remove(gt_to_xe(q->gt)->pxp, q);
 	if (q->vm)
@@ -48,6 +56,39 @@ static void __xe_exec_queue_free(struct xe_exec_queue *q)
 		xe_file_put(q->xef);
 
 	kfree(q);
+}
+
+static int alloc_dep_schedulers(struct xe_device *xe, struct xe_exec_queue *q)
+{
+	struct xe_tile *tile = gt_to_tile(q->gt);
+	int i;
+
+	for (i = 0; i < XE_EXEC_QUEUE_TLB_INVAL_COUNT; ++i) {
+		struct xe_dep_scheduler *dep_scheduler;
+		struct xe_gt *gt;
+		struct workqueue_struct *wq;
+
+		if (i == XE_EXEC_QUEUE_TLB_INVAL_PRIMARY_GT)
+			gt = tile->primary_gt;
+		else
+			gt = tile->media_gt;
+
+		if (!gt)
+			continue;
+
+		wq = gt->tlb_inval.job_wq;
+
+#define MAX_TLB_INVAL_JOBS	16	/* Picking a reasonable value */
+		dep_scheduler = xe_dep_scheduler_create(xe, wq, q->name,
+							MAX_TLB_INVAL_JOBS);
+		if (IS_ERR(dep_scheduler))
+			return PTR_ERR(dep_scheduler);
+
+		q->tlb_inval[i].dep_scheduler = dep_scheduler;
+	}
+#undef MAX_TLB_INVAL_JOBS
+
+	return 0;
 }
 
 static struct xe_exec_queue *__xe_exec_queue_alloc(struct xe_device *xe,
@@ -93,6 +134,14 @@ static struct xe_exec_queue *__xe_exec_queue_alloc(struct xe_device *xe,
 		q->sched_props.priority = XE_EXEC_QUEUE_PRIORITY_KERNEL;
 	else
 		q->sched_props.priority = XE_EXEC_QUEUE_PRIORITY_NORMAL;
+
+	if (q->flags & (EXEC_QUEUE_FLAG_MIGRATE | EXEC_QUEUE_FLAG_VM)) {
+		err = alloc_dep_schedulers(xe, q);
+		if (err) {
+			__xe_exec_queue_free(q);
+			return ERR_PTR(err);
+		}
+	}
 
 	if (vm)
 		q->vm = xe_vm_get(vm);
@@ -235,6 +284,7 @@ struct xe_exec_queue *xe_exec_queue_create_class(struct xe_device *xe, struct xe
  * @xe: Xe device.
  * @tile: tile which bind exec queue belongs to.
  * @flags: exec queue creation flags
+ * @user_vm: The user VM which this exec queue belongs to
  * @extensions: exec queue creation extensions
  *
  * Normalize bind exec queue creation. Bind exec queue is tied to migration VM
@@ -248,6 +298,7 @@ struct xe_exec_queue *xe_exec_queue_create_class(struct xe_device *xe, struct xe
  */
 struct xe_exec_queue *xe_exec_queue_create_bind(struct xe_device *xe,
 						struct xe_tile *tile,
+						struct xe_vm *user_vm,
 						u32 flags, u64 extensions)
 {
 	struct xe_gt *gt = tile->primary_gt;
@@ -276,6 +327,19 @@ struct xe_exec_queue *xe_exec_queue_create_bind(struct xe_device *xe,
 	}
 	xe_vm_put(migrate_vm);
 
+	if (!IS_ERR(q)) {
+		int err = drm_syncobj_create(&q->ufence_syncobj,
+					     DRM_SYNCOBJ_CREATE_SIGNALED,
+					     NULL);
+		if (err) {
+			xe_exec_queue_put(q);
+			return ERR_PTR(err);
+		}
+
+		if (user_vm)
+			q->user_vm = xe_vm_get(user_vm);
+	}
+
 	return q;
 }
 ALLOW_ERROR_INJECTION(xe_exec_queue_create_bind, ERRNO);
@@ -285,6 +349,9 @@ void xe_exec_queue_destroy(struct kref *ref)
 	struct xe_exec_queue *q = container_of(ref, struct xe_exec_queue, refcount);
 	struct xe_exec_queue *eq, *next;
 
+	if (q->ufence_syncobj)
+		drm_syncobj_put(q->ufence_syncobj);
+
 	if (xe_exec_queue_uses_pxp(q))
 		xe_pxp_exec_queue_remove(gt_to_xe(q->gt)->pxp, q);
 
@@ -293,6 +360,11 @@ void xe_exec_queue_destroy(struct kref *ref)
 		list_for_each_entry_safe(eq, next, &q->multi_gt_list,
 					 multi_gt_link)
 			xe_exec_queue_put(eq);
+	}
+
+	if (q->user_vm) {
+		xe_vm_put(q->user_vm);
+		q->user_vm = NULL;
 	}
 
 	q->ops->destroy(q);
@@ -630,6 +702,22 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 		    XE_IOCTL_DBG(xe, eci[0].engine_instance != 0))
 			return -EINVAL;
 
+		vm = xe_vm_lookup(xef, args->vm_id);
+		if (XE_IOCTL_DBG(xe, !vm))
+			return -ENOENT;
+
+		err = down_read_interruptible(&vm->lock);
+		if (err) {
+			xe_vm_put(vm);
+			return err;
+		}
+
+		if (XE_IOCTL_DBG(xe, xe_vm_is_closed_or_banned(vm))) {
+			up_read(&vm->lock);
+			xe_vm_put(vm);
+			return -ENOENT;
+		}
+
 		for_each_tile(tile, xe, id) {
 			struct xe_exec_queue *new;
 
@@ -637,9 +725,11 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 			if (id)
 				flags |= EXEC_QUEUE_FLAG_BIND_ENGINE_CHILD;
 
-			new = xe_exec_queue_create_bind(xe, tile, flags,
+			new = xe_exec_queue_create_bind(xe, tile, vm, flags,
 							args->extensions);
 			if (IS_ERR(new)) {
+				up_read(&vm->lock);
+				xe_vm_put(vm);
 				err = PTR_ERR(new);
 				if (q)
 					goto put_exec_queue;
@@ -651,6 +741,8 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 				list_add_tail(&new->multi_gt_list,
 					      &q->multi_gt_link);
 		}
+		up_read(&vm->lock);
+		xe_vm_put(vm);
 	} else {
 		logical_mask = calc_validate_logical_mask(xe, eci,
 							  args->width,
@@ -697,7 +789,7 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 		if (q->vm && q->hwe->hw_engine_group) {
 			err = xe_hw_engine_group_add_exec_queue(q->hwe->hw_engine_group, q);
 			if (err)
-				goto put_exec_queue;
+				goto kill_exec_queue;
 		}
 	}
 
@@ -706,12 +798,15 @@ int xe_exec_queue_create_ioctl(struct drm_device *dev, void *data,
 	/* user id alloc must always be last in ioctl to prevent UAF */
 	err = xa_alloc(&xef->exec_queue.xa, &id, q, xa_limit_32b, GFP_KERNEL);
 	if (err)
-		goto kill_exec_queue;
+		goto del_hw_engine_group;
 
 	args->exec_queue_id = id;
 
 	return 0;
 
+del_hw_engine_group:
+	if (q->vm && q->hwe && q->hwe->hw_engine_group)
+		xe_hw_engine_group_del_exec_queue(q->hwe->hw_engine_group, q);
 kill_exec_queue:
 	xe_exec_queue_kill(q);
 put_exec_queue:
@@ -747,6 +842,21 @@ int xe_exec_queue_get_property_ioctl(struct drm_device *dev, void *data,
 	xe_exec_queue_put(q);
 
 	return ret;
+}
+
+/**
+ * xe_exec_queue_lrc() - Get the LRC from exec queue.
+ * @q: The exec_queue.
+ *
+ * Retrieves the primary LRC for the exec queue. Note that this function
+ * returns only the first LRC instance, even when multiple parallel LRCs
+ * are configured.
+ *
+ * Return: Pointer to LRC on success, error on failure
+ */
+struct xe_lrc *xe_exec_queue_lrc(struct xe_exec_queue *q)
+{
+	return q->lrc[0];
 }
 
 /**
@@ -1035,4 +1145,52 @@ int xe_exec_queue_last_fence_test_dep(struct xe_exec_queue *q, struct xe_vm *vm)
 	}
 
 	return err;
+}
+
+/**
+ * xe_exec_queue_contexts_hwsp_rebase - Re-compute GGTT references
+ * within all LRCs of a queue.
+ * @q: the &xe_exec_queue struct instance containing target LRCs
+ * @scratch: scratch buffer to be used as temporary storage
+ *
+ * Returns: zero on success, negative error code on failure
+ */
+int xe_exec_queue_contexts_hwsp_rebase(struct xe_exec_queue *q, void *scratch)
+{
+	int i;
+	int err = 0;
+
+	for (i = 0; i < q->width; ++i) {
+		xe_lrc_update_memirq_regs_with_address(q->lrc[i], q->hwe, scratch);
+		xe_lrc_update_hwctx_regs_with_address(q->lrc[i]);
+		err = xe_lrc_setup_wa_bb_with_scratch(q->lrc[i], q->hwe, scratch);
+		if (err)
+			break;
+	}
+
+	return err;
+}
+
+/**
+ * xe_exec_queue_jobs_ring_restore - Re-emit ring commands of requests pending on given queue.
+ * @q: the &xe_exec_queue struct instance
+ */
+void xe_exec_queue_jobs_ring_restore(struct xe_exec_queue *q)
+{
+	struct xe_gpu_scheduler *sched = &q->guc->sched;
+	struct xe_sched_job *job;
+
+	/*
+	 * This routine is used within VF migration recovery. This means
+	 * using the lock here introduces a restriction: we cannot wait
+	 * for any GFX HW response while the lock is taken.
+	 */
+	spin_lock(&sched->base.job_list_lock);
+	list_for_each_entry(job, &sched->base.pending_list, drm.list) {
+		if (xe_sched_job_is_error(job))
+			continue;
+
+		q->ring_ops->emit_job(job);
+	}
+	spin_unlock(&sched->base.job_list_lock);
 }

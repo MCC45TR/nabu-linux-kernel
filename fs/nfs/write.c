@@ -296,7 +296,7 @@ static void nfs_folio_end_writeback(struct folio *folio)
 {
 	struct nfs_server *nfss = NFS_SERVER(folio->mapping->host);
 
-	folio_end_writeback(folio);
+	folio_end_writeback_no_dropbehind(folio);
 	if (atomic_long_dec_return(&nfss->writeback) <
 	    NFS_CONGESTION_OFF_THRESH) {
 		nfss->write_congested = 0;
@@ -593,6 +593,7 @@ static int nfs_do_writepage(struct folio *folio, struct writeback_control *wbc,
 	if (IS_ERR(req))
 		return PTR_ERR(req);
 
+	trace_nfs_do_writepage(req);
 	nfs_folio_set_writeback(folio);
 	WARN_ON_ONCE(test_bit(PG_CLEAN, &req->wb_flags));
 
@@ -656,12 +657,14 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 	int priority = 0;
 	int err;
 
+	trace_nfs_writepages(inode, wbc->range_start, wbc->range_end - wbc->range_start);
+
 	/* Wait with writeback until write congestion eases */
 	if (wbc->sync_mode == WB_SYNC_NONE && nfss->write_congested) {
 		err = wait_event_killable(nfss->write_congestion_wait,
 					  nfss->write_congested == 0);
 		if (err)
-			return err;
+			goto out_err;
 	}
 
 	nfs_inc_stats(inode, NFSIOS_VFSWRITEPAGES);
@@ -692,10 +695,10 @@ int nfs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 	} while (err < 0 && !nfs_error_is_fatal(err));
 	nfs_io_completion_put(ioc);
 
-	if (err < 0)
-		goto out_err;
-	return 0;
+	if (err > 0)
+		err = 0;
 out_err:
+	trace_nfs_writepages_done(inode, wbc->range_start, wbc->range_end - wbc->range_start, err);
 	return err;
 }
 
@@ -745,6 +748,8 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 			clear_bit(PG_MAPPED, &req->wb_head->wb_flags);
 		}
 		spin_unlock(&mapping->i_private_lock);
+
+		folio_end_dropbehind(folio);
 	}
 	nfs_page_group_unlock(req);
 
@@ -802,7 +807,7 @@ nfs_request_add_commit_list(struct nfs_page *req, struct nfs_commit_info *cinfo)
 	mutex_lock(&NFS_I(cinfo->inode)->commit_mutex);
 	nfs_request_add_commit_list_locked(req, &cinfo->mds->list, cinfo);
 	mutex_unlock(&NFS_I(cinfo->inode)->commit_mutex);
-	nfs_folio_mark_unstable(nfs_page_to_folio(req), cinfo);
+	nfs_folio_mark_unstable(req, cinfo);
 }
 EXPORT_SYMBOL_GPL(nfs_request_add_commit_list);
 
@@ -861,10 +866,12 @@ nfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
 	nfs_request_add_commit_list(req, cinfo);
 }
 
-static void nfs_folio_clear_commit(struct folio *folio)
+static void nfs_folio_clear_commit(struct nfs_page *req)
 {
+	struct folio *folio = nfs_page_to_folio(req);
+
 	if (folio) {
-		long nr = folio_nr_pages(folio);
+		long nr = DIV_ROUND_UP(req->wb_bytes, PAGE_SIZE);
 
 		node_stat_mod_folio(folio, NR_WRITEBACK, -nr);
 		wb_stat_mod(&inode_to_bdi(folio->mapping->host)->wb,
@@ -885,7 +892,7 @@ static void nfs_clear_request_commit(struct nfs_commit_info *cinfo,
 			nfs_request_remove_commit_list(req, cinfo);
 		}
 		mutex_unlock(&NFS_I(inode)->commit_mutex);
-		nfs_folio_clear_commit(nfs_page_to_folio(req));
+		nfs_folio_clear_commit(req);
 	}
 }
 
@@ -926,7 +933,7 @@ static void nfs_write_completion(struct nfs_pgio_header *hdr)
 			req->wb_nio = 0;
 			memcpy(&req->wb_verf, &hdr->verf.verifier, sizeof(req->wb_verf));
 			nfs_mark_request_commit(req, hdr->lseg, &cinfo,
-				hdr->pgio_mirror_idx);
+				hdr->ds_commit_idx);
 			goto next;
 		}
 remove_req:
@@ -1017,11 +1024,12 @@ static struct nfs_page *nfs_try_to_update_request(struct folio *folio,
 	unsigned int end;
 	int error;
 
+	trace_nfs_try_to_update_request(folio_inode(folio), offset, bytes);
 	end = offset + bytes;
 
 	req = nfs_lock_and_join_requests(folio);
 	if (IS_ERR_OR_NULL(req))
-		return req;
+		goto out;
 
 	rqend = req->wb_offset + req->wb_bytes;
 	/*
@@ -1043,6 +1051,9 @@ static struct nfs_page *nfs_try_to_update_request(struct folio *folio,
 	else
 		req->wb_bytes = rqend - req->wb_offset;
 	req->wb_nio = 0;
+out:
+	trace_nfs_try_to_update_request_done(folio_inode(folio), offset, bytes,
+					     PTR_ERR_OR_ZERO(req));
 	return req;
 out_flushme:
 	/*
@@ -1053,6 +1064,7 @@ out_flushme:
 	nfs_mark_request_dirty(req);
 	nfs_unlock_and_release_request(req);
 	error = nfs_wb_folio(folio->mapping->host, folio);
+	trace_nfs_try_to_update_request_done(folio_inode(folio), offset, bytes, error);
 	return (error < 0) ? ERR_PTR(error) : NULL;
 }
 
@@ -1090,6 +1102,7 @@ static int nfs_writepage_setup(struct nfs_open_context *ctx,
 	req = nfs_setup_write_request(ctx, folio, offset, count);
 	if (IS_ERR(req))
 		return PTR_ERR(req);
+	trace_nfs_writepage_setup(req);
 	/* Update file length */
 	nfs_grow_file(folio, offset, count);
 	nfs_mark_uptodate(req);
@@ -1290,6 +1303,8 @@ int nfs_update_folio(struct file *file, struct folio *folio,
 
 	nfs_inc_stats(inode, NFSIOS_VFSUPDATEPAGE);
 
+	trace_nfs_update_folio(inode, offset, count);
+
 	dprintk("NFS:       nfs_update_folio(%pD2 %d@%lld)\n", file, count,
 		(long long)(folio_pos(folio) + offset));
 
@@ -1309,6 +1324,7 @@ int nfs_update_folio(struct file *file, struct folio *folio,
 	if (status < 0)
 		nfs_set_pageerror(mapping);
 out:
+	trace_nfs_update_folio_done(inode, offset, count, status);
 	dprintk("NFS:       nfs_update_folio returns %d (isize %lld)\n",
 			status, (long long)i_size_read(inode));
 	return status;
@@ -1521,7 +1537,8 @@ static int nfs_writeback_done(struct rpc_task *task,
 	/* Deal with the suid/sgid bit corner case */
 	if (nfs_should_remove_suid(inode)) {
 		spin_lock(&inode->i_lock);
-		nfs_set_cache_invalid(inode, NFS_INO_INVALID_MODE);
+		nfs_set_cache_invalid(inode, NFS_INO_INVALID_MODE
+				| NFS_INO_REVAL_FORCED);
 		spin_unlock(&inode->i_lock);
 	}
 	return 0;
@@ -1720,7 +1737,7 @@ void nfs_retry_commit(struct list_head *page_list,
 		req = nfs_list_entry(page_list->next);
 		nfs_list_remove_request(req);
 		nfs_mark_request_commit(req, lseg, cinfo, ds_commit_idx);
-		nfs_folio_clear_commit(nfs_page_to_folio(req));
+		nfs_folio_clear_commit(req);
 		nfs_unlock_and_release_request(req);
 	}
 }
@@ -1792,7 +1809,7 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 		req = nfs_list_entry(data->pages.next);
 		nfs_list_remove_request(req);
 		folio = nfs_page_to_folio(req);
-		nfs_folio_clear_commit(folio);
+		nfs_folio_clear_commit(req);
 
 		dprintk("NFS:       commit (%s/%llu %d@%lld)",
 			nfs_req_openctx(req)->dentry->d_sb->s_id,
@@ -1806,7 +1823,7 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 				nfs_mapping_set_error(folio, status);
 				nfs_inode_remove_request(req);
 			}
-			dprintk_cont(", error = %d\n", status);
+			dprintk(", error = %d\n", status);
 			goto next;
 		}
 
@@ -1816,11 +1833,11 @@ static void nfs_commit_release_pages(struct nfs_commit_data *data)
 			/* We have a match */
 			if (folio)
 				nfs_inode_remove_request(req);
-			dprintk_cont(" OK\n");
+			dprintk(" OK\n");
 			goto next;
 		}
 		/* We have a mismatch. Write the page again */
-		dprintk_cont(" mismatch\n");
+		dprintk(" mismatch\n");
 		nfs_mark_request_dirty(req);
 		atomic_long_inc(&NFS_I(data->inode)->redirtied_pages);
 	next:
@@ -2007,6 +2024,39 @@ int nfs_wb_folio_cancel(struct inode *inode, struct folio *folio)
 	}
 
 	return ret;
+}
+
+/**
+ * nfs_wb_folio_reclaim - Write back all requests on one page
+ * @inode: pointer to page
+ * @folio: pointer to folio
+ *
+ * Assumes that the folio has been locked by the caller
+ */
+int nfs_wb_folio_reclaim(struct inode *inode, struct folio *folio)
+{
+	loff_t range_start = folio_pos(folio);
+	size_t len = folio_size(folio);
+	struct writeback_control wbc = {
+		.sync_mode = WB_SYNC_ALL,
+		.nr_to_write = 0,
+		.range_start = range_start,
+		.range_end = range_start + len - 1,
+		.for_sync = 1,
+	};
+	int ret;
+
+	if (folio_test_writeback(folio))
+		return -EBUSY;
+	if (folio_clear_dirty_for_io(folio)) {
+		trace_nfs_writeback_folio_reclaim(inode, range_start, len);
+		ret = nfs_writepage_locked(folio, &wbc);
+		trace_nfs_writeback_folio_reclaim_done(inode, range_start, len,
+						       ret);
+		return ret;
+	}
+	nfs_commit_inode(inode, 0);
+	return 0;
 }
 
 /**

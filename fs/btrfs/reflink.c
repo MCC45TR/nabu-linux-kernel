@@ -23,7 +23,7 @@ static int clone_finish_inode_update(struct btrfs_trans_handle *trans,
 				     u64 endoff,
 				     const u64 destoff,
 				     const u64 olen,
-				     int no_time_update)
+				     bool no_time_update)
 {
 	int ret;
 
@@ -43,7 +43,7 @@ static int clone_finish_inode_update(struct btrfs_trans_handle *trans,
 	}
 
 	ret = btrfs_update_inode(trans, BTRFS_I(inode));
-	if (ret) {
+	if (unlikely(ret)) {
 		btrfs_abort_transaction(trans, ret);
 		btrfs_end_transaction(trans);
 		return ret;
@@ -93,9 +93,7 @@ static int copy_inline_to_page(struct btrfs_inode *inode,
 	if (ret < 0)
 		goto out_unlock;
 
-	btrfs_clear_extent_bit(&inode->io_tree, file_offset, range_end,
-			       EXTENT_DELALLOC | EXTENT_DO_ACCOUNTING | EXTENT_DEFRAG, NULL);
-	ret = btrfs_set_extent_delalloc(inode, file_offset, range_end, 0, NULL);
+	ret = btrfs_reset_extent_delalloc(inode, file_offset, range_end, 0, NULL);
 	if (ret)
 		goto out_unlock;
 
@@ -180,10 +178,12 @@ static int clone_copy_inline_extent(struct btrfs_inode *inode,
 	struct btrfs_drop_extents_args drop_args = { 0 };
 	int ret;
 	struct btrfs_key key;
+	bool copied_inline_to_page = false;
 
 	if (new_key->offset > 0) {
 		ret = copy_inline_to_page(inode, new_key->offset,
 					  inline_data, size, datal, comp_type);
+		copied_inline_to_page = (ret == 0);
 		goto out;
 	}
 
@@ -268,12 +268,12 @@ copy_inline_extent:
 	drop_args.end = aligned_end;
 	drop_args.drop_cache = true;
 	ret = btrfs_drop_extents(trans, root, inode, &drop_args);
-	if (ret) {
+	if (unlikely(ret)) {
 		btrfs_abort_transaction(trans, ret);
 		goto out;
 	}
 	ret = btrfs_insert_empty_item(trans, root, path, new_key, size);
-	if (ret) {
+	if (unlikely(ret)) {
 		btrfs_abort_transaction(trans, ret);
 		goto out;
 	}
@@ -285,10 +285,64 @@ copy_inline_extent:
 	btrfs_update_inode_bytes(inode, datal, drop_args.bytes_found);
 	btrfs_set_inode_full_sync(inode);
 	ret = btrfs_inode_set_file_extent_range(inode, 0, aligned_end);
-	if (ret)
+	if (unlikely(ret))
 		btrfs_abort_transaction(trans, ret);
 out:
 	if (!ret && !trans) {
+		if (copied_inline_to_page &&
+		    new_key->offset + datal > i_size_read(&inode->vfs_inode)) {
+			/*
+			 * If we copied the inline extent data to a page/folio
+			 * beyond the i_size of the destination inode, then we
+			 * need to increase the i_size before we start a
+			 * transaction to update the inode item. This is to
+			 * prevent a deadlock when the flushoncommit mount
+			 * option is used, which happens like this:
+			 *
+			 * 1) Task A clones an inline extent from inode X to an
+			 *    offset of inode Y that is beyond Y's current
+			 *    i_size. This means we copied the inline extent's
+			 *    data to a folio of inode Y that is beyond its EOF,
+			 *    using the call above to copy_inline_to_page();
+			 *
+			 * 2) Task B starts a transaction commit and calls
+			 *    btrfs_start_delalloc_flush() to flush delalloc;
+			 *
+			 * 3) The delalloc flushing sees the new dirty folio of
+			 *    inode Y and when it attempts to flush it, it ends
+			 *    up at extent_writepage() and sees that the offset
+			 *    of the folio is beyond the i_size of inode Y, so
+			 *    it attempts to invalidate the folio by calling
+			 *    folio_invalidate(), which ends up at btrfs' folio
+			 *    invalidate callback - btrfs_invalidate_folio().
+			 *    There it tries to lock the folio's range in inode
+			 *    Y's extent io tree, but it blocks since it's
+			 *    currently locked by task A - during reflink we
+			 *    lock the inodes and the source and destination
+			 *    ranges after flushing all delalloc and waiting for
+			 *    ordered extent completion - after that we don't
+			 *    expect to have dirty folios in the ranges, the
+			 *    exception is if we have to copy an inline extent's
+			 *    data (because the destination offset is not zero);
+			 *
+			 * 4) Task A then does the 'goto out' below and attempts
+			 *    to start a transaction to update the inode item,
+			 *    and then it's blocked since the current
+			 *    transaction is in the TRANS_STATE_COMMIT_START
+			 *    state. Therefore task A has to wait for the
+			 *    current transaction to become unblocked (its
+			 *    state >= TRANS_STATE_UNBLOCKED).
+			 *
+			 * This leads to a deadlock - the task committing the
+			 * transaction waiting for the delalloc flushing which
+			 * is blocked during folio invalidation on the inode's
+			 * extent lock and the reflink task waiting for the
+			 * current transaction to be unblocked so that it can
+			 * start a new one to update the inode item (while
+			 * holding the extent lock).
+			 */
+			i_size_write(&inode->vfs_inode, new_key->offset + datal);
+		}
 		/*
 		 * No transaction here means we copied the inline extent into a
 		 * page of the destination inode.
@@ -321,6 +375,8 @@ copy_to_page:
 
 	ret = copy_inline_to_page(inode, new_key->offset,
 				  inline_data, size, datal, comp_type);
+	copied_inline_to_page = (ret == 0);
+
 	goto out;
 }
 
@@ -337,10 +393,10 @@ copy_to_page:
  */
 static int btrfs_clone(struct inode *src, struct inode *inode,
 		       const u64 off, const u64 olen, const u64 olen_aligned,
-		       const u64 destoff, int no_time_update)
+		       const u64 destoff, bool no_time_update)
 {
 	struct btrfs_fs_info *fs_info = inode_to_fs_info(inode);
-	struct btrfs_path *path = NULL;
+	BTRFS_PATH_AUTO_FREE(path);
 	struct extent_buffer *leaf;
 	struct btrfs_trans_handle *trans;
 	char *buf = NULL;
@@ -611,7 +667,6 @@ process_slot:
 	}
 
 out:
-	btrfs_free_path(path);
 	kvfree(buf);
 	clear_bit(BTRFS_INODE_NO_DELALLOC_FLUSH, &BTRFS_I(inode)->runtime_flags);
 

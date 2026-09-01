@@ -8,6 +8,7 @@
  * Authors: Microsoft Linux virtualization team
  */
 
+#include <linux/entry-virt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/fs.h>
@@ -36,12 +37,6 @@
 MODULE_AUTHOR("Microsoft");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Microsoft Hyper-V root partition VMM interface /dev/mshv");
-
-/* TODO move this to mshyperv.h when needed outside driver */
-static inline bool hv_parent_partition(void)
-{
-	return hv_root_partition();
-}
 
 /* TODO move this to another file when debugfs code is added */
 enum hv_stats_vp_counters {			/* HV_THREAD_COUNTER */
@@ -164,6 +159,7 @@ static int mshv_ioctl_passthru_hvcall(struct mshv_partition *partition,
 	unsigned int pages_order;
 	void *input_pg = NULL;
 	void *output_pg = NULL;
+	u16 reps_completed;
 
 	if (copy_from_user(&args, user_args, sizeof(args)))
 		return -EFAULT;
@@ -215,41 +211,42 @@ static int mshv_ioctl_passthru_hvcall(struct mshv_partition *partition,
 	 */
 	*(u64 *)input_pg = partition->pt_id;
 
-	if (args.reps)
-		status = hv_do_rep_hypercall(args.code, args.reps, 0,
-					     input_pg, output_pg);
-	else
-		status = hv_do_hypercall(args.code, input_pg, output_pg);
-
-	if (hv_result(status) == HV_STATUS_CALL_PENDING) {
-		if (is_async) {
-			mshv_async_hvcall_handler(partition, &status);
-		} else { /* Paranoia check. This shouldn't happen! */
-			ret = -EBADFD;
-			goto free_pages_out;
+	reps_completed = 0;
+	do {
+		if (args.reps) {
+			status = hv_do_rep_hypercall_ex(args.code, args.reps,
+							0, reps_completed,
+							input_pg, output_pg);
+			reps_completed = hv_repcomp(status);
+		} else {
+			status = hv_do_hypercall(args.code, input_pg, output_pg);
 		}
-	}
 
-	if (hv_result(status) == HV_STATUS_INSUFFICIENT_MEMORY) {
-		ret = hv_call_deposit_pages(NUMA_NO_NODE, partition->pt_id, 1);
-		if (!ret)
-			ret = -EAGAIN;
-	} else if (!hv_result_success(status)) {
-		ret = hv_result_to_errno(status);
-	}
+		if (hv_result(status) == HV_STATUS_CALL_PENDING) {
+			if (is_async) {
+				mshv_async_hvcall_handler(partition, &status);
+			} else { /* Paranoia check. This shouldn't happen! */
+				ret = -EBADFD;
+				goto free_pages_out;
+			}
+		}
 
-	/*
-	 * Always return the status and output data regardless of result.
-	 * The VMM may need it to determine how to proceed. E.g. the status may
-	 * contain the number of reps completed if a rep hypercall partially
-	 * succeeded.
-	 */
+		if (hv_result_success(status))
+			break;
+
+		if (hv_result(status) != HV_STATUS_INSUFFICIENT_MEMORY)
+			ret = hv_result_to_errno(status);
+		else
+			ret = hv_call_deposit_pages(NUMA_NO_NODE,
+						    partition->pt_id, 1);
+	} while (!ret);
+
 	args.status = hv_result(status);
-	args.reps = args.reps ? hv_repcomp(status) : 0;
+	args.reps = reps_completed;
 	if (copy_to_user(user_args, &args, sizeof(args)))
 		ret = -EFAULT;
 
-	if (output_pg &&
+	if (!ret && output_pg &&
 	    copy_to_user((void __user *)args.out_ptr, output_pg, args.out_sz))
 		ret = -EFAULT;
 
@@ -487,28 +484,6 @@ mshv_vp_wait_for_hv_kick(struct mshv_vp *vp)
 	return 0;
 }
 
-static int mshv_pre_guest_mode_work(struct mshv_vp *vp)
-{
-	const ulong work_flags = _TIF_NOTIFY_SIGNAL | _TIF_SIGPENDING |
-				 _TIF_NEED_RESCHED  | _TIF_NOTIFY_RESUME;
-	ulong th_flags;
-
-	th_flags = read_thread_flags();
-	while (th_flags & work_flags) {
-		int ret;
-
-		/* nb: following will call schedule */
-		ret = mshv_do_pre_guest_mode_work(th_flags);
-
-		if (ret)
-			return ret;
-
-		th_flags = read_thread_flags();
-	}
-
-	return 0;
-}
-
 /* Must be called with interrupts enabled */
 static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 {
@@ -529,9 +504,11 @@ static long mshv_run_vp_with_root_scheduler(struct mshv_vp *vp)
 		u32 flags = 0;
 		struct hv_output_dispatch_vp output;
 
-		ret = mshv_pre_guest_mode_work(vp);
-		if (ret)
-			break;
+		if (__xfer_to_guest_mode_work_pending()) {
+			ret = xfer_to_guest_mode_handle_work();
+			if (ret)
+				break;
+		}
 
 		if (vp->run.flags.intercept_suspend)
 			flags |= HV_DISPATCH_VP_FLAG_CLEAR_INTERCEPT_SUSPEND;
@@ -1002,7 +979,13 @@ mshv_partition_ioctl_create_vp(struct mshv_partition *partition,
 
 	/* already exclusive with the partition mutex for all ioctls */
 	partition->pt_vp_count++;
-	partition->pt_vp_array[args.vp_index] = vp;
+	/*
+	 * Pairs with smp_load_acquire() in mshv_try_assert_irq_fast(), which
+	 * can run concurrently from an irqfd waker without holding pt_mutex.
+	 * The release ensures the VP's initialising stores are visible to any
+	 * reader that observes a non-NULL pointer in pt_vp_array.
+	 */
+	smp_store_release(&partition->pt_vp_array[args.vp_index], vp);
 
 	return ret;
 
@@ -1197,21 +1180,6 @@ mshv_partition_region_by_gfn(struct mshv_partition *partition, u64 gfn)
 	return NULL;
 }
 
-static struct mshv_mem_region *
-mshv_partition_region_by_uaddr(struct mshv_partition *partition, u64 uaddr)
-{
-	struct mshv_mem_region *region;
-
-	hlist_for_each_entry(region, &partition->pt_mem_regions, hnode) {
-		if (uaddr >= region->start_uaddr &&
-		    uaddr < region->start_uaddr +
-			    (region->nr_pages << HV_HYP_PAGE_SHIFT))
-			return region;
-	}
-
-	return NULL;
-}
-
 /*
  * NB: caller checks and makes sure mem->size is page aligned
  * Returns: 0 with regionpp updated on success, or -errno
@@ -1221,15 +1189,21 @@ static int mshv_partition_create_region(struct mshv_partition *partition,
 					struct mshv_mem_region **regionpp,
 					bool is_mmio)
 {
-	struct mshv_mem_region *region;
+	struct mshv_mem_region *region, *rg;
 	u64 nr_pages = HVPFN_DOWN(mem->size);
 
 	/* Reject overlapping regions */
-	if (mshv_partition_region_by_gfn(partition, mem->guest_pfn) ||
-	    mshv_partition_region_by_gfn(partition, mem->guest_pfn + nr_pages - 1) ||
-	    mshv_partition_region_by_uaddr(partition, mem->userspace_addr) ||
-	    mshv_partition_region_by_uaddr(partition, mem->userspace_addr + mem->size - 1))
+	hlist_for_each_entry(rg, &partition->pt_mem_regions, hnode) {
+		u64 rg_size = rg->nr_pages << HV_HYP_PAGE_SHIFT;
+
+		if ((mem->guest_pfn + nr_pages <= rg->start_gfn ||
+		     rg->start_gfn + rg->nr_pages <= mem->guest_pfn) &&
+		    (mem->userspace_addr + mem->size <= rg->start_uaddr ||
+		     rg->start_uaddr + rg_size <= mem->userspace_addr))
+			continue;
+
 		return -EEXIST;
+	}
 
 	region = vzalloc(sizeof(*region) + sizeof(struct page *) * nr_pages);
 	if (!region)
@@ -2074,9 +2048,13 @@ static int __init hv_retrieve_scheduler_type(enum hv_scheduler_type *out)
 /* Retrieve and stash the supported scheduler type */
 static int __init mshv_retrieve_scheduler_type(struct device *dev)
 {
-	int ret;
+	int ret = 0;
 
-	ret = hv_retrieve_scheduler_type(&hv_scheduler_type);
+	if (hv_l1vh_partition())
+		hv_scheduler_type = HV_SCHEDULER_TYPE_CORE_SMT;
+	else
+		ret = hv_retrieve_scheduler_type(&hv_scheduler_type);
+
 	if (ret)
 		return ret;
 
@@ -2203,9 +2181,6 @@ static int __init mshv_root_partition_init(struct device *dev)
 {
 	int err;
 
-	if (mshv_retrieve_scheduler_type(dev))
-		return -ENODEV;
-
 	err = root_scheduler_init(dev);
 	if (err)
 		return err;
@@ -2227,7 +2202,7 @@ static int __init mshv_parent_partition_init(void)
 	struct device *dev;
 	union hv_hypervisor_version_info version_info;
 
-	if (!hv_root_partition() || is_kdump_kernel())
+	if (!hv_parent_partition() || is_kdump_kernel())
 		return -ENODEV;
 
 	if (hv_get_hypervisor_version(&version_info))
@@ -2264,7 +2239,12 @@ static int __init mshv_parent_partition_init(void)
 
 	mshv_cpuhp_online = ret;
 
-	ret = mshv_root_partition_init(dev);
+	ret = mshv_retrieve_scheduler_type(dev);
+	if (ret)
+		goto remove_cpu_state;
+
+	if (hv_root_partition())
+		ret = mshv_root_partition_init(dev);
 	if (ret)
 		goto remove_cpu_state;
 

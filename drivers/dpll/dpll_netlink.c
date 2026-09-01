@@ -165,6 +165,27 @@ dpll_msg_add_phase_offset_monitor(struct sk_buff *msg, struct dpll_device *dpll,
 }
 
 static int
+dpll_msg_add_phase_offset_avg_factor(struct sk_buff *msg,
+				     struct dpll_device *dpll,
+				     struct netlink_ext_ack *extack)
+{
+	const struct dpll_device_ops *ops = dpll_device_ops(dpll);
+	u32 factor;
+	int ret;
+
+	if (ops->phase_offset_avg_factor_get) {
+		ret = ops->phase_offset_avg_factor_get(dpll, dpll_priv(dpll),
+						       &factor, extack);
+		if (ret)
+			return ret;
+		if (nla_put_u32(msg, DPLL_A_PHASE_OFFSET_AVG_FACTOR, factor))
+			return -EMSGSIZE;
+	}
+
+	return 0;
+}
+
+static int
 dpll_msg_add_lock_status(struct sk_buff *msg, struct dpll_device *dpll,
 			 struct netlink_ext_ack *extack)
 {
@@ -465,6 +486,9 @@ dpll_msg_add_pin_ref_sync(struct sk_buff *msg, struct dpll_pin *pin,
 		if (!dpll_pin_available(ref_sync_pin))
 			continue;
 		ref_sync_pin_priv = dpll_pin_on_dpll_priv(dpll, ref_sync_pin);
+		/* Pin may have been unregistered from this dpll already */
+		if (!ref_sync_pin_priv)
+			continue;
 		if (WARN_ON(!ops->ref_sync_get))
 			return -EOPNOTSUPP;
 		ret = ops->ref_sync_get(pin, pin_priv, ref_sync_pin,
@@ -616,6 +640,10 @@ dpll_cmd_pin_get_one(struct sk_buff *msg, struct dpll_pin *pin,
 	ret = dpll_msg_add_pin_freq(msg, pin, ref, extack);
 	if (ret)
 		return ret;
+	if (prop->phase_gran &&
+	    nla_put_u32(msg, DPLL_A_PIN_PHASE_ADJUST_GRAN,
+			prop->phase_gran))
+		return -EMSGSIZE;
 	if (nla_put_s32(msg, DPLL_A_PIN_PHASE_ADJUST_MIN,
 			prop->phase_range.min))
 		return -EMSGSIZE;
@@ -677,6 +705,9 @@ dpll_device_get_one(struct dpll_device *dpll, struct sk_buff *msg,
 	ret = dpll_msg_add_phase_offset_monitor(msg, dpll, extack);
 	if (ret)
 		return ret;
+	ret = dpll_msg_add_phase_offset_avg_factor(msg, dpll, extack);
+	if (ret)
+		return ret;
 
 	return 0;
 }
@@ -714,17 +745,20 @@ err_free_msg:
 
 int dpll_device_create_ntf(struct dpll_device *dpll)
 {
+	dpll_device_notify(dpll, DPLL_DEVICE_CREATED);
 	return dpll_device_event_send(DPLL_CMD_DEVICE_CREATE_NTF, dpll);
 }
 
 int dpll_device_delete_ntf(struct dpll_device *dpll)
 {
+	dpll_device_notify(dpll, DPLL_DEVICE_DELETED);
 	return dpll_device_event_send(DPLL_CMD_DEVICE_DELETE_NTF, dpll);
 }
 
 static int
 __dpll_device_change_ntf(struct dpll_device *dpll)
 {
+	dpll_device_notify(dpll, DPLL_DEVICE_CHANGED);
 	return dpll_device_event_send(DPLL_CMD_DEVICE_CHANGE_NTF, dpll);
 }
 
@@ -782,18 +816,31 @@ err_free_msg:
 
 int dpll_pin_create_ntf(struct dpll_pin *pin)
 {
+	dpll_pin_notify(pin, DPLL_PIN_CREATED);
 	return dpll_pin_event_send(DPLL_CMD_PIN_CREATE_NTF, pin);
 }
 
 int dpll_pin_delete_ntf(struct dpll_pin *pin)
 {
+	dpll_pin_notify(pin, DPLL_PIN_DELETED);
 	return dpll_pin_event_send(DPLL_CMD_PIN_DELETE_NTF, pin);
 }
 
+/**
+ * __dpll_pin_change_ntf - notify that the pin has been changed
+ * @pin: registered pin pointer
+ *
+ * Context: caller must hold dpll_lock. Suitable for use inside pin
+ *          callbacks which are already invoked under dpll_lock.
+ * Return: 0 if succeeds, error code otherwise.
+ */
 int __dpll_pin_change_ntf(struct dpll_pin *pin)
 {
+	lockdep_assert_held(&dpll_lock);
+	dpll_pin_notify(pin, DPLL_PIN_CHANGED);
 	return dpll_pin_event_send(DPLL_CMD_PIN_CHANGE_NTF, pin);
 }
+EXPORT_SYMBOL_GPL(__dpll_pin_change_ntf);
 
 /**
  * dpll_pin_change_ntf - notify that the pin has been changed
@@ -837,6 +884,23 @@ dpll_phase_offset_monitor_set(struct dpll_device *dpll, struct nlattr *a,
 
 	return ops->phase_offset_monitor_set(dpll, dpll_priv(dpll), state,
 					     extack);
+}
+
+static int
+dpll_phase_offset_avg_factor_set(struct dpll_device *dpll, struct nlattr *a,
+				 struct netlink_ext_ack *extack)
+{
+	const struct dpll_device_ops *ops = dpll_device_ops(dpll);
+	u32 factor = nla_get_u32(a);
+
+	if (!ops->phase_offset_avg_factor_set) {
+		NL_SET_ERR_MSG_ATTR(extack, a,
+				    "device not capable of changing phase offset average factor");
+		return -EOPNOTSUPP;
+	}
+
+	return ops->phase_offset_avg_factor_set(dpll, dpll_priv(dpll), factor,
+						extack);
 }
 
 static int
@@ -1220,7 +1284,13 @@ dpll_pin_phase_adj_set(struct dpll_pin *pin, struct nlattr *phase_adj_attr,
 	if (phase_adj > pin->prop.phase_range.max ||
 	    phase_adj < pin->prop.phase_range.min) {
 		NL_SET_ERR_MSG_ATTR(extack, phase_adj_attr,
-				    "phase adjust value not supported");
+				    "phase adjust value of out range");
+		return -EINVAL;
+	}
+	if (pin->prop.phase_gran && phase_adj % (s32)pin->prop.phase_gran) {
+		NL_SET_ERR_MSG_ATTR_FMT(extack, phase_adj_attr,
+					"phase adjust value not multiple of %u",
+					pin->prop.phase_gran);
 		return -EINVAL;
 	}
 
@@ -1518,16 +1588,18 @@ int dpll_nl_pin_id_get_doit(struct sk_buff *skb, struct genl_info *info)
 		return -EMSGSIZE;
 	}
 	pin = dpll_pin_find_from_nlattr(info);
-	if (!IS_ERR(pin)) {
-		if (!dpll_pin_available(pin)) {
-			nlmsg_free(msg);
-			return -ENODEV;
-		}
-		ret = dpll_msg_add_pin_handle(msg, pin);
-		if (ret) {
-			nlmsg_free(msg);
-			return ret;
-		}
+	if (IS_ERR(pin)) {
+		nlmsg_free(msg);
+		return PTR_ERR(pin);
+	}
+	if (!dpll_pin_available(pin)) {
+		nlmsg_free(msg);
+		return -ENODEV;
+	}
+	ret = dpll_msg_add_pin_handle(msg, pin);
+	if (ret) {
+		nlmsg_free(msg);
+		return ret;
 	}
 	genlmsg_end(msg, hdr);
 
@@ -1694,12 +1766,14 @@ int dpll_nl_device_id_get_doit(struct sk_buff *skb, struct genl_info *info)
 	}
 
 	dpll = dpll_device_find_from_nlattr(info);
-	if (!IS_ERR(dpll)) {
-		ret = dpll_msg_add_dev_handle(msg, dpll);
-		if (ret) {
-			nlmsg_free(msg);
-			return ret;
-		}
+	if (IS_ERR(dpll)) {
+		nlmsg_free(msg);
+		return PTR_ERR(dpll);
+	}
+	ret = dpll_msg_add_dev_handle(msg, dpll);
+	if (ret) {
+		nlmsg_free(msg);
+		return ret;
 	}
 	genlmsg_end(msg, hdr);
 
@@ -1736,14 +1810,25 @@ int dpll_nl_device_get_doit(struct sk_buff *skb, struct genl_info *info)
 static int
 dpll_set_from_nlattr(struct dpll_device *dpll, struct genl_info *info)
 {
-	int ret;
+	struct nlattr *a;
+	int rem, ret;
 
-	if (info->attrs[DPLL_A_PHASE_OFFSET_MONITOR]) {
-		struct nlattr *a = info->attrs[DPLL_A_PHASE_OFFSET_MONITOR];
-
-		ret = dpll_phase_offset_monitor_set(dpll, a, info->extack);
-		if (ret)
-			return ret;
+	nla_for_each_attr(a, genlmsg_data(info->genlhdr),
+			  genlmsg_len(info->genlhdr), rem) {
+		switch (nla_type(a)) {
+		case DPLL_A_PHASE_OFFSET_MONITOR:
+			ret = dpll_phase_offset_monitor_set(dpll, a,
+							    info->extack);
+			if (ret)
+				return ret;
+			break;
+		case DPLL_A_PHASE_OFFSET_AVG_FACTOR:
+			ret = dpll_phase_offset_avg_factor_set(dpll, a,
+							       info->extack);
+			if (ret)
+				return ret;
+			break;
+		}
 	}
 
 	return 0;

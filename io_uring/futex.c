@@ -43,7 +43,6 @@ void io_futex_cache_free(struct io_ring_ctx *ctx)
 
 static void __io_futex_complete(struct io_kiocb *req, io_tw_token_t tw)
 {
-	req->async_data = NULL;
 	hlist_del_init(&req->hash_node);
 	io_req_task_complete(req, tw);
 }
@@ -54,6 +53,7 @@ static void io_futex_complete(struct io_kiocb *req, io_tw_token_t tw)
 
 	io_tw_lock(ctx, tw);
 	io_cache_free(&ctx->futex_cache, req->async_data);
+	io_req_async_data_clear(req, 0);
 	__io_futex_complete(req, tw);
 }
 
@@ -72,8 +72,7 @@ static void io_futexv_complete(struct io_kiocb *req, io_tw_token_t tw)
 			io_req_set_res(req, res, 0);
 	}
 
-	kfree(req->async_data);
-	req->flags &= ~REQ_F_ASYNC_DATA;
+	io_req_async_data_free(req);
 	__io_futex_complete(req, tw);
 }
 
@@ -144,6 +143,17 @@ int io_futex_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
 	if (!futex_validate_input(iof->futex_flags, iof->futex_val) ||
 	    !futex_validate_input(iof->futex_flags, iof->futex_mask))
 		return -EINVAL;
+
+	return 0;
+}
+
+int io_futex_wait_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+{
+	int ret;
+
+	ret = io_futex_prep(req, sqe);
+	if (unlikely(ret))
+		return ret;
 
 	/* Mark as inflight, so file exit cancelation will find it */
 	io_req_track_inflight(req);
@@ -232,9 +242,7 @@ int io_futexv_wait(struct io_kiocb *req, unsigned int issue_flags)
 		io_ring_submit_unlock(ctx, issue_flags);
 		req_set_fail(req);
 		io_req_set_res(req, ret, 0);
-		kfree(futexv);
-		req->async_data = NULL;
-		req->flags &= ~REQ_F_ASYNC_DATA;
+		io_req_async_data_free(req);
 		return IOU_COMPLETE;
 	}
 
@@ -310,9 +318,7 @@ done:
 	if (ret < 0)
 		req_set_fail(req);
 	io_req_set_res(req, ret, 0);
-	req->async_data = NULL;
-	req->flags &= ~REQ_F_ASYNC_DATA;
-	kfree(ifd);
+	io_req_async_data_free(req);
 	return IOU_COMPLETE;
 }
 

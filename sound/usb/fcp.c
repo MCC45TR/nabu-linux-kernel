@@ -82,6 +82,7 @@ struct fcp_data {
 	struct mutex mutex;         /* serialise access to the device */
 	struct completion cmd_done; /* wait for command completion */
 	struct file *file;          /* hwdep file */
+	struct urb *urb;            /* FCP notification endpoint */
 
 	struct fcp_notify notify;
 
@@ -128,6 +129,10 @@ struct fcp_data {
 #define FCP_USB_METER_LEVELS_GET_MAGIC 1
 
 #define FCP_SEGMENT_APP_GOLD 0
+
+#define FCP_MAX_METER_MAP_SIZE \
+	(sizeof_field(struct snd_ctl_elem_value, value.integer.value) / \
+	 sizeof(long))
 
 /* Forward declarations */
 static int fcp_init(struct usb_mixer_interface *mixer,
@@ -190,7 +195,7 @@ static int fcp_usb(struct usb_mixer_interface *mixer, u32 opcode,
 	const int max_retries = 5;
 	int err;
 
-	if (!mixer->urb)
+	if (!private->urb)
 		return -ENODEV;
 
 	req = kmalloc(req_buf_size, GFP_KERNEL);
@@ -303,7 +308,7 @@ static int fcp_reinit(struct usb_mixer_interface *mixer)
 	void *step0_resp __free(kfree) = NULL;
 	void *step2_resp __free(kfree) = NULL;
 
-	if (mixer->urb)
+	if (private->urb)
 		return 0;
 
 	step0_resp = kmalloc(private->step0_resp_size, GFP_KERNEL);
@@ -408,6 +413,9 @@ static int fcp_meter_ctl_get(struct snd_kcontrol *kctl,
 		      &req, sizeof(req), resp, resp_size);
 	if (err < 0)
 		return err;
+
+	if (WARN_ON_ONCE(elem->channels > FCP_MAX_METER_MAP_SIZE))
+		return -EINVAL;
 
 	/* copy & translate from resp[] using meter_level_map[] */
 	for (i = 0; i < elem->channels; i++) {
@@ -636,17 +644,15 @@ static int fcp_ioctl_set_meter_map(struct usb_mixer_interface *mixer,
 	}
 
 	/* Validate the map size */
-	if (map.map_size < 1 || map.map_size > 255 ||
+	if (map.map_size < 1 ||
+	    map.map_size > FCP_MAX_METER_MAP_SIZE ||
 	    map.meter_slots < 1 || map.meter_slots > 255)
 		return -EINVAL;
 
 	/* Allocate and copy the map data */
-	tmp_map = kmalloc_array(map.map_size, sizeof(s16), GFP_KERNEL);
-	if (!tmp_map)
-		return -ENOMEM;
-
-	if (copy_from_user(tmp_map, arg->map, map.map_size * sizeof(s16)))
-		return -EFAULT;
+	tmp_map = memdup_array_user(arg->map, map.map_size, sizeof(s16));
+	if (IS_ERR(tmp_map))
+		return PTR_ERR(tmp_map);
 
 	err = validate_meter_map(tmp_map, map.map_size, map.meter_slots);
 	if (err < 0)
@@ -820,7 +826,6 @@ static long fcp_hwdep_read(struct snd_hwdep *hw, char __user *buf,
 {
 	struct usb_mixer_interface *mixer = hw->private_data;
 	struct fcp_data *private = mixer->private_data;
-	unsigned long flags;
 	long ret = 0;
 	u32 event;
 
@@ -832,10 +837,10 @@ static long fcp_hwdep_read(struct snd_hwdep *hw, char __user *buf,
 	if (ret)
 		return ret;
 
-	spin_lock_irqsave(&private->notify.lock, flags);
-	event = private->notify.event;
-	private->notify.event = 0;
-	spin_unlock_irqrestore(&private->notify.lock, flags);
+	scoped_guard(spinlock_irqsave, &private->notify.lock) {
+		event = private->notify.event;
+		private->notify.event = 0;
+	}
 
 	if (copy_to_user(buf, &event, sizeof(event)))
 		return -EFAULT;
@@ -897,13 +902,15 @@ static int fcp_hwdep_init(struct usb_mixer_interface *mixer)
 
 static void fcp_cleanup_urb(struct usb_mixer_interface *mixer)
 {
-	if (!mixer->urb)
+	struct fcp_data *private = mixer->private_data;
+
+	if (!private->urb)
 		return;
 
-	usb_kill_urb(mixer->urb);
-	kfree(mixer->urb->transfer_buffer);
-	usb_free_urb(mixer->urb);
-	mixer->urb = NULL;
+	usb_kill_urb(private->urb);
+	kfree(private->urb->transfer_buffer);
+	usb_free_urb(private->urb);
+	private->urb = NULL;
 }
 
 static void fcp_private_free(struct usb_mixer_interface *mixer)
@@ -946,11 +953,9 @@ static void fcp_notify(struct urb *urb)
 	}
 
 	if (data) {
-		unsigned long flags;
-
-		spin_lock_irqsave(&private->notify.lock, flags);
-		private->notify.event |= data;
-		spin_unlock_irqrestore(&private->notify.lock, flags);
+		scoped_guard(spinlock_irqsave, &private->notify.lock) {
+			private->notify.event |= data;
+		}
 
 		wake_up_interruptible(&private->notify.queue);
 	}
@@ -976,37 +981,37 @@ static int fcp_init_notify(struct usb_mixer_interface *mixer)
 	int err;
 
 	/* Already set up */
-	if (mixer->urb)
+	if (private->urb)
 		return 0;
 
 	if (usb_pipe_type_check(dev, pipe))
 		return -EINVAL;
 
-	mixer->urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (!mixer->urb)
+	private->urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (!private->urb)
 		return -ENOMEM;
 
 	transfer_buffer = kmalloc(private->wMaxPacketSize, GFP_KERNEL);
 	if (!transfer_buffer) {
-		usb_free_urb(mixer->urb);
-		mixer->urb = NULL;
+		usb_free_urb(private->urb);
+		private->urb = NULL;
 		return -ENOMEM;
 	}
 
-	usb_fill_int_urb(mixer->urb, dev, pipe,
+	usb_fill_int_urb(private->urb, dev, pipe,
 			 transfer_buffer, private->wMaxPacketSize,
 			 fcp_notify, mixer, private->bInterval);
 
-	init_completion(&private->cmd_done);
+	reinit_completion(&private->cmd_done);
 
-	err = usb_submit_urb(mixer->urb, GFP_KERNEL);
+	err = usb_submit_urb(private->urb, GFP_KERNEL);
 	if (err) {
 		usb_audio_err(mixer->chip,
 			      "%s: usb_submit_urb failed: %d\n",
 			      __func__, err);
 		kfree(transfer_buffer);
-		usb_free_urb(mixer->urb);
-		mixer->urb = NULL;
+		usb_free_urb(private->urb);
+		private->urb = NULL;
 	}
 
 	return err;
@@ -1057,6 +1062,7 @@ static int fcp_init_private(struct usb_mixer_interface *mixer)
 		return -ENOMEM;
 
 	mutex_init(&private->mutex);
+	init_completion(&private->cmd_done);
 	init_waitqueue_head(&private->notify.queue);
 	spin_lock_init(&private->notify.lock);
 
@@ -1088,6 +1094,8 @@ static int fcp_find_fc_interface(struct usb_mixer_interface *mixer)
 		struct usb_endpoint_descriptor *epd;
 
 		if (desc->bInterfaceClass != 255)
+			continue;
+		if (desc->bNumEndpoints < 1)
 			continue;
 
 		epd = get_endpoint(intf->altsetting, 0);

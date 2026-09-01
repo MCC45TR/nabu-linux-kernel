@@ -1905,7 +1905,7 @@ static int pic32_pinconf_get(struct pinctrl_dev *pctldev, unsigned pin,
 	case PIN_CONFIG_INPUT_ENABLE:
 		arg = !!(readl(bank->reg_base + TRIS_REG) & mask);
 		break;
-	case PIN_CONFIG_OUTPUT:
+	case PIN_CONFIG_LEVEL:
 		arg = !(readl(bank->reg_base + TRIS_REG) & mask);
 		break;
 	default:
@@ -1960,7 +1960,7 @@ static int pic32_pinconf_set(struct pinctrl_dev *pctldev, unsigned pin,
 		case PIN_CONFIG_INPUT_ENABLE:
 			pic32_gpio_direction_input(&bank->gpio_chip, offset);
 			break;
-		case PIN_CONFIG_OUTPUT:
+		case PIN_CONFIG_LEVEL:
 			pic32_gpio_direction_output(&bank->gpio_chip,
 						    offset, arg);
 			break;
@@ -2175,16 +2175,10 @@ static int pic32_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(pctl->reg_base))
 		return PTR_ERR(pctl->reg_base);
 
-	pctl->clk = devm_clk_get(&pdev->dev, NULL);
+	pctl->clk = devm_clk_get_enabled(&pdev->dev, NULL);
 	if (IS_ERR(pctl->clk)) {
 		ret = PTR_ERR(pctl->clk);
-		dev_err(&pdev->dev, "clk get failed\n");
-		return ret;
-	}
-
-	ret = clk_prepare_enable(pctl->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "clk enable failed\n");
+		dev_err(&pdev->dev, "Failed to get and enable clock\n");
 		return ret;
 	}
 
@@ -2240,16 +2234,10 @@ static int pic32_gpio_probe(struct platform_device *pdev)
 	if (irq < 0)
 		return irq;
 
-	bank->clk = devm_clk_get(&pdev->dev, NULL);
+	bank->clk = devm_clk_get_enabled(&pdev->dev, NULL);
 	if (IS_ERR(bank->clk)) {
 		ret = PTR_ERR(bank->clk);
-		dev_err(&pdev->dev, "clk get failed\n");
-		return ret;
-	}
-
-	ret = clk_prepare_enable(bank->clk);
-	if (ret) {
-		dev_err(&pdev->dev, "clk enable failed\n");
+		dev_err(&pdev->dev, "Failed to get and enable clock\n");
 		return ret;
 	}
 

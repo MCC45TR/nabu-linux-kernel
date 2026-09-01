@@ -1416,18 +1416,15 @@ static inline char *debug_get_user_string(const char __user *user_buf,
 {
 	char *buffer;
 
-	buffer = kmalloc(user_len + 1, GFP_KERNEL);
-	if (!buffer)
-		return ERR_PTR(-ENOMEM);
-	if (copy_from_user(buffer, user_buf, user_len) != 0) {
-		kfree(buffer);
-		return ERR_PTR(-EFAULT);
-	}
+	if (!user_len)
+		return ERR_PTR(-EINVAL);
+
+	buffer = memdup_user_nul(user_buf, user_len);
+	if (IS_ERR(buffer))
+		return buffer;
 	/* got the string, now strip linefeed. */
 	if (buffer[user_len - 1] == '\n')
 		buffer[user_len - 1] = 0;
-	else
-		buffer[user_len] = 0;
 	return buffer;
 }
 
@@ -1591,6 +1588,11 @@ static int debug_input_flush_fn(debug_info_t *id, struct debug_view *view,
 {
 	char input_buf[1];
 	int rc = user_len;
+
+	if (!user_len) {
+		rc = -EINVAL;
+		goto out;
+	}
 
 	if (user_len > 0x10000)
 		user_len = 0x10000;

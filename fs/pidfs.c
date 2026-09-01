@@ -306,6 +306,8 @@ static long pidfd_info(struct file *file, unsigned int cmd, unsigned long arg)
 	const struct cred *c;
 	__u64 mask;
 
+	BUILD_BUG_ON(sizeof(struct pidfd_info) != PIDFD_INFO_SIZE_VER1);
+
 	if (!uinfo)
 		return -EINVAL;
 	if (usize < PIDFD_INFO_SIZE_VER0)
@@ -319,7 +321,7 @@ static long pidfd_info(struct file *file, unsigned int cmd, unsigned long arg)
 	 * namespace hierarchy.
 	 */
 	if (!pid_in_current_pidns(pid))
-		return -ESRCH;
+		return -EREMOTE;
 
 	attr = READ_ONCE(pid->attr);
 	if (mask & PIDFD_INFO_EXIT) {
@@ -357,8 +359,11 @@ static long pidfd_info(struct file *file, unsigned int cmd, unsigned long arg)
 
 	if ((kinfo.mask & PIDFD_INFO_COREDUMP) && !(kinfo.coredump_mask)) {
 		task_lock(task);
-		if (task->mm)
-			kinfo.coredump_mask = pidfs_coredump_mask(task->mm->flags);
+		if (task->mm) {
+			unsigned long flags = __mm_flags_get_dumpable(task->mm);
+
+			kinfo.coredump_mask = pidfs_coredump_mask(flags);
+		}
 		task_unlock(task);
 	}
 
@@ -440,7 +445,7 @@ static bool pidfs_ioctl_valid(unsigned int cmd)
 		 * erronously mistook the file descriptor for a pidfd.
 		 * This is not perfect but will catch most cases.
 		 */
-		return (_IOC_TYPE(cmd) == _IOC_TYPE(PIDFD_GET_INFO));
+		return extensible_ioctl_valid(cmd, PIDFD_GET_INFO, PIDFD_INFO_SIZE_VER0);
 	}
 
 	return false;
@@ -718,7 +723,7 @@ static void pidfs_evict_inode(struct inode *inode)
 }
 
 static const struct super_operations pidfs_sops = {
-	.drop_inode	= generic_delete_inode,
+	.drop_inode	= inode_just_drop,
 	.evict_inode	= pidfs_evict_inode,
 	.statfs		= simple_statfs,
 };
@@ -847,7 +852,7 @@ static int pidfs_export_permission(struct handle_to_path_ctx *ctx,
 	return 0;
 }
 
-static struct file *pidfs_export_open(struct path *path, unsigned int oflags)
+static struct file *pidfs_export_open(const struct path *path, unsigned int oflags)
 {
 	/*
 	 * Clear O_LARGEFILE as open_by_handle_at() forces it and raise

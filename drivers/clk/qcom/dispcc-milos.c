@@ -394,7 +394,6 @@ static struct clk_regmap_div disp_cc_mdss_byte0_div_clk_src = {
 			&disp_cc_mdss_byte0_clk_src.clkr.hw,
 		},
 		.num_parents = 1,
-		.flags = CLK_SET_RATE_PARENT,
 		.ops = &clk_regmap_div_ops,
 	},
 };
@@ -937,7 +936,7 @@ static struct qcom_cc_driver_data disp_cc_milos_driver_data = {
 	.clk_regs_configure = disp_cc_milos_clk_regs_configure,
 };
 
-static struct qcom_cc_desc disp_cc_milos_desc = {
+static const struct qcom_cc_desc disp_cc_milos_desc = {
 	.config = &disp_cc_milos_regmap_config,
 	.clks = disp_cc_milos_clocks,
 	.num_clks = ARRAY_SIZE(disp_cc_milos_clocks),

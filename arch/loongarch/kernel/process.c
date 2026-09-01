@@ -130,6 +130,11 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 
 	preempt_enable();
 
+	if (IS_ENABLED(CONFIG_RANDSTRUCT)) {
+		memcpy(dst, src, sizeof(struct task_struct));
+		return 0;
+	}
+
 	if (!used_math())
 		memcpy(dst, src, offsetof(struct task_struct, thread.fpu.fpr));
 	else
@@ -167,7 +172,7 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 	unsigned long childksp;
 	unsigned long tls = args->tls;
 	unsigned long usp = args->stack;
-	unsigned long clone_flags = args->flags;
+	u64 clone_flags = args->flags;
 	struct pt_regs *childregs, *regs = current_pt_regs();
 
 	childksp = (unsigned long)task_stack_page(p) + THREAD_SIZE;

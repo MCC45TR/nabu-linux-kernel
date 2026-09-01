@@ -46,6 +46,7 @@ MODULE_PARM_DESC(super_pages, "Enable/Disable Super Pages support.");
 static int v3d_get_param_ioctl(struct drm_device *dev, void *data,
 			       struct drm_file *file_priv)
 {
+	struct v3d_file_priv *v3d_priv = file_priv->driver_priv;
 	struct v3d_dev *v3d = to_v3d_dev(dev);
 	struct drm_v3d_get_param *args = data;
 	static const u32 reg_map[] = {
@@ -107,6 +108,16 @@ static int v3d_get_param_ioctl(struct drm_device *dev, void *data,
 	case DRM_V3D_PARAM_SUPPORTS_SUPER_PAGES:
 		args->value = !!v3d->gemfs;
 		return 0;
+	case DRM_V3D_PARAM_GLOBAL_RESET_COUNTER:
+		mutex_lock(&v3d->reset_lock);
+		args->value = v3d->reset_counter;
+		mutex_unlock(&v3d->reset_lock);
+		return 0;
+	case DRM_V3D_PARAM_CONTEXT_RESET_COUNTER:
+		mutex_lock(&v3d->reset_lock);
+		args->value = v3d_priv->reset_counter;
+		mutex_unlock(&v3d->reset_lock);
+		return 0;
 	default:
 		DRM_DEBUG("Unknown parameter %d\n", args->param);
 		return -EINVAL;
@@ -119,7 +130,7 @@ v3d_open(struct drm_device *dev, struct drm_file *file)
 	struct v3d_dev *v3d = to_v3d_dev(dev);
 	struct v3d_file_priv *v3d_priv;
 	struct drm_gpu_scheduler *sched;
-	int i;
+	int i, ret;
 
 	v3d_priv = kzalloc(sizeof(*v3d_priv), GFP_KERNEL);
 	if (!v3d_priv)
@@ -129,9 +140,11 @@ v3d_open(struct drm_device *dev, struct drm_file *file)
 
 	for (i = 0; i < V3D_MAX_QUEUES; i++) {
 		sched = &v3d->queue[i].sched;
-		drm_sched_entity_init(&v3d_priv->sched_entity[i],
-				      DRM_SCHED_PRIORITY_NORMAL, &sched,
-				      1, NULL);
+		ret = drm_sched_entity_init(&v3d_priv->sched_entity[i],
+					    DRM_SCHED_PRIORITY_NORMAL, &sched,
+					    1, NULL);
+		if (ret)
+			goto err_sched;
 
 		memset(&v3d_priv->stats[i], 0, sizeof(v3d_priv->stats[i]));
 		seqcount_init(&v3d_priv->stats[i].lock);
@@ -141,16 +154,34 @@ v3d_open(struct drm_device *dev, struct drm_file *file)
 	file->driver_priv = v3d_priv;
 
 	return 0;
+
+err_sched:
+	for (i--; i >= 0; i--)
+		drm_sched_entity_destroy(&v3d_priv->sched_entity[i]);
+	kfree(v3d_priv);
+	return ret;
 }
 
 static void
 v3d_postclose(struct drm_device *dev, struct drm_file *file)
 {
+	struct v3d_dev *v3d = to_v3d_dev(dev);
 	struct v3d_file_priv *v3d_priv = file->driver_priv;
+	unsigned long irqflags;
 	enum v3d_queue q;
 
-	for (q = 0; q < V3D_MAX_QUEUES; q++)
+	for (q = 0; q < V3D_MAX_QUEUES; q++) {
+		struct v3d_queue_state *queue = &v3d->queue[q];
+		struct v3d_job *job = queue->active_job;
+
 		drm_sched_entity_destroy(&v3d_priv->sched_entity[q]);
+
+		if (job && job->base.entity == &v3d_priv->sched_entity[q]) {
+			spin_lock_irqsave(&queue->queue_lock, irqflags);
+			job->file_priv = NULL;
+			spin_unlock_irqrestore(&queue->queue_lock, irqflags);
+		}
+	}
 
 	v3d_perfmon_close_file(v3d_priv);
 	kfree(v3d_priv);
@@ -353,6 +384,8 @@ static int v3d_platform_drm_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(dev, mask);
 	if (ret)
 		goto clk_disable;
+
+	dma_set_max_seg_size(&pdev->dev, UINT_MAX);
 
 	v3d->va_width = 30 + V3D_GET_FIELD(mmu_debug, V3D_MMU_VA_WIDTH);
 

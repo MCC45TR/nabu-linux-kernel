@@ -27,17 +27,13 @@ properties:
       - sdsp
       - cdsp
       - cdsp1
+      - gdsp0
+      - gdsp1
 
   memory-region:
     maxItems: 1
     description:
       Phandle to a node describing memory to be used for remote heap CMA.
-
-  mount-matrix:
-    description:
-      Optional 3x3 mounting rotation matrix for an accelerometer delivered
-      through a sensor DSP FastRPC domain. The driver exports this metadata
-      through the FastRPC misc device for sensor middleware.
 
   qcom,glink-channels:
     description:
@@ -128,9 +124,6 @@ examples:
             compatible = "qcom,fastrpc";
             qcom,glink-channels = "fastrpcglink-apps-dsp";
             label = "sdsp";
-            mount-matrix = "1", "0", "0",
-                           "0", "1", "0",
-                           "0", "0", "1";
             qcom,non-secure-domain;
             #address-cells = <1>;
             #size-cells = <0>;

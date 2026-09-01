@@ -126,8 +126,9 @@ enum hv_dynamic_processor_feature_property {
 
 struct hv_input_get_system_property {
 	u32 property_id; /* enum hv_system_property */
+	u32 reserved;
 	union {
-		u32 as_uint32;
+		u64 as_uint64;
 #if IS_ENABLED(CONFIG_X86)
 		/* enum hv_dynamic_processor_feature_property */
 		u32 hv_processor_feature;
@@ -301,6 +302,7 @@ struct hv_input_map_device_interrupt {
 /* HV_OUTPUT_MAP_DEVICE_INTERRUPT */
 struct hv_output_map_device_interrupt {
 	struct hv_interrupt_entry interrupt_entry;
+	u64 ext_status_deprecated[5];
 } __packed;
 
 /* HV_INPUT_UNMAP_DEVICE_INTERRUPT */

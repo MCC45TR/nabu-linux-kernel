@@ -9,15 +9,26 @@ use crate::{
     device::{Bound, Core},
     error::{to_result, Result},
     prelude::*,
+    sync::aref::ARef,
     transmute::{AsBytes, FromBytes},
-    types::ARef,
 };
+
+/// DMA address type.
+///
+/// Represents a bus address used for Direct Memory Access (DMA) operations.
+///
+/// This is an alias of the kernel's `dma_addr_t`, which may be `u32` or `u64` depending on
+/// `CONFIG_ARCH_DMA_ADDR_T_64BIT`.
+///
+/// Note that this may be `u64` even on 32-bit architectures.
+pub type DmaAddress = bindings::dma_addr_t;
 
 /// Trait to be implemented by DMA capable bus devices.
 ///
 /// The [`dma::Device`](Device) trait should be implemented by bus specific device representations,
-/// where the underlying bus is DMA capable, such as [`pci::Device`](::kernel::pci::Device) or
-/// [`platform::Device`](::kernel::platform::Device).
+/// where the underlying bus is DMA capable, such as:
+#[cfg_attr(CONFIG_PCI, doc = "* [`pci::Device`](kernel::pci::Device)")]
+/// * [`platform::Device`](::kernel::platform::Device)
 pub trait Device: AsRef<device::Device<Core>> {
     /// Set up the device's DMA streaming addressing capabilities.
     ///
@@ -221,9 +232,6 @@ pub mod attrs {
     /// Specifies that writes to the mapping may be buffered to improve performance.
     pub const DMA_ATTR_WRITE_COMBINE: Attrs = Attrs(bindings::DMA_ATTR_WRITE_COMBINE);
 
-    /// Lets the platform to avoid creating a kernel virtual mapping for the allocated buffer.
-    pub const DMA_ATTR_NO_KERNEL_MAPPING: Attrs = Attrs(bindings::DMA_ATTR_NO_KERNEL_MAPPING);
-
     /// Allows platform code to skip synchronization of the CPU cache for the given buffer assuming
     /// that it has been already transferred to 'device' domain.
     pub const DMA_ATTR_SKIP_CPU_SYNC: Attrs = Attrs(bindings::DMA_ATTR_SKIP_CPU_SYNC);
@@ -242,6 +250,77 @@ pub mod attrs {
     /// Indicates that the buffer is fully accessible at an elevated privilege level (and
     /// ideally inaccessible or at least read-only at lesser-privileged levels).
     pub const DMA_ATTR_PRIVILEGED: Attrs = Attrs(bindings::DMA_ATTR_PRIVILEGED);
+
+    /// Indicates that the buffer is MMIO memory.
+    pub const DMA_ATTR_MMIO: Attrs = Attrs(bindings::DMA_ATTR_MMIO);
+}
+
+/// DMA data direction.
+///
+/// Corresponds to the C [`enum dma_data_direction`].
+///
+/// [`enum dma_data_direction`]: srctree/include/linux/dma-direction.h
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub enum DataDirection {
+    /// The DMA mapping is for bidirectional data transfer.
+    ///
+    /// This is used when the buffer can be both read from and written to by the device.
+    /// The cache for the corresponding memory region is both flushed and invalidated.
+    Bidirectional = Self::const_cast(bindings::dma_data_direction_DMA_BIDIRECTIONAL),
+
+    /// The DMA mapping is for data transfer from memory to the device (write).
+    ///
+    /// The CPU has prepared data in the buffer, and the device will read it.
+    /// The cache for the corresponding memory region is flushed before device access.
+    ToDevice = Self::const_cast(bindings::dma_data_direction_DMA_TO_DEVICE),
+
+    /// The DMA mapping is for data transfer from the device to memory (read).
+    ///
+    /// The device will write data into the buffer for the CPU to read.
+    /// The cache for the corresponding memory region is invalidated before CPU access.
+    FromDevice = Self::const_cast(bindings::dma_data_direction_DMA_FROM_DEVICE),
+
+    /// The DMA mapping is not for data transfer.
+    ///
+    /// This is primarily for debugging purposes. With this direction, the DMA mapping API
+    /// will not perform any cache coherency operations.
+    None = Self::const_cast(bindings::dma_data_direction_DMA_NONE),
+}
+
+impl DataDirection {
+    /// Casts the bindgen-generated enum type to a `u32` at compile time.
+    ///
+    /// This function will cause a compile-time error if the underlying value of the
+    /// C enum is out of bounds for `u32`.
+    const fn const_cast(val: bindings::dma_data_direction) -> u32 {
+        // CAST: The C standard allows compilers to choose different integer types for enums.
+        // To safely check the value, we cast it to a wide signed integer type (`i128`)
+        // which can hold any standard C integer enum type without truncation.
+        let wide_val = val as i128;
+
+        // Check if the value is outside the valid range for the target type `u32`.
+        // CAST: `u32::MAX` is cast to `i128` to match the type of `wide_val` for the comparison.
+        if wide_val < 0 || wide_val > u32::MAX as i128 {
+            // Trigger a compile-time error in a const context.
+            build_error!("C enum value is out of bounds for the target type `u32`.");
+        }
+
+        // CAST: This cast is valid because the check above guarantees that `wide_val`
+        // is within the representable range of `u32`.
+        wide_val as u32
+    }
+}
+
+impl From<DataDirection> for bindings::dma_data_direction {
+    /// Returns the raw representation of [`enum dma_data_direction`].
+    fn from(direction: DataDirection) -> Self {
+        // CAST: `direction as u32` gets the underlying representation of our `#[repr(u32)]` enum.
+        // The subsequent cast to `Self` (the bindgen type) assumes the C enum is compatible
+        // with the enum variants of `DataDirection`, which is a valid assumption given our
+        // compile-time checks.
+        direction as u32 as Self
+    }
 }
 
 /// An abstraction of the `dma_alloc_coherent` API.
@@ -275,7 +354,7 @@ pub mod attrs {
 // entire `CoherentAllocation` including the allocated memory itself.
 pub struct CoherentAllocation<T: AsBytes + FromBytes> {
     dev: ARef<device::Device>,
-    dma_handle: bindings::dma_addr_t,
+    dma_handle: DmaAddress,
     count: usize,
     cpu_addr: *mut T,
     dma_attrs: Attrs,
@@ -376,7 +455,7 @@ impl<T: AsBytes + FromBytes> CoherentAllocation<T> {
 
     /// Returns a DMA handle which may be given to the device as the DMA address base of
     /// the region.
-    pub fn dma_handle(&self) -> bindings::dma_addr_t {
+    pub fn dma_handle(&self) -> DmaAddress {
         self.dma_handle
     }
 
@@ -384,13 +463,13 @@ impl<T: AsBytes + FromBytes> CoherentAllocation<T> {
     /// device as the DMA address base of the region.
     ///
     /// Returns `EINVAL` if `offset` is not within the bounds of the allocation.
-    pub fn dma_handle_with_offset(&self, offset: usize) -> Result<bindings::dma_addr_t> {
+    pub fn dma_handle_with_offset(&self, offset: usize) -> Result<DmaAddress> {
         if offset >= self.count {
             Err(EINVAL)
         } else {
             // INVARIANT: The type invariant of `Self` guarantees that `size_of::<T> * count` fits
             // into a `usize`, and `offset` is inferior to `count`.
-            Ok(self.dma_handle + (offset * core::mem::size_of::<T>()) as bindings::dma_addr_t)
+            Ok(self.dma_handle + (offset * core::mem::size_of::<T>()) as DmaAddress)
         }
     }
 

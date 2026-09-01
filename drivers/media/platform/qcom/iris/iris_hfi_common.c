@@ -79,17 +79,6 @@ int iris_hfi_core_init(struct iris_core *core)
 	const struct iris_hfi_command_ops *hfi_ops = core->hfi_ops;
 	int ret;
 
-	/*
-	 * Wait for the VPU5 SYS_INIT response before sending any further
-	 * command.  The downstream Venus driver sends its default system
-	 * properties later, immediately before SESSION_INIT.
-	 */
-	if (core->iris_platform_data->legacy_vpu5) {
-		dev_info(core->dev,
-			 "Iris1 v88: sending SYS_INIT through legacy HFI queue\n");
-		return hfi_ops->sys_init(core);
-	}
-
 	ret = hfi_ops->sys_init(core);
 	if (ret)
 		return ret;
@@ -103,18 +92,7 @@ int iris_hfi_core_init(struct iris_core *core)
 
 irqreturn_t iris_hfi_isr(int irq, void *data)
 {
-	struct iris_core *core = data;
-
 	disable_irq_nosync(irq);
-
-	/*
-	 * SM8150 VPU5 signals a level-high interrupt.  Clear the source in
-	 * the hard IRQ handler, as the legacy Venus driver does.  Deferring
-	 * the clear leaves the source asserted during firmware boot because
-	 * iris_core_init() owns core->lock while the threaded handler waits.
-	 */
-	if (core && core->iris_platform_data->legacy_vpu5)
-		iris_vpu_clear_interrupt(core);
 
 	return IRQ_WAKE_THREAD;
 }
@@ -128,8 +106,7 @@ irqreturn_t iris_hfi_isr_handler(int irq, void *data)
 
 	mutex_lock(&core->lock);
 	pm_runtime_mark_last_busy(core->dev);
-	if (!core->iris_platform_data->legacy_vpu5)
-		iris_vpu_clear_interrupt(core);
+	iris_vpu_clear_interrupt(core);
 	mutex_unlock(&core->lock);
 
 	core->hfi_response_ops->hfi_response_handler(core);
@@ -160,8 +137,7 @@ int iris_hfi_pm_suspend(struct iris_core *core)
 	return 0;
 
 error:
-	dev_err_once(core->dev,
-		     "failed to suspend (%d); suppressing repeated messages\n", ret);
+	dev_err(core->dev, "failed to suspend\n");
 
 	return ret;
 }

@@ -98,7 +98,6 @@ struct dpu_encoder_phys_ops {
 	void (*atomic_mode_set)(struct dpu_encoder_phys *encoder,
 			struct drm_crtc_state *crtc_state,
 			struct drm_connector_state *conn_state);
-	void (*seamless_mode_set)(struct dpu_encoder_phys *encoder);
 	void (*enable)(struct dpu_encoder_phys *encoder);
 	void (*disable)(struct dpu_encoder_phys *encoder);
 	int (*control_vblank_irq)(struct dpu_encoder_phys *enc, bool enable);

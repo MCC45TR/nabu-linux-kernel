@@ -44,7 +44,6 @@
 #include "log.h"
 #include "mesh-interface.h"
 #include "multicast.h"
-#include "network-coding.h"
 #include "originator.h"
 #include "tp_meter.h"
 #include "translation-table.h"
@@ -144,7 +143,6 @@ static const struct nla_policy batadv_netlink_policy[NUM_BATADV_ATTR] = {
 	[BATADV_ATTR_LOG_LEVEL]			= { .type = NLA_U32 },
 	[BATADV_ATTR_MULTICAST_FORCEFLOOD_ENABLED]	= { .type = NLA_U8 },
 	[BATADV_ATTR_MULTICAST_FANOUT]		= { .type = NLA_U32 },
-	[BATADV_ATTR_NETWORK_CODING_ENABLED]	= { .type = NLA_U8 },
 	[BATADV_ATTR_ORIG_INTERVAL]		= { .type = NLA_U32 },
 	[BATADV_ATTR_ELP_INTERVAL]		= { .type = NLA_U32 },
 	[BATADV_ATTR_THROUGHPUT_OVERRIDE]	= { .type = NLA_U32 },
@@ -344,12 +342,6 @@ static int batadv_netlink_mesh_fill(struct sk_buff *msg,
 			atomic_read(&bat_priv->multicast_fanout)))
 		goto nla_put_failure;
 #endif /* CONFIG_BATMAN_ADV_MCAST */
-
-#ifdef CONFIG_BATMAN_ADV_NC
-	if (nla_put_u8(msg, BATADV_ATTR_NETWORK_CODING_ENABLED,
-		       !!atomic_read(&bat_priv->network_coding)))
-		goto nla_put_failure;
-#endif /* CONFIG_BATMAN_ADV_NC */
 
 	if (nla_put_u32(msg, BATADV_ATTR_ORIG_INTERVAL,
 			atomic_read(&bat_priv->orig_interval)))
@@ -587,15 +579,6 @@ static int batadv_netlink_set_mesh(struct sk_buff *skb, struct genl_info *info)
 		atomic_set(&bat_priv->multicast_fanout, nla_get_u32(attr));
 	}
 #endif /* CONFIG_BATMAN_ADV_MCAST */
-
-#ifdef CONFIG_BATMAN_ADV_NC
-	if (info->attrs[BATADV_ATTR_NETWORK_CODING_ENABLED]) {
-		attr = info->attrs[BATADV_ATTR_NETWORK_CODING_ENABLED];
-
-		atomic_set(&bat_priv->network_coding, !!nla_get_u8(attr));
-		batadv_nc_status_update(bat_priv->mesh_iface);
-	}
-#endif /* CONFIG_BATMAN_ADV_NC */
 
 	if (info->attrs[BATADV_ATTR_ORIG_INTERVAL]) {
 		u32 orig_interval;
@@ -934,9 +917,15 @@ static int batadv_netlink_set_hardif(struct sk_buff *skb,
 #ifdef CONFIG_BATMAN_ADV_BATMAN_V
 
 	if (info->attrs[BATADV_ATTR_ELP_INTERVAL]) {
-		attr = info->attrs[BATADV_ATTR_ELP_INTERVAL];
+		u32 elp_interval;
 
-		atomic_set(&hard_iface->bat_v.elp_interval, nla_get_u32(attr));
+		attr = info->attrs[BATADV_ATTR_ELP_INTERVAL];
+		elp_interval = nla_get_u32(attr);
+
+		elp_interval = min_t(u32, elp_interval, INT_MAX);
+		elp_interval = max_t(u32, elp_interval, BATADV_JITTER);
+
+		atomic_set(&hard_iface->bat_v.elp_interval, elp_interval);
 	}
 
 	if (info->attrs[BATADV_ATTR_THROUGHPUT_OVERRIDE]) {

@@ -481,19 +481,52 @@ static void exfat_free_benign_secondary_clusters(struct inode *inode,
 	exfat_free_cluster(inode, &dir);
 }
 
+/*
+ * exfat_init_ext_entry - initialize extension entries in a directory entry set
+ * @es:          target entry set
+ * @num_entries: number of entries excluding benign secondary entries
+ * @p_uniname:   filename to store
+ * @old_es:      optional source entry set with benign secondary entries, or NULL
+ * @num_extra:   number of benign secondary entries to copy from @old_es
+ *
+ * Set up the file, stream extension, and filename entries in @es, optionally
+ * preserving @num_extra benign secondary entries from @old_es.  @es and @old_es
+ * may refer to the same entry set; excess entries are marked as deleted.
+ */
 void exfat_init_ext_entry(struct exfat_entry_set_cache *es, int num_entries,
-		struct exfat_uni_name *p_uniname)
+		struct exfat_uni_name *p_uniname,
+		struct exfat_entry_set_cache *old_es, int num_extra)
 {
-	int i;
+	int i, src_start = 0, old_num;
 	unsigned short *uniname = p_uniname->name;
 	struct exfat_dentry *ep;
 
+	if (WARN_ON(num_extra < 0 || (num_extra && (!old_es ||
+		    old_es->num_entries < ES_IDX_FIRST_FILENAME + num_extra))))
+		num_extra = 0;
+
+	/*
+	 * Save old entry count and source position before modifying
+	 * es->num_entries, since old_es and es may point to the same
+	 * entry set.
+	 */
+	old_num = es->num_entries;
+	if (old_es && num_extra > 0)
+		src_start = old_es->num_entries - num_extra;
+
+	es->num_entries = num_entries + num_extra;
 	ep = exfat_get_dentry_cached(es, ES_IDX_FILE);
-	ep->dentry.file.num_ext = (unsigned char)(num_entries - 1);
+	ep->dentry.file.num_ext = (unsigned char)(num_entries - 1 + num_extra);
 
 	ep = exfat_get_dentry_cached(es, ES_IDX_STREAM);
 	ep->dentry.stream.name_len = p_uniname->name_len;
 	ep->dentry.stream.name_hash = cpu_to_le16(p_uniname->name_hash);
+
+	if (old_es && num_extra > 0) {
+		for (i = 0; i < num_extra; i++)
+			*exfat_get_dentry_cached(es, num_entries + i) =
+				*exfat_get_dentry_cached(old_es, src_start + i);
+	}
 
 	for (i = ES_IDX_FIRST_FILENAME; i < num_entries; i++) {
 		ep = exfat_get_dentry_cached(es, i);
@@ -501,11 +534,17 @@ void exfat_init_ext_entry(struct exfat_entry_set_cache *es, int num_entries,
 		uniname += EXFAT_FILE_NAME_LEN;
 	}
 
+	/* Mark excess old entries as deleted (in-place shrink) */
+	for (i = num_entries + num_extra; i < old_num; i++) {
+		ep = exfat_get_dentry_cached(es, i);
+		exfat_set_entry_type(ep, TYPE_DELETED);
+	}
+
 	exfat_update_dir_chksum(es);
 }
 
 void exfat_remove_entries(struct inode *inode, struct exfat_entry_set_cache *es,
-		int order)
+		int order, bool free_benign)
 {
 	int i;
 	struct exfat_dentry *ep;
@@ -513,7 +552,7 @@ void exfat_remove_entries(struct inode *inode, struct exfat_entry_set_cache *es,
 	for (i = order; i < es->num_entries; i++) {
 		ep = exfat_get_dentry_cached(es, i);
 
-		if (exfat_get_entry_type(ep) & TYPE_BENIGN_SEC)
+		if (free_benign && (exfat_get_entry_type(ep) & TYPE_BENIGN_SEC))
 			exfat_free_benign_secondary_clusters(inode, ep);
 
 		exfat_set_entry_type(ep, TYPE_DELETED);
@@ -1081,22 +1120,26 @@ rewind:
 				continue;
 			}
 
-			brelse(bh);
 			if (entry_type == TYPE_EXTEND) {
 				unsigned short entry_uniname[16], unichar;
+				unsigned int offset;
 
 				if (step != DIRENT_STEP_NAME ||
 				    name_len >= MAX_NAME_LENGTH) {
+					brelse(bh);
 					step = DIRENT_STEP_FILE;
 					continue;
 				}
 
-				if (++order == 2)
-					uniname = p_uniname->name;
-				else
-					uniname += EXFAT_FILE_NAME_LEN;
-
+				offset = (++order - 2) * EXFAT_FILE_NAME_LEN;
 				len = exfat_extract_uni_name(ep, entry_uniname);
+				brelse(bh);
+				if (offset > MAX_NAME_LENGTH ||
+				    len > MAX_NAME_LENGTH - offset) {
+					step = DIRENT_STEP_FILE;
+					continue;
+				}
+				uniname = p_uniname->name + offset;
 				name_len += len;
 
 				unichar = *(uniname+len);
@@ -1115,6 +1158,7 @@ rewind:
 				continue;
 			}
 
+			brelse(bh);
 			if (entry_type &
 					(TYPE_CRITICAL_SEC | TYPE_BENIGN_SEC)) {
 				if (step == DIRENT_STEP_SECD) {
@@ -1243,4 +1287,164 @@ int exfat_count_dir_entries(struct super_block *sb, struct exfat_chain *p_dir)
 	}
 
 	return count;
+}
+
+static int exfat_get_volume_label_dentry(struct super_block *sb,
+		struct exfat_entry_set_cache *es)
+{
+	int i;
+	int dentry = 0;
+	unsigned int type;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_hint_femp hint_femp;
+	struct exfat_inode_info *ei = EXFAT_I(sb->s_root->d_inode);
+	struct exfat_chain clu;
+	struct exfat_dentry *ep;
+	struct buffer_head *bh;
+
+	hint_femp.eidx = EXFAT_HINT_NONE;
+	exfat_chain_set(&clu, sbi->root_dir, 0, ALLOC_FAT_CHAIN);
+
+	while (clu.dir != EXFAT_EOF_CLUSTER) {
+		for (i = 0; i < sbi->dentries_per_clu; i++, dentry++) {
+			ep = exfat_get_dentry(sb, &clu, i, &bh);
+			if (!ep)
+				return -EIO;
+
+			type = exfat_get_entry_type(ep);
+			if (hint_femp.eidx == EXFAT_HINT_NONE) {
+				if (type == TYPE_DELETED || type == TYPE_UNUSED) {
+					hint_femp.cur = clu;
+					hint_femp.eidx = dentry;
+					hint_femp.count = 1;
+				}
+			}
+
+			if (type == TYPE_UNUSED) {
+				brelse(bh);
+				goto not_found;
+			}
+
+			if (type != TYPE_VOLUME) {
+				brelse(bh);
+				continue;
+			}
+
+			memset(es, 0, sizeof(*es));
+			es->sb = sb;
+			es->bh = es->__bh;
+			es->bh[0] = bh;
+			es->num_bh = 1;
+			es->start_off = EXFAT_DEN_TO_B(i) % sb->s_blocksize;
+
+			return 0;
+		}
+
+		if (exfat_get_next_cluster(sb, &(clu.dir)))
+			return -EIO;
+	}
+
+not_found:
+	if (hint_femp.eidx == EXFAT_HINT_NONE) {
+		hint_femp.cur.dir = EXFAT_EOF_CLUSTER;
+		hint_femp.eidx = dentry;
+		hint_femp.count = 0;
+	}
+
+	ei->hint_femp = hint_femp;
+
+	return -ENOENT;
+}
+
+int exfat_read_volume_label(struct super_block *sb, struct exfat_uni_name *label_out)
+{
+	int ret, i;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct exfat_entry_set_cache es;
+	struct exfat_dentry *ep;
+
+	mutex_lock(&sbi->s_lock);
+
+	memset(label_out, 0, sizeof(*label_out));
+	ret = exfat_get_volume_label_dentry(sb, &es);
+	if (ret < 0) {
+		/*
+		 * ENOENT signifies that a volume label dentry doesn't exist
+		 * We will treat this as an empty volume label and not fail.
+		 */
+		if (ret == -ENOENT)
+			ret = 0;
+
+		goto unlock;
+	}
+
+	ep = exfat_get_dentry_cached(&es, 0);
+	label_out->name_len = ep->dentry.volume_label.char_count;
+	if (label_out->name_len > EXFAT_VOLUME_LABEL_LEN) {
+		ret = -EIO;
+		exfat_put_dentry_set(&es, false);
+		goto unlock;
+	}
+
+	for (i = 0; i < label_out->name_len; i++)
+		label_out->name[i] = le16_to_cpu(ep->dentry.volume_label.volume_label[i]);
+
+	exfat_put_dentry_set(&es, false);
+unlock:
+	mutex_unlock(&sbi->s_lock);
+	return ret;
+}
+
+int exfat_write_volume_label(struct super_block *sb,
+			     struct exfat_uni_name *label)
+{
+	int ret, i;
+	struct exfat_sb_info *sbi = EXFAT_SB(sb);
+	struct inode *root_inode = sb->s_root->d_inode;
+	struct exfat_entry_set_cache es;
+	struct exfat_chain clu;
+	struct exfat_dentry *ep;
+
+	if (label->name_len > EXFAT_VOLUME_LABEL_LEN)
+		return -EINVAL;
+
+	mutex_lock(&sbi->s_lock);
+
+	ret = exfat_get_volume_label_dentry(sb, &es);
+	if (ret == -ENOENT) {
+		if (label->name_len == 0) {
+			/* No volume label dentry, no need to clear */
+			ret = 0;
+			goto unlock;
+		}
+
+		ret = exfat_find_empty_entry(root_inode, &clu, 1, &es);
+	}
+
+	if (ret < 0)
+		goto unlock;
+
+	ep = exfat_get_dentry_cached(&es, 0);
+
+	if (label->name_len == 0 && ep->dentry.volume_label.char_count == 0) {
+		/* volume label had been cleared */
+		exfat_put_dentry_set(&es, 0);
+		goto unlock;
+	}
+
+	memset(ep, 0, sizeof(*ep));
+	ep->type = EXFAT_VOLUME;
+
+	for (i = 0; i < label->name_len; i++)
+		ep->dentry.volume_label.volume_label[i] =
+			cpu_to_le16(label->name[i]);
+
+	ep->dentry.volume_label.char_count = label->name_len;
+	es.modified = true;
+
+	ret = exfat_put_dentry_set(&es, IS_DIRSYNC(root_inode));
+
+unlock:
+	mutex_unlock(&sbi->s_lock);
+	return ret;
 }

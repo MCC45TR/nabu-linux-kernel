@@ -234,7 +234,8 @@ static int create_direct_keys(struct mlx5_vdpa_dev *mvdev, struct mlx5_vdpa_mr *
 		cmds[i].out = cmd_mem->out;
 		cmds[i].outlen = sizeof(cmd_mem->out);
 		cmds[i].in = cmd_mem->in;
-		cmds[i].inlen = struct_size(cmd_mem, mtt, mttcount);
+		cmds[i].inlen = struct_size(cmd_mem, mtt, mttcount) -
+				offsetof(struct mlx5_create_mkey_mem, in);
 
 		fill_create_direct_mr(mvdev, dmr, cmd_mem);
 
@@ -378,7 +379,7 @@ static int map_direct_mr(struct mlx5_vdpa_dev *mvdev, struct mlx5_vdpa_direct_mr
 	u64 pa, offset;
 	u64 paend;
 	struct scatterlist *sg;
-	struct device *dma = mvdev->vdev.dma_dev;
+	struct device *dma = mvdev->vdev.vmap.dma_dev;
 
 	for (map = vhost_iotlb_itree_first(iotlb, mr->start, mr->end - 1);
 	     map; map = vhost_iotlb_itree_next(map, mr->start, mr->end - 1)) {
@@ -432,7 +433,7 @@ err_map:
 
 static void unmap_direct_mr(struct mlx5_vdpa_dev *mvdev, struct mlx5_vdpa_direct_mr *mr)
 {
-	struct device *dma = mvdev->vdev.dma_dev;
+	struct device *dma = mvdev->vdev.vmap.dma_dev;
 
 	destroy_direct_mr(mvdev, mr);
 	dma_unmap_sg_attrs(dma, mr->sg_head.sgl, mr->nsg, DMA_BIDIRECTIONAL, 0);

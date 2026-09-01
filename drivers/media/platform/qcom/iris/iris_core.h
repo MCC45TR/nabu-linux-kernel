@@ -16,8 +16,6 @@
 #include "iris_resources.h"
 #include "iris_state.h"
 
-struct llcc_slice_desc;
-
 struct icc_info {
 	const char		*name;
 	u32			bw_min_kbps;
@@ -116,9 +114,6 @@ struct iris_core {
 	u32					intr_status;
 	struct delayed_work			sys_error_handler;
 	struct list_head			instances;
-	struct llcc_slice_desc			*llcc_slices[2];
-	bool					llcc_active;
-	bool					syscache_set;
 	/* encoder and decoder have overlapping caps, so two different arrays are required */
 	struct platform_inst_fw_cap		inst_fw_caps_dec[INST_FW_CAP_MAX];
 	struct platform_inst_fw_cap		inst_fw_caps_enc[INST_FW_CAP_MAX];

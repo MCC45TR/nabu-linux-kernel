@@ -4,6 +4,7 @@
 #include <net/sock.h>
 
 #include "uring_cmd.h"
+#include "io_uring.h"
 
 static inline int io_uring_cmd_getsockopt(struct socket *sock,
 					  struct io_uring_cmd *cmd,
@@ -73,7 +74,7 @@ static bool io_process_timestamp_skb(struct io_uring_cmd *cmd, struct sock *sk,
 
 	cqe->user_data = 0;
 	cqe->res = tskey;
-	cqe->flags = IORING_CQE_F_MORE;
+	cqe->flags = IORING_CQE_F_MORE | ctx_cqe32_flags(cmd_to_io_kiocb(cmd)->ctx);
 	cqe->flags |= tstype << IORING_TIMESTAMP_TYPE_SHIFT;
 	if (ret == SOF_TIMESTAMPING_TX_HARDWARE)
 		cqe->flags |= IORING_CQE_F_TSTAMP_HW;
@@ -126,7 +127,7 @@ static int io_uring_cmd_timestamp(struct socket *sock,
 
 	if (!unlikely(skb_queue_empty(&list))) {
 		scoped_guard(spinlock_irqsave, &q->lock)
-			skb_queue_splice(q, &list);
+			skb_queue_splice(&list, q);
 	}
 	return -EAGAIN;
 }
@@ -138,16 +139,19 @@ int io_uring_cmd_sock(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct proto *prot = READ_ONCE(sk->sk_prot);
 	int ret, arg = 0;
 
-	if (!prot || !prot->ioctl)
-		return -EOPNOTSUPP;
-
 	switch (cmd->cmd_op) {
 	case SOCKET_URING_OP_SIOCINQ:
+		if (!prot || !prot->ioctl)
+			return -EOPNOTSUPP;
+
 		ret = prot->ioctl(sk, SIOCINQ, &arg);
 		if (ret)
 			return ret;
 		return arg;
 	case SOCKET_URING_OP_SIOCOUTQ:
+		if (!prot || !prot->ioctl)
+			return -EOPNOTSUPP;
+
 		ret = prot->ioctl(sk, SIOCOUTQ, &arg);
 		if (ret)
 			return ret;

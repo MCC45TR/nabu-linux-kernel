@@ -47,8 +47,8 @@ int iris_venc_inst_init(struct iris_inst *inst)
 	f = inst->fmt_src;
 	f->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
 	f->fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-	f->fmt.pix_mp.width = DEFAULT_WIDTH;
-	f->fmt.pix_mp.height = DEFAULT_HEIGHT;
+	f->fmt.pix_mp.width = ALIGN(DEFAULT_WIDTH, 128);
+	f->fmt.pix_mp.height = ALIGN(DEFAULT_HEIGHT, 32);
 	f->fmt.pix_mp.num_planes = 1;
 	f->fmt.pix_mp.plane_fmt[0].bytesperline = ALIGN(DEFAULT_WIDTH, 128);
 	f->fmt.pix_mp.plane_fmt[0].sizeimage = iris_get_buffer_size(inst, BUF_INPUT);
@@ -226,9 +226,8 @@ static int iris_venc_s_fmt_input(struct iris_inst *inst, struct v4l2_format *f)
 
 	fmt = inst->fmt_src;
 	fmt->type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-	/* Keep the visible dimensions separate from the DMA layout. */
-	fmt->fmt.pix_mp.width = f->fmt.pix_mp.width;
-	fmt->fmt.pix_mp.height = f->fmt.pix_mp.height;
+	fmt->fmt.pix_mp.width = ALIGN(f->fmt.pix_mp.width, 128);
+	fmt->fmt.pix_mp.height = ALIGN(f->fmt.pix_mp.height, 32);
 	fmt->fmt.pix_mp.num_planes = 1;
 	fmt->fmt.pix_mp.pixelformat = f->fmt.pix_mp.pixelformat;
 	fmt->fmt.pix_mp.plane_fmt[0].bytesperline = ALIGN(f->fmt.pix_mp.width, 128);
@@ -346,8 +345,7 @@ int iris_venc_s_param(struct iris_inst *inst, struct v4l2_streamparm *s_parm)
 	struct v4l2_fract *timeperframe = NULL;
 	u32 default_rate = DEFAULT_FPS;
 	bool is_frame_rate = false;
-	u64 us_per_frame, fps;
-	u32 max_rate;
+	u32 fps, max_rate;
 
 	int ret = 0;
 
@@ -369,23 +367,19 @@ int iris_venc_s_param(struct iris_inst *inst, struct v4l2_streamparm *s_parm)
 			timeperframe->denominator = default_rate;
 	}
 
-	us_per_frame = timeperframe->numerator * (u64)USEC_PER_SEC;
-	do_div(us_per_frame, timeperframe->denominator);
-
-	if (!us_per_frame)
+	fps = timeperframe->denominator / timeperframe->numerator;
+	if (!fps)
 		return -EINVAL;
 
-	fps = (u64)USEC_PER_SEC;
-	do_div(fps, us_per_frame);
 	if (fps > max_rate) {
 		ret = -ENOMEM;
 		goto reset_rate;
 	}
 
 	if (is_frame_rate)
-		inst->frame_rate = (u32)fps;
+		inst->frame_rate = fps;
 	else
-		inst->operating_rate = (u32)fps;
+		inst->operating_rate = fps;
 
 	if ((s_parm->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE && vb2_is_streaming(src_q)) ||
 	    (s_parm->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE && vb2_is_streaming(dst_q))) {
@@ -491,9 +485,7 @@ int iris_venc_streamon_output(struct iris_inst *inst)
 	return ret;
 
 error:
-	inst->start_streaming_rollback_type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
 	iris_session_streamoff(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
-	inst->start_streaming_rollback_type = 0;
 
 	return ret;
 }

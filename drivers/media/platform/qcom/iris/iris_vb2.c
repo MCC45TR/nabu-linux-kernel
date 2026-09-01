@@ -3,8 +3,6 @@
  * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
-#include <linux/dma-mapping.h>
-#include <linux/module.h>
 #include <media/videobuf2-dma-contig.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-mem2mem.h>
@@ -15,105 +13,6 @@
 #include "iris_vdec.h"
 #include "iris_venc.h"
 #include "iris_power.h"
-
-/*
- * On SM8150 Venus (VIDEO.IR.1.2) the firmware validates OUTPUT/OUTPUT2
- * (capture and split-mode DPB) IOVAs against an output-address boundary near
- * the top of the non-secure aperture (~0xd0000000).  The attached SMMU uses a
- * single shared iommu-dma allocator that is top-down within [0, 0xdfffffff].
- *
- * FFmpeg's m2m flow allocates the OUTPUT (bitstream) queue and the
- * firmware-internal BIN/SCRATCH/PERSIST buffers before the CAPTURE queue and
- * the internal DPBs.  Those early allocations therefore consume the IOVAs
- * the firmware requires for OUTPUT/OUTPUT2, pushing the later CAPTURE/DPB
- * allocations down to 0xb/0xc... where the firmware rejects them.
- *
- * Reserve the high IOVA region with a throwaway placeholder allocation taken
- * while the input side is set up, then release it right before the CAPTURE
- * queue is allocated so the top-down allocator hands the freshly freed high
- * region to the output buffers instead.  This keeps the device DMA mask
- * stable for the whole session, unlike the v80/v81 mask-toggling experiment.
- */
-#define IRIS1_VP9_IOVA_HOLE_SIZE	0x04000000ULL	/* 64 MiB placeholder */
-
-static bool cached_capture;
-module_param(cached_capture, bool, 0444);
-MODULE_PARM_DESC(cached_capture,
-		 "Use cacheable H.264/HEVC CAPTURE MMAP buffers on legacy Iris1");
-
-static bool iris1_use_cached_capture(struct iris_inst *inst,
-				     struct vb2_queue *q)
-{
-	return cached_capture &&
-	       inst->core->iris_platform_data->legacy_vpu5 &&
-	       (inst->codec == V4L2_PIX_FMT_H264 ||
-		inst->codec == V4L2_PIX_FMT_HEVC) &&
-	       V4L2_TYPE_IS_CAPTURE(q->type) &&
-	       q->memory == VB2_MEMORY_MMAP;
-}
-
-static bool iris1_vp9_needs_iova_hole(struct iris_inst *inst)
-{
-	return inst->core->iris_platform_data->legacy_vpu5 &&
-	       inst->codec == V4L2_PIX_FMT_VP9;
-}
-
-int iris_vb2_vp9_alloc_high_iova_hole(struct iris_inst *inst)
-{
-	struct iris_core *core = inst->core;
-	size_t size = IRIS1_VP9_IOVA_HOLE_SIZE;
-	dma_addr_t daddr;
-	void *vaddr;
-
-	if (!iris1_vp9_needs_iova_hole(inst) || inst->vp9_iova_hole_size)
-		return 0;
-
-	vaddr = dma_alloc_attrs(core->dev, size, &daddr, GFP_KERNEL,
-			       DMA_ATTR_WRITE_COMBINE);
-	if (!vaddr) {
-		dev_err(core->dev,
-			"Iris1 v85: VP9 IOVA hole alloc of %#zx failed\n",
-			size);
-		return -ENOMEM;
-	}
-
-	inst->vp9_iova_hole_vaddr = vaddr;
-	inst->vp9_iova_hole_daddr = daddr;
-	inst->vp9_iova_hole_size = size;
-
-	dev_info(core->dev,
-		 "Iris1 v85: VP9 reserved high IOVA hole %#llx-%#llx (size %#zx)\n",
-		 (unsigned long long)daddr,
-		 (unsigned long long)daddr + size - 1, size);
-
-	return 0;
-}
-
-void iris_vb2_vp9_release_high_iova_hole(struct iris_inst *inst)
-{
-	struct iris_core *core = inst->core;
-	dma_addr_t daddr;
-	void *vaddr;
-	size_t size;
-
-	if (!inst->vp9_iova_hole_size)
-		return;
-
-	vaddr = inst->vp9_iova_hole_vaddr;
-	daddr = inst->vp9_iova_hole_daddr;
-	size = inst->vp9_iova_hole_size;
-
-	inst->vp9_iova_hole_vaddr = NULL;
-	inst->vp9_iova_hole_daddr = 0;
-	inst->vp9_iova_hole_size = 0;
-
-	dma_free_attrs(core->dev, size, vaddr, daddr, DMA_ATTR_WRITE_COMBINE);
-
-	dev_info(core->dev,
-		 "Iris1 v85: VP9 released high IOVA hole %#llx-%#llx\n",
-		 (unsigned long long)daddr,
-		 (unsigned long long)daddr + size - 1);
-}
 
 static int iris_check_inst_mbpf(struct iris_inst *inst)
 {
@@ -157,12 +56,10 @@ static int iris_check_session_supported(struct iris_inst *inst)
 	bool found = false;
 	int ret;
 
-	mutex_lock(&core->lock);
 	list_for_each_entry(instance, &core->instances, list) {
 		if (instance == inst)
 			found = true;
 	}
-	mutex_unlock(&core->lock);
 
 	if (!found) {
 		ret = -EINVAL;
@@ -205,16 +102,12 @@ int iris_vb2_queue_setup(struct vb2_queue *q,
 	struct iris_inst *inst;
 	struct iris_core *core;
 	struct v4l2_format *f;
-	u32 admission_fps;
 	int ret = 0;
 
 	inst = vb2_get_drv_priv(q);
 
 	mutex_lock(&inst->lock);
 	if (inst->state == IRIS_INST_ERROR) {
-		dev_err_ratelimited(inst->core->dev,
-				    "queue setup rejected: instance is in error state (queue type %u)\n",
-				    q->type);
 		ret = -EBUSY;
 		goto unlock;
 	}
@@ -222,35 +115,10 @@ int iris_vb2_queue_setup(struct vb2_queue *q,
 	core = inst->core;
 	f = V4L2_TYPE_IS_OUTPUT(q->type) ? inst->fmt_src : inst->fmt_dst;
 
-	/*
-	 * FFmpeg's v4l2m2m-copy path maps CAPTURE buffers into the CPU and
-	 * uploads every decoded frame to the display API.  Coherent DMA memory
-	 * is expensive to read on SM8150, especially for 4K60 NV12.  For this
-	 * opt-in Iris1/H.264/HEVC path, allocate cacheable streaming DMA memory
-	 * and let vb2_dma_contig perform the required post-DMA cache maintenance
-	 * before each completed frame is returned to userspace.
-	 *
-	 * Keep this limited to MMAP: imported DMABUF ownership and cache policy
-	 * belong to the exporter.  VP9 is deliberately excluded because its IOVA
-	 * placement work depends on the existing allocation lifecycle.
-	 */
-	if (iris1_use_cached_capture(inst, q)) {
-		q->dma_dir = DMA_FROM_DEVICE;
-		q->non_coherent_mem = true;
-		dev_info(core->dev,
-			 "Iris1 v99: using cacheable %s CAPTURE MMAP buffers; dynamic power vote starts at %u fps\n",
-			 inst->codec == V4L2_PIX_FMT_H264 ? "H.264" : "HEVC",
-			 iris_get_operating_fps(inst));
-	}
-
 	if (*num_planes) {
 		if (*num_planes != f->fmt.pix_mp.num_planes ||
 		    sizes[0] < f->fmt.pix_mp.plane_fmt[0].sizeimage)
 			ret = -EINVAL;
-		goto unlock;
-	}
-	if (V4L2_TYPE_IS_CAPTURE(q->type) && inst->core_load_rejected) {
-		ret = -ENOMEM;
 		goto unlock;
 	}
 
@@ -258,40 +126,19 @@ int iris_vb2_queue_setup(struct vb2_queue *q,
 	if (ret)
 		goto unlock;
 
-	ret = iris_hfi_session_open(inst);
-	if (ret) {
-		dev_err(core->dev, "session open failed: %d\n", ret);
-		goto unlock;
-	}
+	if (!inst->once_per_session_set) {
+		inst->once_per_session_set = true;
 
-	if (V4L2_TYPE_IS_CAPTURE(q->type) && !inst->core_load_reserved) {
-		if (inst->domain == DECODER)
-			admission_fps = iris_vdec_get_admission_fps(inst);
-		else
-			admission_fps = max(inst->frame_rate,
-					    inst->operating_rate);
-
-		ret = iris_reserve_core_load(inst, admission_fps);
+		ret = core->hfi_ops->session_open(inst);
 		if (ret) {
-			inst->core_load_rejected = true;
+			ret = -EINVAL;
+			dev_err(core->dev, "session open failed\n");
 			goto unlock;
 		}
-	}
 
-	/*
-	 * Hold the high IOVA region across input-side allocations so the
-	 * top-down allocator returns high IOVAs to the CAPTURE/DPB buffers
-	 * queued later.  Allocate the placeholder when the OUTPUT queue is
-	 * set up (before bitstream buffers are allocated) and release it on
-	 * the first CAPTURE queue_setup so the released high region is the
-	 * next IOVA handed out by the allocator.
-	 */
-	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
-		ret = iris_vb2_vp9_alloc_high_iova_hole(inst);
+		ret = iris_inst_change_state(inst, IRIS_INST_INIT);
 		if (ret)
 			goto unlock;
-	} else if (V4L2_TYPE_IS_CAPTURE(q->type)) {
-		iris_vb2_vp9_release_high_iova_hole(inst);
 	}
 
 	*num_planes = 1;
@@ -323,15 +170,11 @@ int iris_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 		goto error;
 	}
 
+	iris_scale_power(inst);
+
 	ret = iris_check_session_supported(inst);
 	if (ret)
 		goto error;
-
-	ret = iris_hfi_session_open(inst);
-	if (ret)
-		goto error;
-
-	iris_scale_power(inst);
 
 	if (V4L2_TYPE_IS_OUTPUT(q->type)) {
 		if (inst->domain == DECODER)
@@ -344,12 +187,8 @@ int iris_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 		else
 			ret = iris_venc_streamon_output(inst);
 	}
-	if (ret) {
-		dev_err(inst->core->dev,
-			"Iris1 v119: start_streaming failed queue=%u count=%u state=%u ret=%d\n",
-			q->type, count, inst->state, ret);
+	if (ret)
 		goto error;
-	}
 
 	buf_type = iris_v4l2_type_to_driver(q->type);
 
@@ -370,12 +209,8 @@ int iris_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 		}
 	}
 
-	if (ret) {
-		dev_err(inst->core->dev,
-			"Iris1 v119: deferred buffer queue failed queue=%u count=%u state=%u ret=%d\n",
-			q->type, count, inst->state, ret);
+	if (ret)
 		goto error;
-	}
 
 	mutex_unlock(&inst->lock);
 
@@ -396,14 +231,10 @@ void iris_vb2_stop_streaming(struct vb2_queue *q)
 
 	inst = vb2_get_drv_priv(q);
 
-	if (V4L2_TYPE_IS_CAPTURE(q->type) && inst->state == IRIS_INST_INIT) {
-		iris_release_core_load(inst);
+	if (V4L2_TYPE_IS_CAPTURE(q->type) && inst->state == IRIS_INST_INIT)
 		return;
-	}
 
 	mutex_lock(&inst->lock);
-	if (inst->domain == DECODER && V4L2_TYPE_IS_CAPTURE(q->type))
-		iris_vdec_clear_pending_output(inst);
 
 	if (!V4L2_TYPE_IS_OUTPUT(q->type) &&
 	    !V4L2_TYPE_IS_CAPTURE(q->type))
@@ -412,8 +243,6 @@ void iris_vb2_stop_streaming(struct vb2_queue *q)
 	ret = iris_session_streamoff(inst, q->type);
 	if (ret)
 		goto exit;
-	if (V4L2_TYPE_IS_CAPTURE(q->type))
-		iris_release_core_load(inst);
 
 exit:
 	iris_helper_buffers_done(inst, q->type, VB2_BUF_STATE_ERROR);

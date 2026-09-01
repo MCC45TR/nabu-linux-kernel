@@ -740,6 +740,8 @@ macro_rules! stack_try_pin_init {
 /// As already mentioned in the examples above, inside of `pin_init!` a `struct` initializer with
 /// the following modifications is expected:
 /// - Fields that you want to initialize in-place have to use `<-` instead of `:`.
+/// - You can use `_: { /* run any user-code here */ },` anywhere where you can place fields in
+///   order to run arbitrary code.
 /// - In front of the initializer you can write `&this in` to have access to a [`NonNull<Self>`]
 ///   pointer named `this` inside of the initializer.
 /// - Using struct update syntax one can place `..Zeroable::init_zeroed()` at the very end of the
@@ -994,7 +996,7 @@ macro_rules! try_init {
 /// }
 ///
 /// impl<T> Foo<T> {
-///     fn project(self: Pin<&mut Self>) -> Pin<&mut T> {
+///     fn project_this(self: Pin<&mut Self>) -> Pin<&mut T> {
 ///         assert_pinned!(Foo<T>, elem, T, inline);
 ///
 ///         // SAFETY: The field is structurally pinned.
@@ -1274,13 +1276,13 @@ pub const unsafe fn init_from_closure<T: ?Sized, E>(
 ///
 /// - `*mut U` must be castable to `*mut T` and any value of type `T` written through such a
 ///   pointer must result in a valid `U`.
-#[expect(clippy::let_and_return)]
 pub const unsafe fn cast_pin_init<T, U, E>(init: impl PinInit<T, E>) -> impl PinInit<U, E> {
     // SAFETY: initialization delegated to a valid initializer. Cast is valid by function safety
     // requirements.
     let res = unsafe { pin_init_from_closure(|ptr: *mut U| init.__pinned_init(ptr.cast::<T>())) };
     // FIXME: remove the let statement once the nightly-MSRV allows it (1.78 otherwise encounters a
     // cycle when computing the type returned by this function)
+    #[allow(clippy::let_and_return)]
     res
 }
 
@@ -1290,13 +1292,13 @@ pub const unsafe fn cast_pin_init<T, U, E>(init: impl PinInit<T, E>) -> impl Pin
 ///
 /// - `*mut U` must be castable to `*mut T` and any value of type `T` written through such a
 ///   pointer must result in a valid `U`.
-#[expect(clippy::let_and_return)]
 pub const unsafe fn cast_init<T, U, E>(init: impl Init<T, E>) -> impl Init<U, E> {
     // SAFETY: initialization delegated to a valid initializer. Cast is valid by function safety
     // requirements.
     let res = unsafe { init_from_closure(|ptr: *mut U| init.__init(ptr.cast::<T>())) };
     // FIXME: remove the let statement once the nightly-MSRV allows it (1.78 otherwise encounters a
     // cycle when computing the type returned by this function)
+    #[allow(clippy::let_and_return)]
     res
 }
 

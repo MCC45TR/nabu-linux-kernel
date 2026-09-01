@@ -331,6 +331,10 @@ struct mlx5_ib_flow_db {
 #define MLX5_IB_QPT_DCT		IB_QPT_RESERVED4
 #define MLX5_IB_WR_UMR		IB_WR_RESERVED1
 
+/*
+ * A valid pdn is required when flags include MLX5_IB_UPD_XLT_ENABLE,
+ * MLX5_IB_UPD_XLT_PD or MLX5_IB_UPD_XLT_ACCESS.
+ */
 #define MLX5_IB_UPD_XLT_ZAP	      BIT(0)
 #define MLX5_IB_UPD_XLT_ENABLE	      BIT(1)
 #define MLX5_IB_UPD_XLT_ATOMIC	      BIT(2)
@@ -854,6 +858,8 @@ struct mlx5_ib_port_resources {
 struct mlx5_data_direct_resources {
 	u32 pdn;
 	u32 mkey;
+	u32 mkey_ro;
+	u8 mkey_ro_valid :1;
 };
 
 struct mlx5_ib_resources {
@@ -1005,6 +1011,7 @@ enum mlx5_ib_stages {
 	MLX5_IB_STAGE_BFREG,
 	MLX5_IB_STAGE_PRE_IB_REG_UMR,
 	MLX5_IB_STAGE_WHITELIST_UID,
+	MLX5_IB_STAGE_SYS_ERROR_NOTIFIER,
 	MLX5_IB_STAGE_IB_REG,
 	MLX5_IB_STAGE_DEVICE_NOTIFIER,
 	MLX5_IB_STAGE_POST_IB_REG_UMR,
@@ -1109,6 +1116,7 @@ struct mlx5_ib_lb_state {
 	u32			user_td;
 	int			qps;
 	bool			enabled;
+	bool			force_enable;
 };
 
 struct mlx5_ib_pf_eq {
@@ -1162,6 +1170,7 @@ struct mlx5_ib_dev {
 	/* protect accessing data_direct_dev */
 	struct mutex			data_direct_lock;
 	struct notifier_block		mdev_events;
+	struct notifier_block		sys_error_events;
 	struct notifier_block           lag_events;
 	int				num_ports;
 	/* serialize update of capability mask
@@ -1274,6 +1283,11 @@ static inline struct mlx5_ib_rwq *to_mibrwq(struct mlx5_core_qp *core_qp)
 static inline struct mlx5_ib_pd *to_mpd(struct ib_pd *ibpd)
 {
 	return container_of(ibpd, struct mlx5_ib_pd, ibpd);
+}
+
+static inline u32 mlx5_mr_pdn(struct mlx5_ib_mr *mr)
+{
+	return to_mpd(mr->ibmr.pd)->pdn;
 }
 
 static inline struct mlx5_ib_srq *to_msrq(struct ib_srq *ibsrq)
@@ -1801,6 +1815,10 @@ mlx5_umem_mkc_find_best_pgsz(struct mlx5_ib_dev *dev, struct ib_umem *umem,
 	min_log_entity_size_cap = get_min_log_entity_size_cap(dev, access_mode);
 
 	bitmap = GENMASK_ULL(max_log_entity_size_cap, min_log_entity_size_cap);
+
+	/* In KSM mode HW requires IOVA and mkey's page size to be aligned */
+	if (access_mode == MLX5_MKC_ACCESS_MODE_KSM && iova)
+		bitmap &= GENMASK_ULL(__ffs64(iova), 0);
 
 	return ib_umem_find_best_pgsz(umem, bitmap, iova);
 }

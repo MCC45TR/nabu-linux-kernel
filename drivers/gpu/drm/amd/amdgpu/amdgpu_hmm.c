@@ -78,8 +78,10 @@ static bool amdgpu_hmm_invalidate_gfx(struct mmu_interval_notifier *mni,
 
 	mmu_interval_set_seq(mni, cur_seq);
 
-	r = dma_resv_wait_timeout(bo->tbo.base.resv, DMA_RESV_USAGE_BOOKKEEP,
-				  false, MAX_SCHEDULE_TIMEOUT);
+	amdgpu_vm_bo_invalidate(bo, false);
+	r = dma_resv_wait_timeout(bo->parent->tbo.base.resv,
+				  DMA_RESV_USAGE_BOOKKEEP, false,
+				  MAX_SCHEDULE_TIMEOUT);
 	mutex_unlock(&adev->notifier_lock);
 	if (r <= 0)
 		DRM_ERROR("(%ld) failed to wait for user bo\n", r);
@@ -167,13 +169,12 @@ void amdgpu_hmm_unregister(struct amdgpu_bo *bo)
 
 int amdgpu_hmm_range_get_pages(struct mmu_interval_notifier *notifier,
 			       uint64_t start, uint64_t npages, bool readonly,
-			       void *owner, struct page **pages,
+			       void *owner,
 			       struct hmm_range **phmm_range)
 {
 	struct hmm_range *hmm_range;
 	unsigned long end;
 	unsigned long timeout;
-	unsigned long i;
 	unsigned long *pfns;
 	int r = 0;
 
@@ -221,14 +222,6 @@ retry:
 
 	hmm_range->start = start;
 	hmm_range->hmm_pfns = pfns;
-
-	/*
-	 * Due to default_flags, all pages are HMM_PFN_VALID or
-	 * hmm_range_fault() fails. FIXME: The pages cannot be touched outside
-	 * the notifier_lock, and mmu_interval_read_retry() must be done first.
-	 */
-	for (i = 0; pages && i < npages; i++)
-		pages[i] = hmm_pfn_to_page(pfns[i]);
 
 	*phmm_range = hmm_range;
 

@@ -103,7 +103,6 @@ static unsigned long kvm_emu_xchg_csr(struct kvm_vcpu *vcpu, int csrid,
 		old = kvm_read_sw_gcsr(csr, csrid);
 		val = (old & ~csr_mask) | (val & csr_mask);
 		kvm_write_sw_gcsr(csr, csrid, val);
-		old = old & csr_mask;
 	} else
 		pr_warn_once("Unsupported csrxchg 0x%x with pc %lx\n", csrid, vcpu->arch.pc);
 
@@ -218,16 +217,16 @@ int kvm_emu_iocsr(larch_inst inst, struct kvm_run *run, struct kvm_vcpu *vcpu)
 		}
 		trace_kvm_iocsr(KVM_TRACE_IOCSR_WRITE, run->iocsr_io.len, addr, val);
 	} else {
+		vcpu->arch.io_gpr = rd; /* Set register id for iocsr read completion */
 		idx = srcu_read_lock(&vcpu->kvm->srcu);
-		ret = kvm_io_bus_read(vcpu, KVM_IOCSR_BUS, addr, run->iocsr_io.len, val);
+		ret = kvm_io_bus_read(vcpu, KVM_IOCSR_BUS, addr,
+				      run->iocsr_io.len, run->iocsr_io.data);
 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
-		if (ret == 0)
+		if (ret == 0) {
+			kvm_complete_iocsr_read(vcpu, run);
 			ret = EMULATE_DONE;
-		else {
+		} else
 			ret = EMULATE_DO_IOCSR;
-			/* Save register id for iocsr read completion */
-			vcpu->arch.io_gpr = rd;
-		}
 		trace_kvm_iocsr(KVM_TRACE_IOCSR_READ, run->iocsr_io.len, addr, NULL);
 	}
 
@@ -390,6 +389,7 @@ int kvm_emu_mmio_read(struct kvm_vcpu *vcpu, larch_inst inst)
 			run->mmio.len = 8;
 			break;
 		default:
+			ret = EMULATE_FAIL;
 			break;
 		}
 		break;
@@ -468,6 +468,8 @@ int kvm_emu_mmio_read(struct kvm_vcpu *vcpu, larch_inst inst)
 	if (ret == EMULATE_DO_MMIO) {
 		trace_kvm_mmio(KVM_TRACE_MMIO_READ, run->mmio.len, run->mmio.phys_addr, NULL);
 
+		vcpu->arch.io_gpr = rd; /* Set for kvm_complete_mmio_read() use */
+
 		/*
 		 * If mmio device such as PCH-PIC is emulated in KVM,
 		 * it need not return to user space to handle the mmio
@@ -475,16 +477,15 @@ int kvm_emu_mmio_read(struct kvm_vcpu *vcpu, larch_inst inst)
 		 */
 		idx = srcu_read_lock(&vcpu->kvm->srcu);
 		ret = kvm_io_bus_read(vcpu, KVM_MMIO_BUS, vcpu->arch.badv,
-				      run->mmio.len, &vcpu->arch.gprs[rd]);
+				      run->mmio.len, run->mmio.data);
 		srcu_read_unlock(&vcpu->kvm->srcu, idx);
 		if (!ret) {
+			kvm_complete_mmio_read(vcpu, run);
 			update_pc(&vcpu->arch);
 			vcpu->mmio_needed = 0;
 			return EMULATE_DONE;
 		}
 
-		/* Set for kvm_complete_mmio_read() use */
-		vcpu->arch.io_gpr = rd;
 		run->mmio.is_write = 0;
 		vcpu->mmio_is_write = 0;
 		return EMULATE_DO_MMIO;

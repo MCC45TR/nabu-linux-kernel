@@ -637,6 +637,9 @@ static int phylink_validate(struct phylink *pl, unsigned long *supported,
 
 static void phylink_fill_fixedlink_supported(unsigned long *supported)
 {
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, supported);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, supported);
+	linkmode_set_bit(ETHTOOL_LINK_MODE_Autoneg_BIT, supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Half_BIT, supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_10baseT_Full_BIT, supported);
 	linkmode_set_bit(ETHTOOL_LINK_MODE_100baseT_Half_BIT, supported);
@@ -701,6 +704,9 @@ static int phylink_parse_fixedlink(struct phylink *pl,
 			phylink_err(pl, "broken fixed-link?\n");
 			return -EINVAL;
 		}
+
+		phylink_warn(pl, "%pfw uses deprecated array-style fixed-link binding!\n",
+			     fwnode);
 
 		ret = fwnode_property_read_u32_array(fwnode, "fixed-link",
 						     prop, ARRAY_SIZE(prop));
@@ -1855,8 +1861,8 @@ struct phylink *phylink_create(struct phylink_config *config,
 	} else if (config->type == PHYLINK_DEV) {
 		pl->dev = config->dev;
 	} else {
-		kfree(pl);
-		return ERR_PTR(-EINVAL);
+		ret = -EINVAL;
+		goto free_pl;
 	}
 
 	pl->mac_supports_eee_ops = phylink_mac_implements_lpi(mac_ops);
@@ -1889,28 +1895,29 @@ struct phylink *phylink_create(struct phylink_config *config,
 	phylink_validate(pl, pl->supported, &pl->link_config);
 
 	ret = phylink_parse_mode(pl, fwnode);
-	if (ret < 0) {
-		kfree(pl);
-		return ERR_PTR(ret);
-	}
+	if (ret < 0)
+		goto free_pl;
 
 	if (pl->cfg_link_an_mode == MLO_AN_FIXED) {
 		ret = phylink_parse_fixedlink(pl, fwnode);
-		if (ret < 0) {
-			kfree(pl);
-			return ERR_PTR(ret);
-		}
+		if (ret < 0)
+			goto release_link_gpio;
 	}
 
 	pl->req_link_an_mode = pl->cfg_link_an_mode;
 
 	ret = phylink_register_sfp(pl, fwnode);
-	if (ret < 0) {
-		kfree(pl);
-		return ERR_PTR(ret);
-	}
+	if (ret < 0)
+		goto release_link_gpio;
 
 	return pl;
+
+release_link_gpio:
+	if (pl->link_gpio)
+		gpiod_put(pl->link_gpio);
+free_pl:
+	kfree(pl);
+	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(phylink_create);
 
@@ -3747,17 +3754,18 @@ static int phylink_sfp_config_optical(struct phylink *pl)
 static int phylink_sfp_module_insert(void *upstream,
 				     const struct sfp_eeprom_id *id)
 {
+	const struct sfp_module_caps *caps;
 	struct phylink *pl = upstream;
 
 	ASSERT_RTNL();
 
-	linkmode_zero(pl->sfp_support);
-	phy_interface_zero(pl->sfp_interfaces);
-	sfp_parse_support(pl->sfp_bus, id, pl->sfp_support, pl->sfp_interfaces);
-	pl->sfp_port = sfp_parse_port(pl->sfp_bus, id, pl->sfp_support);
+	caps = sfp_get_module_caps(pl->sfp_bus);
+	phy_interface_copy(pl->sfp_interfaces, caps->interfaces);
+	linkmode_copy(pl->sfp_support, caps->link_modes);
+	pl->sfp_may_have_phy = caps->may_have_phy;
+	pl->sfp_port = caps->port;
 
 	/* If this module may have a PHY connecting later, defer until later */
-	pl->sfp_may_have_phy = sfp_may_have_phy(pl->sfp_bus, id);
 	if (pl->sfp_may_have_phy)
 		return 0;
 

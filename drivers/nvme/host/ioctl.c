@@ -122,7 +122,6 @@ static int nvme_map_user_request(struct request *req, u64 ubuffer,
 	bool supports_metadata = bdev && blk_get_integrity(bdev->bd_disk);
 	struct nvme_ctrl *ctrl = nvme_req(req)->ctrl;
 	bool has_metadata = meta_buffer && meta_len;
-	struct bio *bio = NULL;
 	int ret;
 
 	if (!nvme_ctrl_sgl_supported(ctrl))
@@ -142,13 +141,8 @@ static int nvme_map_user_request(struct request *req, u64 ubuffer,
 		ret = blk_rq_map_user_io(req, NULL, nvme_to_user_ptr(ubuffer),
 				bufflen, GFP_KERNEL, flags & NVME_IOCTL_VEC, 0,
 				0, rq_data_dir(req));
-
 	if (ret)
 		return ret;
-
-	bio = req->bio;
-	if (bdev)
-		bio_set_dev(bio, bdev);
 
 	if (has_metadata) {
 		ret = blk_rq_integrity_map_user(req, meta_buffer, meta_len);
@@ -159,8 +153,8 @@ static int nvme_map_user_request(struct request *req, u64 ubuffer,
 	return ret;
 
 out_unmap:
-	if (bio)
-		blk_rq_unmap_user(bio);
+	if (req->bio)
+		blk_rq_unmap_user(req->bio);
 	return ret;
 }
 
@@ -410,7 +404,7 @@ static void nvme_uring_task_cb(struct io_uring_cmd *ioucmd,
 
 	if (pdu->bio)
 		blk_rq_unmap_user(pdu->bio);
-	io_uring_cmd_done(ioucmd, pdu->status, pdu->result, issue_flags);
+	io_uring_cmd_done32(ioucmd, pdu->status, pdu->result, issue_flags);
 }
 
 static enum rq_end_io_ret nvme_uring_cmd_end_io(struct request *req,

@@ -11,7 +11,6 @@
 #include <linux/build_bug.h>
 #include <linux/byteorder/generic.h>
 #include <linux/container_of.h>
-#include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/errno.h>
 #include <linux/gfp.h>
@@ -53,7 +52,6 @@
 #include "mesh-interface.h"
 #include "multicast.h"
 #include "netlink.h"
-#include "network-coding.h"
 #include "originator.h"
 #include "routing.h"
 #include "send.h"
@@ -103,7 +101,6 @@ static int __init batadv_init(void)
 
 	batadv_v_init();
 	batadv_iv_init();
-	batadv_nc_init();
 	batadv_tp_meter_init();
 
 	batadv_event_workqueue = create_singlethread_workqueue("bat_events");
@@ -218,12 +215,6 @@ int batadv_mesh_init(struct net_device *mesh_iface)
 		goto err_dat;
 	}
 
-	ret = batadv_nc_mesh_init(bat_priv);
-	if (ret < 0) {
-		atomic_set(&bat_priv->mesh_state, BATADV_MESH_DEACTIVATING);
-		goto err_nc;
-	}
-
 	batadv_gw_init(bat_priv);
 	batadv_mcast_init(bat_priv);
 
@@ -232,8 +223,6 @@ int batadv_mesh_init(struct net_device *mesh_iface)
 
 	return 0;
 
-err_nc:
-	batadv_dat_free(bat_priv);
 err_dat:
 	batadv_bla_free(bat_priv);
 err_bla:
@@ -256,19 +245,27 @@ err_orig:
 void batadv_mesh_free(struct net_device *mesh_iface)
 {
 	struct batadv_priv *bat_priv = netdev_priv(mesh_iface);
+	struct batadv_meshif_vlan *vlan;
 
 	atomic_set(&bat_priv->mesh_state, BATADV_MESH_DEACTIVATING);
 
 	batadv_purge_outstanding_packets(bat_priv, NULL);
+	batadv_tp_stop_all(bat_priv);
 
 	batadv_gw_node_free(bat_priv);
 
 	batadv_v_mesh_free(bat_priv);
-	batadv_nc_mesh_free(bat_priv);
 	batadv_dat_free(bat_priv);
 	batadv_bla_free(bat_priv);
 
 	batadv_mcast_free(bat_priv);
+
+	/* destroy the "untagged" VLAN */
+	vlan = batadv_meshif_vlan_get(bat_priv, BATADV_NO_FLAGS);
+	if (vlan) {
+		batadv_meshif_destroy_vlan(bat_priv, vlan);
+		batadv_meshif_vlan_put(vlan);
+	}
 
 	/* Free the TT and the originator tables only after having terminated
 	 * all the other depending components which may use these structures for
@@ -336,11 +333,6 @@ int batadv_max_header_len(void)
 	header_len = max_t(int, header_len,
 			   sizeof(struct batadv_bcast_packet));
 
-#ifdef CONFIG_BATMAN_ADV_NC
-	header_len = max_t(int, header_len,
-			   sizeof(struct batadv_coded_packet));
-#endif
-
 	return header_len + ETH_HLEN;
 }
 
@@ -370,7 +362,7 @@ void batadv_skb_set_priority(struct sk_buff *skb, int offset)
 
 	switch (ethhdr->h_proto) {
 	case htons(ETH_P_8021Q):
-		vhdr = skb_header_pointer(skb, offset + sizeof(*vhdr),
+		vhdr = skb_header_pointer(skb, offset,
 					  sizeof(*vhdr), &vhdr_tmp);
 		if (!vhdr)
 			return;
@@ -578,42 +570,12 @@ void batadv_recv_handler_unregister(u8 packet_type)
 }
 
 /**
- * batadv_skb_crc32() - calculate CRC32 of the whole packet and skip bytes in
- *  the header
- * @skb: skb pointing to fragmented socket buffers
- * @payload_ptr: Pointer to position inside the head buffer of the skb
- *  marking the start of the data to be CRC'ed
- *
- * payload_ptr must always point to an address in the skb head buffer and not to
- * a fragment.
- *
- * Return: big endian crc32c of the checksummed data
- */
-__be32 batadv_skb_crc32(struct sk_buff *skb, u8 *payload_ptr)
-{
-	u32 crc = 0;
-	unsigned int from;
-	unsigned int to = skb->len;
-	struct skb_seq_state st;
-	const u8 *data;
-	unsigned int len;
-	unsigned int consumed = 0;
-
-	from = (unsigned int)(payload_ptr - skb->data);
-
-	skb_prepare_seq_read(skb, from, to, &st);
-	while ((len = skb_seq_read(consumed, &data, &st)) != 0) {
-		crc = crc32c(crc, data, len);
-		consumed += len;
-	}
-
-	return htonl(crc);
-}
-
-/**
  * batadv_get_vid() - extract the VLAN identifier from skb if any
  * @skb: the buffer containing the packet
  * @header_len: length of the batman header preceding the ethernet header
+ *
+ * The caller must ensure that at least @header_len + ETH_HLEN bytes are
+ * accessible after skb->data.
  *
  * Return: VID with the BATADV_VLAN_HAS_TAG flag when the packet embedded in the
  * skb is vlan tagged. Otherwise BATADV_NO_FLAGS.

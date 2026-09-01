@@ -64,7 +64,7 @@
 #define VCPU_IRQS_MAX_BUF (sizeof(struct kvm_s390_irq) * \
 			   (KVM_MAX_VCPUS + LOCAL_IRQS))
 
-const struct _kvm_stats_desc kvm_vm_stats_desc[] = {
+const struct kvm_stats_desc kvm_vm_stats_desc[] = {
 	KVM_GENERIC_VM_STATS(),
 	STATS_DESC_COUNTER(VM, inject_io),
 	STATS_DESC_COUNTER(VM, inject_float_mchk),
@@ -90,7 +90,7 @@ const struct kvm_stats_header kvm_vm_stats_header = {
 		       sizeof(kvm_vm_stats_desc),
 };
 
-const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
+const struct kvm_stats_desc kvm_vcpu_stats_desc[] = {
 	KVM_GENERIC_VCPU_STATS(),
 	STATS_DESC_COUNTER(VCPU, exit_userspace),
 	STATS_DESC_COUNTER(VCPU, exit_null),
@@ -356,7 +356,7 @@ static __always_inline void pfcr_query(u8 (*query)[16])
 {
 	asm volatile(
 		"	lghi	0,0\n"
-		"	.insn   rsy,0xeb0000000016,0,0,%[query]\n"
+		"	.insn   rsy,0xeb0000000016,0,0,%[query]"
 		: [query] "=QS" (*query)
 		:
 		: "cc", "0");
@@ -368,7 +368,7 @@ static __always_inline void __sortl_query(u8 (*query)[32])
 		"	lghi	0,0\n"
 		"	la	1,%[query]\n"
 		/* Parameter registers are ignored */
-		"	.insn	rre,0xb9380000,2,4\n"
+		"	.insn	rre,0xb9380000,2,4"
 		: [query] "=R" (*query)
 		:
 		: "cc", "0", "1");
@@ -380,7 +380,7 @@ static __always_inline void __dfltcc_query(u8 (*query)[32])
 		"	lghi	0,0\n"
 		"	la	1,%[query]\n"
 		/* Parameter registers are ignored */
-		"	.insn	rrf,0xb9390000,2,4,6,0\n"
+		"	.insn	rrf,0xb9390000,2,4,6,0"
 		: [query] "=R" (*query)
 		:
 		: "cc", "0", "1");

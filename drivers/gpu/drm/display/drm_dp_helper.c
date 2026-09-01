@@ -3457,6 +3457,18 @@ int drm_dp_get_pcon_max_frl_bw(const u8 dpcd[DP_RECEIVER_CAP_SIZE],
 	int bw;
 	u8 buf;
 
+	if (!drm_dp_is_branch(dpcd))
+		return 0;
+
+	if (dpcd[DP_DPCD_REV] < 0x11)
+		return 0;
+
+	if ((dpcd[DP_DOWNSTREAMPORT_PRESENT] & DP_DETAILED_CAP_INFO_AVAILABLE) == 0)
+		return 0;
+
+	if ((port_cap[0] & DP_DS_PORT_TYPE_MASK) != DP_DS_PORT_TYPE_HDMI)
+		return 0;
+
 	buf = port_cap[2];
 	bw = buf & DP_PCON_MAX_FRL_BW;
 
@@ -3962,6 +3974,7 @@ int drm_edp_backlight_set_level(struct drm_dp_aux *aux, const struct drm_edp_bac
 	int ret;
 	unsigned int offset = DP_EDP_BACKLIGHT_BRIGHTNESS_MSB;
 	u8 buf[3] = { 0 };
+	size_t len = 2;
 
 	/* The panel uses the PWM for controlling brightness levels */
 	if (!(bl->aux_set || bl->luminance_set))
@@ -3974,6 +3987,7 @@ int drm_edp_backlight_set_level(struct drm_dp_aux *aux, const struct drm_edp_bac
 		buf[1] = (level & 0x00ff00) >> 8;
 		buf[2] = (level & 0xff0000) >> 16;
 		offset = DP_EDP_PANEL_TARGET_LUMINANCE_VALUE;
+		len = 3;
 	} else if (bl->lsb_reg_used) {
 		buf[0] = (level & 0xff00) >> 8;
 		buf[1] = (level & 0x00ff);
@@ -3981,7 +3995,7 @@ int drm_edp_backlight_set_level(struct drm_dp_aux *aux, const struct drm_edp_bac
 		buf[0] = level;
 	}
 
-	ret = drm_dp_dpcd_write_data(aux, offset, buf, sizeof(buf));
+	ret = drm_dp_dpcd_write_data(aux, offset, buf, len);
 	if (ret < 0) {
 		drm_err(aux->drm_dev,
 			"%s: Failed to write aux backlight level: %d\n",

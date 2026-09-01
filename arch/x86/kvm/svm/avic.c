@@ -64,6 +64,34 @@
 
 static_assert(__AVIC_GATAG(AVIC_VM_ID_MASK, AVIC_VCPU_IDX_MASK) == -1u);
 
+#define AVIC_AUTO_MODE -1
+
+static int avic_param_set(const char *val, const struct kernel_param *kp)
+{
+	if (val && sysfs_streq(val, "auto")) {
+		*(int *)kp->arg = AVIC_AUTO_MODE;
+		return 0;
+	}
+
+	return param_set_bint(val, kp);
+}
+
+static const struct kernel_param_ops avic_ops = {
+	.flags = KERNEL_PARAM_OPS_FL_NOARG,
+	.set = avic_param_set,
+	.get = param_get_bool,
+};
+
+/*
+ * Enable / disable AVIC.  In "auto" mode (default behavior), AVIC is enabled
+ * for Zen4+ CPUs with x2AVIC (and all other criteria for enablement are met).
+ */
+static int avic = AVIC_AUTO_MODE;
+module_param_cb(avic, &avic_ops, &avic, 0444);
+__MODULE_PARM_TYPE(avic, "bool");
+
+module_param(enable_ipiv, bool, 0444);
+
 static bool force_avic;
 module_param_unsafe(force_avic, bool, 0444);
 
@@ -77,16 +105,92 @@ static DEFINE_HASHTABLE(svm_vm_data_hash, SVM_VM_DATA_HASH_BITS);
 static u32 next_vm_id = 0;
 static bool next_vm_id_wrapped = 0;
 static DEFINE_SPINLOCK(svm_vm_data_hash_lock);
-bool x2avic_enabled;
+static bool x2avic_enabled;
+
+
+static void avic_set_x2apic_msr_interception(struct vcpu_svm *svm,
+					     bool intercept)
+{
+	struct kvm_vcpu *vcpu = &svm->vcpu;
+	u64 rd_regs;
+	int i;
+
+	if (intercept == svm->x2avic_msrs_intercepted)
+		return;
+
+	if (!x2avic_enabled)
+		return;
+
+	rd_regs = kvm_x2apic_disable_read_intercept_reg_mask(vcpu);
+
+	for_each_set_bit(i, (unsigned long *)&rd_regs, BITS_PER_TYPE(rd_regs))
+		svm_set_intercept_for_msr(vcpu, APIC_BASE_MSR + i,
+					  MSR_TYPE_R, intercept);
+
+	svm_set_intercept_for_msr(vcpu, X2APIC_MSR(APIC_TASKPRI), MSR_TYPE_W, intercept);
+	svm_set_intercept_for_msr(vcpu, X2APIC_MSR(APIC_EOI), MSR_TYPE_W, intercept);
+	svm_set_intercept_for_msr(vcpu, X2APIC_MSR(APIC_SELF_IPI), MSR_TYPE_W, intercept);
+	svm_set_intercept_for_msr(vcpu, X2APIC_MSR(APIC_ICR), MSR_TYPE_W, intercept);
+
+	svm->x2avic_msrs_intercepted = intercept;
+}
+
+static u32 avic_get_max_physical_id(struct kvm_vcpu *vcpu)
+{
+	u32 arch_max;
+
+	if (x2avic_enabled && apic_x2apic_mode(vcpu->arch.apic))
+		arch_max = X2AVIC_MAX_PHYSICAL_ID;
+	else
+		arch_max = AVIC_MAX_PHYSICAL_ID;
+
+	/*
+	 * Despite its name, KVM_CAP_MAX_VCPU_ID represents the maximum APIC ID
+	 * plus one, so the max possible APIC ID is one less than that.
+	 */
+	return min(vcpu->kvm->arch.max_vcpu_ids - 1, arch_max);
+}
 
 static void avic_activate_vmcb(struct vcpu_svm *svm)
 {
 	struct vmcb *vmcb = svm->vmcb01.ptr;
+	struct kvm_vcpu *vcpu = &svm->vcpu;
 
 	vmcb->control.int_ctl &= ~(AVIC_ENABLE_MASK | X2APIC_MODE_MASK);
 	vmcb->control.avic_physical_id &= ~AVIC_PHYSICAL_MAX_INDEX_MASK;
-
+	vmcb->control.avic_physical_id |= avic_get_max_physical_id(vcpu);
 	vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
+
+	svm_clr_intercept(svm, INTERCEPT_CR8_WRITE);
+
+	/*
+	 * Flush the TLB when enabling (x2)AVIC and when transitioning between
+	 * xAVIC and x2AVIC, as the CPU may have inserted a TLB entry for the
+	 * "wrong" mapping.
+	 *
+	 * KVM uses a per-VM "scratch" page to back the APIC memslot, because
+	 * KVM also uses per-VM page tables *and* maintains the page table (NPT
+	 * or shadow page) mappings for said memslot even if one or more vCPUs
+	 * have their local APIC hardware-disabled or are in x2APIC mode, i.e.
+	 * even if one or more vCPUs' APIC MMIO BAR is effectively disabled.
+	 *
+	 * If xAVIC is fully enabled, hardware ignores the physical address in
+	 * KVM's page tables, i.e. in the leaf SPTE for the APIC memslot, and
+	 * instead redirects the access to the AVIC backing page, i.e. to the
+	 * vCPU's virtual APIC page.  If xAVIC is not enabled (APIC is either
+	 * hardware-disabled or in x2APIC mode), then guest accesses will use
+	 * the page table mapping verbatim, i.e. will access the per-VM scratch
+	 * page, as normal memory.
+	 *
+	 * In both cases, the CPU is allowed to cache TLB entries for the APIC
+	 * base GPA.  So, KVM needs to flush the TLB when enabling xAVIC, as
+	 * accesses need to be redirected to the virtual APIC page, but the TLB
+	 * may contain entries pointing at the scratch page.  KVM also needs to
+	 * flush the TLB when enabling x2AVIC, as accesses need to go to the
+	 * scratch page, but the TLB may contain entries tagged as xAVIC, i.e.
+	 * entries pointing to the vCPU's virtual APIC page.
+	 */
+	kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, &svm->vcpu);
 
 	/*
 	 * Note: KVM supports hybrid-AVIC mode, where KVM emulates x2APIC MSR
@@ -97,20 +201,12 @@ static void avic_activate_vmcb(struct vcpu_svm *svm)
 	 */
 	if (x2avic_enabled && apic_x2apic_mode(svm->vcpu.arch.apic)) {
 		vmcb->control.int_ctl |= X2APIC_MODE_MASK;
-		vmcb->control.avic_physical_id |= X2AVIC_MAX_PHYSICAL_ID;
-		/* Disabling MSR intercept for x2APIC registers */
-		svm_set_x2apic_msr_interception(svm, false);
-	} else {
-		/*
-		 * Flush the TLB, the guest may have inserted a non-APIC
-		 * mapping into the TLB while AVIC was disabled.
-		 */
-		kvm_make_request(KVM_REQ_TLB_FLUSH_CURRENT, &svm->vcpu);
 
-		/* For xAVIC and hybrid-xAVIC modes */
-		vmcb->control.avic_physical_id |= AVIC_MAX_PHYSICAL_ID;
+		/* Disabling MSR intercept for x2APIC registers */
+		avic_set_x2apic_msr_interception(svm, false);
+	} else {
 		/* Enabling MSR intercept for x2APIC registers */
-		svm_set_x2apic_msr_interception(svm, true);
+		avic_set_x2apic_msr_interception(svm, true);
 	}
 }
 
@@ -121,23 +217,18 @@ static void avic_deactivate_vmcb(struct vcpu_svm *svm)
 	vmcb->control.int_ctl &= ~(AVIC_ENABLE_MASK | X2APIC_MODE_MASK);
 	vmcb->control.avic_physical_id &= ~AVIC_PHYSICAL_MAX_INDEX_MASK;
 
-	/*
-	 * If running nested and the guest uses its own MSR bitmap, there
-	 * is no need to update L0's msr bitmap
-	 */
-	if (is_guest_mode(&svm->vcpu) &&
-	    vmcb12_is_intercept(&svm->nested.ctl, INTERCEPT_MSR_PROT))
-		return;
+	if (!sev_es_guest(svm->vcpu.kvm))
+		svm_set_intercept(svm, INTERCEPT_CR8_WRITE);
 
 	/* Enabling MSR intercept for x2APIC registers */
-	svm_set_x2apic_msr_interception(svm, true);
+	avic_set_x2apic_msr_interception(svm, true);
 }
 
 /* Note:
  * This function is called from IOMMU driver to notify
  * SVM to schedule in a particular vCPU of a particular VM.
  */
-int avic_ga_log_notifier(u32 ga_tag)
+static int avic_ga_log_notifier(u32 ga_tag)
 {
 	unsigned long flags;
 	struct kvm_svm *kvm_svm;
@@ -242,7 +333,7 @@ void avic_init_vmcb(struct vcpu_svm *svm, struct vmcb *vmcb)
 	vmcb->control.avic_physical_id = __sme_set(__pa(kvm_svm->avic_physical_id_table));
 	vmcb->control.avic_vapic_bar = APIC_DEFAULT_PHYS_BASE;
 
-	if (kvm_apicv_activated(svm->vcpu.kvm))
+	if (kvm_vcpu_apicv_active(&svm->vcpu))
 		avic_activate_vmcb(svm);
 	else
 		avic_deactivate_vmcb(svm);
@@ -709,7 +800,7 @@ int avic_init_vcpu(struct vcpu_svm *svm)
 	struct kvm_vcpu *vcpu = &svm->vcpu;
 
 	INIT_LIST_HEAD(&svm->ir_list);
-	spin_lock_init(&svm->ir_list_lock);
+	raw_spin_lock_init(&svm->ir_list_lock);
 
 	if (!enable_apicv || !irqchip_in_kernel(vcpu->kvm))
 		return 0;
@@ -737,9 +828,9 @@ static void svm_ir_list_del(struct kvm_kernel_irqfd *irqfd)
 	if (!vcpu)
 		return;
 
-	spin_lock_irqsave(&to_svm(vcpu)->ir_list_lock, flags);
+	raw_spin_lock_irqsave(&to_svm(vcpu)->ir_list_lock, flags);
 	list_del(&irqfd->vcpu_list);
-	spin_unlock_irqrestore(&to_svm(vcpu)->ir_list_lock, flags);
+	raw_spin_unlock_irqrestore(&to_svm(vcpu)->ir_list_lock, flags);
 }
 
 int avic_pi_update_irte(struct kvm_kernel_irqfd *irqfd, struct kvm *kvm,
@@ -776,7 +867,7 @@ int avic_pi_update_irte(struct kvm_kernel_irqfd *irqfd, struct kvm *kvm,
 		 * list of IRQs being posted to the vCPU, to ensure the IRTE
 		 * isn't programmed with stale pCPU/IsRunning information.
 		 */
-		guard(spinlock_irqsave)(&svm->ir_list_lock);
+		guard(raw_spinlock_irqsave)(&svm->ir_list_lock);
 
 		/*
 		 * Update the target pCPU for IOMMU doorbells if the vCPU is
@@ -893,7 +984,7 @@ static void __avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu,
 	 * up-to-date entry information, or that this task will wait until
 	 * svm_ir_list_add() completes to set the new target pCPU.
 	 */
-	spin_lock_irqsave(&svm->ir_list_lock, flags);
+	raw_spin_lock_irqsave(&svm->ir_list_lock, flags);
 
 	entry = svm->avic_physical_id_entry;
 	WARN_ON_ONCE(entry & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK);
@@ -918,7 +1009,7 @@ static void __avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu,
 
 	avic_update_iommu_vcpu_affinity(vcpu, h_physical_id, action);
 
-	spin_unlock_irqrestore(&svm->ir_list_lock, flags);
+	raw_spin_unlock_irqrestore(&svm->ir_list_lock, flags);
 }
 
 void avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
@@ -956,7 +1047,7 @@ static void __avic_vcpu_put(struct kvm_vcpu *vcpu, enum avic_vcpu_action action)
 	 * or that this task will wait until svm_ir_list_add() completes to
 	 * mark the vCPU as not running.
 	 */
-	spin_lock_irqsave(&svm->ir_list_lock, flags);
+	raw_spin_lock_irqsave(&svm->ir_list_lock, flags);
 
 	avic_update_iommu_vcpu_affinity(vcpu, -1, action);
 
@@ -980,7 +1071,7 @@ static void __avic_vcpu_put(struct kvm_vcpu *vcpu, enum avic_vcpu_action action)
 
 	svm->avic_physical_id_entry = entry;
 
-	spin_unlock_irqrestore(&svm->ir_list_lock, flags);
+	raw_spin_unlock_irqrestore(&svm->ir_list_lock, flags);
 }
 
 void avic_vcpu_put(struct kvm_vcpu *vcpu)
@@ -1090,23 +1181,27 @@ void avic_vcpu_unblocking(struct kvm_vcpu *vcpu)
 	avic_vcpu_load(vcpu, vcpu->cpu);
 }
 
-/*
- * Note:
- * - The module param avic enable both xAPIC and x2APIC mode.
- * - Hypervisor can support both xAVIC and x2AVIC in the same guest.
- * - The mode can be switched at run-time.
- */
-bool avic_hardware_setup(void)
+static bool __init avic_want_avic_enabled(void)
 {
-	if (!npt_enabled)
+	/*
+	 * In "auto" mode, enable AVIC by default for Zen4+ if x2AVIC is
+	 * supported (to avoid enabling partial support by default, and because
+	 * x2AVIC should be supported by all Zen4+ CPUs).  Explicitly check for
+	 * family 0x19 and later (Zen5+), as the kernel's synthetic ZenX flags
+	 * aren't inclusive of previous generations, i.e. the kernel will set
+	 * at most one ZenX feature flag.
+	 */
+	if (avic == AVIC_AUTO_MODE)
+		avic = boot_cpu_has(X86_FEATURE_X2AVIC) &&
+		       (boot_cpu_data.x86 > 0x19 || cpu_feature_enabled(X86_FEATURE_ZEN4));
+
+	if (!avic || !npt_enabled)
 		return false;
 
 	/* AVIC is a prerequisite for x2AVIC. */
 	if (!boot_cpu_has(X86_FEATURE_AVIC) && !force_avic) {
-		if (boot_cpu_has(X86_FEATURE_X2AVIC)) {
-			pr_warn(FW_BUG "Cannot support x2AVIC due to AVIC is disabled");
-			pr_warn(FW_BUG "Try enable AVIC using force_avic option");
-		}
+		if (boot_cpu_has(X86_FEATURE_X2AVIC))
+			pr_warn(FW_BUG "Cannot enable x2AVIC, AVIC is unsupported\n");
 		return false;
 	}
 
@@ -1116,31 +1211,55 @@ bool avic_hardware_setup(void)
 		return false;
 	}
 
-	if (boot_cpu_has(X86_FEATURE_AVIC)) {
-		pr_info("AVIC enabled\n");
-	} else if (force_avic) {
-		/*
-		 * Some older systems does not advertise AVIC support.
-		 * See Revision Guide for specific AMD processor for more detail.
-		 */
-		pr_warn("AVIC is not supported in CPUID but force enabled");
-		pr_warn("Your system might crash and burn");
-	}
+	/*
+	 * Print a scary message if AVIC is force enabled to make it abundantly
+	 * clear that ignoring CPUID could have repercussions.  See Revision
+	 * Guide for specific AMD processor for more details.
+	 */
+	if (!boot_cpu_has(X86_FEATURE_AVIC))
+		pr_warn("AVIC unsupported in CPUID but force enabled, your system might crash and burn\n");
+
+	return true;
+}
+
+/*
+ * Note:
+ * - The module param avic enable both xAPIC and x2APIC mode.
+ * - Hypervisor can support both xAVIC and x2AVIC in the same guest.
+ * - The mode can be switched at run-time.
+ */
+bool __init avic_hardware_setup(void)
+{
+	avic = avic_want_avic_enabled();
+	if (!avic)
+		return false;
+
+	pr_info("AVIC enabled\n");
 
 	/* AVIC is a prerequisite for x2AVIC. */
 	x2avic_enabled = boot_cpu_has(X86_FEATURE_X2AVIC);
 	if (x2avic_enabled)
 		pr_info("x2AVIC enabled\n");
+	else
+		svm_x86_ops.allow_apicv_in_x2apic_without_x2apic_virtualization = true;
 
 	/*
-	 * Disable IPI virtualization for AMD Family 17h CPUs (Zen1 and Zen2)
-	 * due to erratum 1235, which results in missed VM-Exits on the sender
-	 * and thus missed wake events for blocking vCPUs due to the CPU
-	 * failing to see a software update to clear IsRunning.
+	 * Disable IPI virtualization for AMD Family 17h (Zen1 and Zen2) and
+	 * Hygon Family 18h (derived from AMD Zen1) CPUs due to erratum 1235,
+	 * which results in missed VM-Exits on the sender and thus missed wake
+	 * events for blocking vCPUs due to the CPU failing to see a software
+	 * update to clear IsRunning.
 	 */
-	enable_ipiv = enable_ipiv && boot_cpu_data.x86 != 0x17;
+	if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18)
+		enable_ipiv = false;
 
 	amd_iommu_register_ga_log_notifier(&avic_ga_log_notifier);
 
 	return true;
+}
+
+void avic_hardware_unsetup(void)
+{
+	if (avic)
+		amd_iommu_register_ga_log_notifier(NULL);
 }

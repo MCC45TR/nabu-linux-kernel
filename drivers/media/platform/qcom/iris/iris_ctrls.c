@@ -197,27 +197,12 @@ static int iris_op_s_ctrl(struct v4l2_ctrl *ctrl)
 	struct platform_inst_fw_cap *cap;
 	struct vb2_queue *q;
 
-	q = v4l2_m2m_get_src_vq(inst->m2m_ctx);
-	switch (ctrl->id) {
-	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY:
-		if (inst->domain != DECODER || vb2_is_streaming(q))
-			return -EINVAL;
-		inst->display_delay = ctrl->val;
-		return 0;
-	case V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE:
-		if (inst->domain != DECODER || vb2_is_streaming(q))
-			return -EINVAL;
-		inst->display_delay_enable = ctrl->val;
-		return 0;
-	default:
-		break;
-	}
-
 	cap = &inst->fw_caps[0];
 	cap_id = iris_get_cap_id(ctrl->id);
 	if (!iris_valid_cap_id(cap_id))
 		return -EINVAL;
 
+	q = v4l2_m2m_get_src_vq(inst->m2m_ctx);
 	if (vb2_is_streaming(q) &&
 	    (!(inst->fw_caps[cap_id].flags & CAP_FLAG_DYNAMIC_ALLOWED)))
 		return -EINVAL;
@@ -241,7 +226,7 @@ static const struct v4l2_ctrl_ops iris_ctrl_ops = {
 int iris_ctrls_init(struct iris_inst *inst)
 {
 	struct platform_inst_fw_cap *cap = &inst->fw_caps[0];
-	u32 num_ctrls = 0, handler_ctrls, ctrl_idx = 0, idx = 0;
+	u32 num_ctrls = 0, ctrl_idx = 0, idx = 0;
 	u32 v4l2_id;
 	int ret;
 
@@ -250,19 +235,12 @@ int iris_ctrls_init(struct iris_inst *inst)
 			num_ctrls++;
 	}
 
-	/* Add one read-only buffer-count control.  Legacy VPU5 decoders also
-	 * expose the two standard display-delay controls used to request
-	 * decode-order output from firmware.
-	 *
+	/* Adding 1 to num_ctrls to include
 	 * V4L2_CID_MIN_BUFFERS_FOR_CAPTURE for decoder and
 	 * V4L2_CID_MIN_BUFFERS_FOR_OUTPUT for encoder
 	 */
-	handler_ctrls = num_ctrls + 1;
-	if (inst->domain == DECODER &&
-	    inst->core->iris_platform_data->legacy_vpu5)
-		handler_ctrls += 2;
 
-	ret = v4l2_ctrl_handler_init(&inst->ctrl_handler, handler_ctrls);
+	ret = v4l2_ctrl_handler_init(&inst->ctrl_handler, num_ctrls + 1);
 	if (ret)
 		return ret;
 
@@ -305,15 +283,6 @@ int iris_ctrls_init(struct iris_inst *inst)
 	if (inst->domain == DECODER) {
 		v4l2_ctrl_new_std(&inst->ctrl_handler, NULL,
 				  V4L2_CID_MIN_BUFFERS_FOR_CAPTURE, 1, 32, 1, 4);
-
-		if (inst->core->iris_platform_data->legacy_vpu5) {
-			v4l2_ctrl_new_std(&inst->ctrl_handler, &iris_ctrl_ops,
-					  V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY,
-					  0, 16383, 1, 0);
-			v4l2_ctrl_new_std(&inst->ctrl_handler, &iris_ctrl_ops,
-					  V4L2_CID_MPEG_VIDEO_DEC_DISPLAY_DELAY_ENABLE,
-					  0, 1, 1, 0);
-		}
 	} else {
 		v4l2_ctrl_new_std(&inst->ctrl_handler, NULL,
 				  V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1, 4);
@@ -497,56 +466,18 @@ int iris_set_profile_level_gen1(struct iris_inst *inst, enum platform_inst_fw_ca
 	struct hfi_profile_level pl;
 
 	if (inst->codec == V4L2_PIX_FMT_H264) {
-		switch (inst->fw_caps[PROFILE_H264].value) {
-		case V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE:
-			pl.profile = BIT(0);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_MAIN:
-			pl.profile = BIT(1);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_HIGH:
-			pl.profile = BIT(2);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_STEREO_HIGH:
-			pl.profile = BIT(3);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_MULTIVIEW_HIGH:
-			pl.profile = BIT(4);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_BASELINE:
-			pl.profile = BIT(5);
-			break;
-		case V4L2_MPEG_VIDEO_H264_PROFILE_CONSTRAINED_HIGH:
-			pl.profile = BIT(6);
-			break;
-		default:
-			return -EINVAL;
-		}
-
-		pl.level = BIT(inst->fw_caps[LEVEL_H264].value);
+		pl.profile = inst->fw_caps[PROFILE_H264].value;
+		pl.level = inst->fw_caps[LEVEL_H264].value;
 	} else {
-		switch (inst->fw_caps[PROFILE_HEVC].value) {
-		case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN:
-			pl.profile = BIT(0);
-			break;
-		case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10:
-			pl.profile = BIT(1);
-			break;
-		case V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_STILL_PICTURE:
-			pl.profile = BIT(2);
-			break;
-		default:
-			return -EINVAL;
-		}
-
-		pl.level = BIT(inst->fw_caps[LEVEL_HEVC].value);
+		pl.profile = inst->fw_caps[PROFILE_HEVC].value;
+		pl.level = inst->fw_caps[LEVEL_HEVC].value;
 	}
 
 	return hfi_ops->session_set_property(inst, hfi_id,
 					     HFI_HOST_FLAGS_NONE,
 					     iris_get_port_info(inst, cap_id),
 					     HFI_PAYLOAD_U32_ENUM,
-					     &pl, sizeof(pl));
+					     &pl, sizeof(u32));
 }
 
 int iris_set_header_mode_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
@@ -613,23 +544,6 @@ int iris_set_bitrate(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_
 				     iris_get_port_info(inst, cap_id),
 				     HFI_PAYLOAD_U32,
 				     &bitrate, sizeof(u32));
-}
-
-int iris_set_gop_size_gen1(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)
-{
-	const struct iris_hfi_command_ops *hfi_ops = inst->core->hfi_ops;
-	u32 hfi_id = inst->fw_caps[cap_id].hfi_id;
-	u32 gop_size = inst->fw_caps[cap_id].value;
-	struct hfi_intra_period period = {
-		.pframes = gop_size ? gop_size - 1 : 0,
-		.bframes = 0,
-	};
-
-	return hfi_ops->session_set_property(inst, hfi_id,
-					     HFI_HOST_FLAGS_NONE,
-					     iris_get_port_info(inst, cap_id),
-					     HFI_PAYLOAD_U32,
-					     &period, sizeof(period));
 }
 
 int iris_set_peak_bitrate(struct iris_inst *inst, enum platform_inst_fw_cap_type cap_id)

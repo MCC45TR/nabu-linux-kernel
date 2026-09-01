@@ -318,7 +318,7 @@ struct scsi_host_template {
 	 *
 	 * Status: OPTIONAL
 	 */
-	int (* bios_param)(struct scsi_device *, struct block_device *,
+	int (* bios_param)(struct scsi_device *, struct gendisk *,
 			sector_t, int []);
 
 	/*
@@ -713,6 +713,9 @@ struct Scsi_Host {
 	 * Needed just in case we have virtual hosts.
 	 */
 	struct device *dma_dev;
+
+	/* Used for an rcu-synchronizing eh wakeup */
+	struct work_struct eh_work;
 
 	/* Delay for runtime autosuspend */
 	int rpm_autosuspend_delay;

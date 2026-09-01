@@ -417,9 +417,12 @@ static int hbg_pci_init(struct pci_dev *pdev)
 
 	priv->io_base = pcim_iomap_table(pdev)[0];
 	if (!priv->io_base)
-		return dev_err_probe(dev, -ENOMEM, "failed to get io base\n");
+		return -ENOMEM;
 
 	pci_set_master(pdev);
+	pcie_capability_clear_word(pdev, PCI_EXP_DEVCTL,
+				   PCI_EXP_DEVCTL_RELAX_EN);
+	pci_save_state(pdev);
 	return 0;
 }
 

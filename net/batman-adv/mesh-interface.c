@@ -37,6 +37,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <net/netlink.h>
+#include <net/rtnetlink.h>
 #include <uapi/linux/batadv_packet.h>
 #include <uapi/linux/batman_adv.h>
 
@@ -46,7 +47,6 @@
 #include "gateway_client.h"
 #include "hard-interface.h"
 #include "multicast.h"
-#include "network-coding.h"
 #include "send.h"
 #include "translation-table.h"
 
@@ -191,6 +191,9 @@ static netdev_tx_t batadv_interface_tx(struct sk_buff *skb,
 	__be16 proto;
 
 	if (atomic_read(&bat_priv->mesh_state) != BATADV_MESH_ACTIVE)
+		goto dropped;
+
+	if (!pskb_may_pull(skb, ETH_HLEN))
 		goto dropped;
 
 	/* reset control block to avoid left overs from previous users */
@@ -432,6 +435,7 @@ void batadv_interface_rx(struct net_device *mesh_iface,
 		if (!pskb_may_pull(skb, VLAN_ETH_HLEN))
 			goto dropped;
 
+		ethhdr = eth_hdr(skb);
 		vhdr = skb_vlan_eth_hdr(skb);
 
 		/* drop batman-in-batman packets to prevent loops */
@@ -589,8 +593,8 @@ int batadv_meshif_create_vlan(struct batadv_priv *bat_priv, unsigned short vid)
  * @bat_priv: the bat priv with all the mesh interface information
  * @vlan: the object to remove
  */
-static void batadv_meshif_destroy_vlan(struct batadv_priv *bat_priv,
-				       struct batadv_meshif_vlan *vlan)
+void batadv_meshif_destroy_vlan(struct batadv_priv *bat_priv,
+				struct batadv_meshif_vlan *vlan)
 {
 	/* explicitly remove the associated TT local entry because it is marked
 	 * with the NOPURGE flag
@@ -787,6 +791,7 @@ static int batadv_meshif_init_late(struct net_device *dev)
 	atomic_set(&bat_priv->tt.ogm_append_cnt, 0);
 #ifdef CONFIG_BATMAN_ADV_BLA
 	atomic_set(&bat_priv->bla.num_requests, 0);
+	spin_lock_init(&bat_priv->bla.num_requests_lock);
 #endif
 	atomic_set(&bat_priv->tp_num, 0);
 
@@ -801,8 +806,6 @@ static int batadv_meshif_init_late(struct net_device *dev)
 	atomic_set(&bat_priv->frag_seqno, random_seqno);
 
 	bat_priv->primary_if = NULL;
-
-	batadv_nc_init_bat_priv(bat_priv);
 
 	if (!bat_priv->algo_ops) {
 		ret = batadv_algo_select(bat_priv, batadv_routing_algo);
@@ -947,17 +950,6 @@ static const struct {
 	{ "dat_put_rx" },
 	{ "dat_cached_reply_tx" },
 #endif
-#ifdef CONFIG_BATMAN_ADV_NC
-	{ "nc_code" },
-	{ "nc_code_bytes" },
-	{ "nc_recode" },
-	{ "nc_recode_bytes" },
-	{ "nc_buffer" },
-	{ "nc_decode" },
-	{ "nc_decode_bytes" },
-	{ "nc_decode_failed" },
-	{ "nc_sniffed" },
-#endif
 };
 
 static void batadv_get_strings(struct net_device *dev, u32 stringset, u8 *data)
@@ -1097,20 +1089,11 @@ static int batadv_meshif_newlink(struct net_device *dev,
 static void batadv_meshif_destroy_netlink(struct net_device *mesh_iface,
 					  struct list_head *head)
 {
-	struct batadv_priv *bat_priv = netdev_priv(mesh_iface);
 	struct batadv_hard_iface *hard_iface;
-	struct batadv_meshif_vlan *vlan;
 
 	while (!list_empty(&mesh_iface->adj_list.lower)) {
 		hard_iface = netdev_adjacent_get_private(mesh_iface->adj_list.lower.next);
 		batadv_hardif_disable_interface(hard_iface);
-	}
-
-	/* destroy the "untagged" VLAN */
-	vlan = batadv_meshif_vlan_get(bat_priv, BATADV_NO_FLAGS);
-	if (vlan) {
-		batadv_meshif_destroy_vlan(bat_priv, vlan);
-		batadv_meshif_vlan_put(vlan);
 	}
 
 	unregister_netdevice_queue(mesh_iface, head);

@@ -642,7 +642,7 @@ static struct sk_buff *macsec_encrypt(struct sk_buff *skb,
 	}
 
 	unprotected_len = skb->len;
-	eth = eth_hdr(skb);
+	eth = skb_eth_hdr(skb);
 	sci_present = macsec_send_sci(secy);
 	hh = skb_push(skb, macsec_extra_len(sci_present));
 	memmove(hh, eth, 2 * ETH_ALEN);
@@ -804,7 +804,8 @@ static bool macsec_post_decrypt(struct sk_buff *skb, struct macsec_secy *secy, u
 		if (pn + 1 > rx_sa->next_pn_halves.lower) {
 			rx_sa->next_pn_halves.lower = pn + 1;
 		} else if (secy->xpn &&
-			   !pn_same_half(pn, rx_sa->next_pn_halves.lower)) {
+			   (pn + 1 == 0 ||
+			    !pn_same_half(pn, rx_sa->next_pn_halves.lower))) {
 			rx_sa->next_pn_halves.upper++;
 			rx_sa->next_pn_halves.lower = pn + 1;
 		}
@@ -1583,9 +1584,6 @@ static struct macsec_tx_sa *get_txsa_from_nl(struct net *net,
 	if (IS_ERR(dev))
 		return ERR_CAST(dev);
 
-	if (*assoc_num >= MACSEC_NUM_AN)
-		return ERR_PTR(-EINVAL);
-
 	secy = &macsec_priv(dev)->secy;
 	tx_sc = &secy->tx_sc;
 
@@ -1646,8 +1644,6 @@ static struct macsec_rx_sa *get_rxsa_from_nl(struct net *net,
 		return ERR_PTR(-EINVAL);
 
 	*assoc_num = nla_get_u8(tb_sa[MACSEC_SA_ATTR_AN]);
-	if (*assoc_num >= MACSEC_NUM_AN)
-		return ERR_PTR(-EINVAL);
 
 	rx_sc = get_rxsc_from_nl(net, attrs, tb_rxsc, devp, secyp);
 	if (IS_ERR(rx_sc))
@@ -1670,24 +1666,21 @@ static const struct nla_policy macsec_genl_policy[NUM_MACSEC_ATTR] = {
 
 static const struct nla_policy macsec_genl_rxsc_policy[NUM_MACSEC_RXSC_ATTR] = {
 	[MACSEC_RXSC_ATTR_SCI] = { .type = NLA_U64 },
-	[MACSEC_RXSC_ATTR_ACTIVE] = { .type = NLA_U8 },
+	[MACSEC_RXSC_ATTR_ACTIVE] = NLA_POLICY_MAX(NLA_U8, 1),
 };
 
 static const struct nla_policy macsec_genl_sa_policy[NUM_MACSEC_SA_ATTR] = {
-	[MACSEC_SA_ATTR_AN] = { .type = NLA_U8 },
-	[MACSEC_SA_ATTR_ACTIVE] = { .type = NLA_U8 },
-	[MACSEC_SA_ATTR_PN] = NLA_POLICY_MIN_LEN(4),
-	[MACSEC_SA_ATTR_KEYID] = { .type = NLA_BINARY,
-				   .len = MACSEC_KEYID_LEN, },
-	[MACSEC_SA_ATTR_KEY] = { .type = NLA_BINARY,
-				 .len = MACSEC_MAX_KEY_LEN, },
+	[MACSEC_SA_ATTR_AN] = NLA_POLICY_MAX(NLA_U8, MACSEC_NUM_AN - 1),
+	[MACSEC_SA_ATTR_ACTIVE] = NLA_POLICY_MAX(NLA_U8, 1),
+	[MACSEC_SA_ATTR_PN] = NLA_POLICY_MIN(NLA_UINT, 1),
+	[MACSEC_SA_ATTR_KEYID] = NLA_POLICY_EXACT_LEN(MACSEC_KEYID_LEN),
+	[MACSEC_SA_ATTR_KEY] = NLA_POLICY_MAX_LEN(MACSEC_MAX_KEY_LEN),
 	[MACSEC_SA_ATTR_SSCI] = { .type = NLA_U32 },
-	[MACSEC_SA_ATTR_SALT] = { .type = NLA_BINARY,
-				  .len = MACSEC_SALT_LEN, },
+	[MACSEC_SA_ATTR_SALT] = NLA_POLICY_EXACT_LEN(MACSEC_SALT_LEN),
 };
 
 static const struct nla_policy macsec_genl_offload_policy[NUM_MACSEC_OFFLOAD_ATTR] = {
-	[MACSEC_OFFLOAD_ATTR_TYPE] = { .type = NLA_U8 },
+	[MACSEC_OFFLOAD_ATTR_TYPE] = NLA_POLICY_MAX(NLA_U8, MACSEC_OFFLOAD_MAX),
 };
 
 /* Offloads an operation to a device driver */
@@ -1737,21 +1730,6 @@ static bool validate_add_rxsa(struct nlattr **attrs)
 	if (!attrs[MACSEC_SA_ATTR_AN] ||
 	    !attrs[MACSEC_SA_ATTR_KEY] ||
 	    !attrs[MACSEC_SA_ATTR_KEYID])
-		return false;
-
-	if (nla_get_u8(attrs[MACSEC_SA_ATTR_AN]) >= MACSEC_NUM_AN)
-		return false;
-
-	if (attrs[MACSEC_SA_ATTR_PN] &&
-	    nla_get_u64(attrs[MACSEC_SA_ATTR_PN]) == 0)
-		return false;
-
-	if (attrs[MACSEC_SA_ATTR_ACTIVE]) {
-		if (nla_get_u8(attrs[MACSEC_SA_ATTR_ACTIVE]) > 1)
-			return false;
-	}
-
-	if (nla_len(attrs[MACSEC_SA_ATTR_KEYID]) != MACSEC_KEYID_LEN)
 		return false;
 
 	return true;
@@ -1809,14 +1787,6 @@ static int macsec_add_rxsa(struct sk_buff *skb, struct genl_info *info)
 
 	if (secy->xpn) {
 		if (!tb_sa[MACSEC_SA_ATTR_SSCI] || !tb_sa[MACSEC_SA_ATTR_SALT]) {
-			rtnl_unlock();
-			return -EINVAL;
-		}
-
-		if (nla_len(tb_sa[MACSEC_SA_ATTR_SALT]) != MACSEC_SALT_LEN) {
-			pr_notice("macsec: nl: add_rxsa: bad salt length: %d != %d\n",
-				  nla_len(tb_sa[MACSEC_SA_ATTR_SALT]),
-				  MACSEC_SALT_LEN);
 			rtnl_unlock();
 			return -EINVAL;
 		}
@@ -1895,19 +1865,6 @@ cleanup:
 	return err;
 }
 
-static bool validate_add_rxsc(struct nlattr **attrs)
-{
-	if (!attrs[MACSEC_RXSC_ATTR_SCI])
-		return false;
-
-	if (attrs[MACSEC_RXSC_ATTR_ACTIVE]) {
-		if (nla_get_u8(attrs[MACSEC_RXSC_ATTR_ACTIVE]) > 1)
-			return false;
-	}
-
-	return true;
-}
-
 static int macsec_add_rxsc(struct sk_buff *skb, struct genl_info *info)
 {
 	struct net_device *dev;
@@ -1925,7 +1882,7 @@ static int macsec_add_rxsc(struct sk_buff *skb, struct genl_info *info)
 	if (parse_rxsc_config(attrs, tb_rxsc))
 		return -EINVAL;
 
-	if (!validate_add_rxsc(tb_rxsc))
+	if (!tb_rxsc[MACSEC_RXSC_ATTR_SCI])
 		return -EINVAL;
 
 	rtnl_lock();
@@ -1984,20 +1941,6 @@ static bool validate_add_txsa(struct nlattr **attrs)
 	    !attrs[MACSEC_SA_ATTR_KEYID])
 		return false;
 
-	if (nla_get_u8(attrs[MACSEC_SA_ATTR_AN]) >= MACSEC_NUM_AN)
-		return false;
-
-	if (nla_get_u64(attrs[MACSEC_SA_ATTR_PN]) == 0)
-		return false;
-
-	if (attrs[MACSEC_SA_ATTR_ACTIVE]) {
-		if (nla_get_u8(attrs[MACSEC_SA_ATTR_ACTIVE]) > 1)
-			return false;
-	}
-
-	if (nla_len(attrs[MACSEC_SA_ATTR_KEYID]) != MACSEC_KEYID_LEN)
-		return false;
-
 	return true;
 }
 
@@ -2052,14 +1995,6 @@ static int macsec_add_txsa(struct sk_buff *skb, struct genl_info *info)
 
 	if (secy->xpn) {
 		if (!tb_sa[MACSEC_SA_ATTR_SSCI] || !tb_sa[MACSEC_SA_ATTR_SALT]) {
-			rtnl_unlock();
-			return -EINVAL;
-		}
-
-		if (nla_len(tb_sa[MACSEC_SA_ATTR_SALT]) != MACSEC_SALT_LEN) {
-			pr_notice("macsec: nl: add_txsa: bad salt length: %d != %d\n",
-				  nla_len(tb_sa[MACSEC_SA_ATTR_SALT]),
-				  MACSEC_SALT_LEN);
 			rtnl_unlock();
 			return -EINVAL;
 		}
@@ -2339,17 +2274,6 @@ static bool validate_upd_sa(struct nlattr **attrs)
 	    attrs[MACSEC_SA_ATTR_SALT])
 		return false;
 
-	if (nla_get_u8(attrs[MACSEC_SA_ATTR_AN]) >= MACSEC_NUM_AN)
-		return false;
-
-	if (attrs[MACSEC_SA_ATTR_PN] && nla_get_u64(attrs[MACSEC_SA_ATTR_PN]) == 0)
-		return false;
-
-	if (attrs[MACSEC_SA_ATTR_ACTIVE]) {
-		if (nla_get_u8(attrs[MACSEC_SA_ATTR_ACTIVE]) > 1)
-			return false;
-	}
-
 	return true;
 }
 
@@ -2556,7 +2480,7 @@ static int macsec_upd_rxsc(struct sk_buff *skb, struct genl_info *info)
 	if (parse_rxsc_config(attrs, tb_rxsc))
 		return -EINVAL;
 
-	if (!validate_add_rxsc(tb_rxsc))
+	if (!tb_rxsc[MACSEC_RXSC_ATTR_SCI])
 		return -EINVAL;
 
 	rtnl_lock();
@@ -2661,7 +2585,9 @@ static void macsec_inherit_tso_max(struct net_device *dev)
 		netif_inherit_tso_max(dev, macsec->real_dev);
 }
 
-static int macsec_update_offload(struct net_device *dev, enum macsec_offload offload)
+static int macsec_update_offload(struct net_device *dev,
+				 enum macsec_offload offload,
+				 struct netlink_ext_ack *extack)
 {
 	enum macsec_offload prev_offload;
 	const struct macsec_ops *ops;
@@ -2693,14 +2619,35 @@ static int macsec_update_offload(struct net_device *dev, enum macsec_offload off
 	if (!ops)
 		return -EOPNOTSUPP;
 
-	macsec->offload = offload;
-
 	ctx.secy = &macsec->secy;
 	ret = offload == MACSEC_OFFLOAD_OFF ? macsec_offload(ops->mdo_del_secy, &ctx)
 					    : macsec_offload(ops->mdo_add_secy, &ctx);
-	if (ret) {
-		macsec->offload = prev_offload;
+	if (ret)
 		return ret;
+
+	/* Remove VLAN filters when disabling offload. */
+	if (offload == MACSEC_OFFLOAD_OFF) {
+		vlan_drop_rx_ctag_filter_info(dev);
+		vlan_drop_rx_stag_filter_info(dev);
+	}
+	macsec->offload = offload;
+	/* Add VLAN filters when enabling offload. */
+	if (prev_offload == MACSEC_OFFLOAD_OFF) {
+		ret = vlan_get_rx_ctag_filter_info(dev);
+		if (ret) {
+			NL_SET_ERR_MSG_FMT(extack,
+					   "adding ctag VLAN filters failed, err %d",
+					   ret);
+			goto rollback_offload;
+		}
+		ret = vlan_get_rx_stag_filter_info(dev);
+		if (ret) {
+			NL_SET_ERR_MSG_FMT(extack,
+					   "adding stag VLAN filters failed, err %d",
+					   ret);
+			vlan_drop_rx_ctag_filter_info(dev);
+			goto rollback_offload;
+		}
 	}
 
 	macsec_set_head_tail_room(dev);
@@ -2709,6 +2656,12 @@ static int macsec_update_offload(struct net_device *dev, enum macsec_offload off
 	macsec_inherit_tso_max(dev);
 
 	netdev_update_features(dev);
+
+	return 0;
+
+rollback_offload:
+	macsec->offload = prev_offload;
+	macsec_offload(ops->mdo_del_secy, &ctx);
 
 	return ret;
 }
@@ -2750,7 +2703,7 @@ static int macsec_upd_offload(struct sk_buff *skb, struct genl_info *info)
 	offload = nla_get_u8(tb_offload[MACSEC_OFFLOAD_ATTR_TYPE]);
 
 	if (macsec->offload != offload)
-		ret = macsec_update_offload(dev, offload);
+		ret = macsec_update_offload(dev, offload, info->extack);
 out:
 	rtnl_unlock();
 	return ret;
@@ -3563,7 +3516,8 @@ static netdev_tx_t macsec_start_xmit(struct sk_buff *skb,
 }
 
 #define MACSEC_FEATURES \
-	(NETIF_F_SG | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST)
+	(NETIF_F_SG | NETIF_F_HIGHDMA | NETIF_F_FRAGLIST | \
+	 NETIF_F_HW_VLAN_STAG_FILTER | NETIF_F_HW_VLAN_CTAG_FILTER)
 
 #define MACSEC_OFFLOAD_FEATURES \
 	(MACSEC_FEATURES | NETIF_F_GSO_SOFTWARE | NETIF_F_SOFT_FEATURES | \
@@ -3655,19 +3609,22 @@ static int macsec_dev_open(struct net_device *dev)
 		ops = macsec_get_ops(netdev_priv(dev), &ctx);
 		if (!ops) {
 			err = -EOPNOTSUPP;
-			goto clear_allmulti;
+			goto clear_promisc;
 		}
 
 		ctx.secy = &macsec->secy;
 		err = macsec_offload(ops->mdo_dev_open, &ctx);
 		if (err)
-			goto clear_allmulti;
+			goto clear_promisc;
 	}
 
 	if (netif_carrier_ok(real_dev))
 		netif_carrier_on(dev);
 
 	return 0;
+clear_promisc:
+	if (dev->flags & IFF_PROMISC)
+		dev_set_promiscuity(real_dev, -1);
 clear_allmulti:
 	if (dev->flags & IFF_ALLMULTI)
 		dev_set_allmulti(real_dev, -1);
@@ -3784,6 +3741,29 @@ restore_old_addr:
 	return err;
 }
 
+static int macsec_vlan_rx_add_vid(struct net_device *dev,
+				  __be16 proto, u16 vid)
+{
+	struct macsec_dev *macsec = netdev_priv(dev);
+
+	if (!macsec_is_offloaded(macsec))
+		return 0;
+
+	return vlan_vid_add(macsec->real_dev, proto, vid);
+}
+
+static int macsec_vlan_rx_kill_vid(struct net_device *dev,
+				   __be16 proto, u16 vid)
+{
+	struct macsec_dev *macsec = netdev_priv(dev);
+
+	if (!macsec_is_offloaded(macsec))
+		return 0;
+
+	vlan_vid_del(macsec->real_dev, proto, vid);
+	return 0;
+}
+
 static int macsec_change_mtu(struct net_device *dev, int new_mtu)
 {
 	struct macsec_dev *macsec = macsec_priv(dev);
@@ -3825,6 +3805,8 @@ static const struct net_device_ops macsec_netdev_ops = {
 	.ndo_set_rx_mode	= macsec_dev_set_rx_mode,
 	.ndo_change_rx_flags	= macsec_dev_change_rx_flags,
 	.ndo_set_mac_address	= macsec_set_mac_address,
+	.ndo_vlan_rx_add_vid	= macsec_vlan_rx_add_vid,
+	.ndo_vlan_rx_kill_vid	= macsec_vlan_rx_kill_vid,
 	.ndo_start_xmit		= macsec_start_xmit,
 	.ndo_get_stats64	= macsec_get_stats64,
 	.ndo_get_iflink		= macsec_get_iflink,
@@ -3834,21 +3816,23 @@ static const struct device_type macsec_type = {
 	.name = "macsec",
 };
 
+static int validate_cipher_suite(const struct nlattr *attr,
+				 struct netlink_ext_ack *extack);
 static const struct nla_policy macsec_rtnl_policy[IFLA_MACSEC_MAX + 1] = {
 	[IFLA_MACSEC_SCI] = { .type = NLA_U64 },
 	[IFLA_MACSEC_PORT] = { .type = NLA_U16 },
-	[IFLA_MACSEC_ICV_LEN] = { .type = NLA_U8 },
-	[IFLA_MACSEC_CIPHER_SUITE] = { .type = NLA_U64 },
+	[IFLA_MACSEC_ICV_LEN] = NLA_POLICY_RANGE(NLA_U8, MACSEC_MIN_ICV_LEN, MACSEC_STD_ICV_LEN),
+	[IFLA_MACSEC_CIPHER_SUITE] = NLA_POLICY_VALIDATE_FN(NLA_U64, validate_cipher_suite),
 	[IFLA_MACSEC_WINDOW] = { .type = NLA_U32 },
-	[IFLA_MACSEC_ENCODING_SA] = { .type = NLA_U8 },
-	[IFLA_MACSEC_ENCRYPT] = { .type = NLA_U8 },
-	[IFLA_MACSEC_PROTECT] = { .type = NLA_U8 },
-	[IFLA_MACSEC_INC_SCI] = { .type = NLA_U8 },
-	[IFLA_MACSEC_ES] = { .type = NLA_U8 },
-	[IFLA_MACSEC_SCB] = { .type = NLA_U8 },
-	[IFLA_MACSEC_REPLAY_PROTECT] = { .type = NLA_U8 },
-	[IFLA_MACSEC_VALIDATION] = { .type = NLA_U8 },
-	[IFLA_MACSEC_OFFLOAD] = { .type = NLA_U8 },
+	[IFLA_MACSEC_ENCODING_SA] = NLA_POLICY_MAX(NLA_U8, MACSEC_NUM_AN - 1),
+	[IFLA_MACSEC_ENCRYPT] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_PROTECT] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_INC_SCI] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_ES] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_SCB] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_REPLAY_PROTECT] = NLA_POLICY_MAX(NLA_U8, 1),
+	[IFLA_MACSEC_VALIDATION] = NLA_POLICY_MAX(NLA_U8, MACSEC_VALIDATE_MAX),
+	[IFLA_MACSEC_OFFLOAD] = NLA_POLICY_MAX(NLA_U8, MACSEC_OFFLOAD_MAX),
 };
 
 static void macsec_free_netdev(struct net_device *dev)
@@ -3987,7 +3971,7 @@ static int macsec_changelink(struct net_device *dev, struct nlattr *tb[],
 		offload = nla_get_u8(data[IFLA_MACSEC_OFFLOAD]);
 		if (macsec->offload != offload) {
 			macsec_offload_state_change = true;
-			ret = macsec_update_offload(dev, offload);
+			ret = macsec_update_offload(dev, offload, extack);
 			if (ret)
 				goto cleanup;
 		}
@@ -4303,19 +4287,29 @@ unregister:
 	return err;
 }
 
+static int validate_cipher_suite(const struct nlattr *attr,
+				 struct netlink_ext_ack *extack)
+{
+	switch (nla_get_u64(attr)) {
+	case MACSEC_CIPHER_ID_GCM_AES_128:
+	case MACSEC_CIPHER_ID_GCM_AES_256:
+	case MACSEC_CIPHER_ID_GCM_AES_XPN_128:
+	case MACSEC_CIPHER_ID_GCM_AES_XPN_256:
+	case MACSEC_DEFAULT_CIPHER_ID:
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int macsec_validate_attr(struct nlattr *tb[], struct nlattr *data[],
 				struct netlink_ext_ack *extack)
 {
-	u64 csid = MACSEC_DEFAULT_CIPHER_ID;
 	u8 icv_len = MACSEC_DEFAULT_ICV_LEN;
-	int flag;
 	bool es, scb, sci;
 
 	if (!data)
 		return 0;
-
-	if (data[IFLA_MACSEC_CIPHER_SUITE])
-		csid = nla_get_u64(data[IFLA_MACSEC_CIPHER_SUITE]);
 
 	if (data[IFLA_MACSEC_ICV_LEN]) {
 		icv_len = nla_get_u8(data[IFLA_MACSEC_ICV_LEN]);
@@ -4332,43 +4326,11 @@ static int macsec_validate_attr(struct nlattr *tb[], struct nlattr *data[],
 		}
 	}
 
-	switch (csid) {
-	case MACSEC_CIPHER_ID_GCM_AES_128:
-	case MACSEC_CIPHER_ID_GCM_AES_256:
-	case MACSEC_CIPHER_ID_GCM_AES_XPN_128:
-	case MACSEC_CIPHER_ID_GCM_AES_XPN_256:
-	case MACSEC_DEFAULT_CIPHER_ID:
-		if (icv_len < MACSEC_MIN_ICV_LEN ||
-		    icv_len > MACSEC_STD_ICV_LEN)
-			return -EINVAL;
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	if (data[IFLA_MACSEC_ENCODING_SA]) {
-		if (nla_get_u8(data[IFLA_MACSEC_ENCODING_SA]) >= MACSEC_NUM_AN)
-			return -EINVAL;
-	}
-
-	for (flag = IFLA_MACSEC_ENCODING_SA + 1;
-	     flag < IFLA_MACSEC_VALIDATION;
-	     flag++) {
-		if (data[flag]) {
-			if (nla_get_u8(data[flag]) > 1)
-				return -EINVAL;
-		}
-	}
-
 	es  = nla_get_u8_default(data[IFLA_MACSEC_ES], false);
 	sci = nla_get_u8_default(data[IFLA_MACSEC_INC_SCI], false);
 	scb = nla_get_u8_default(data[IFLA_MACSEC_SCB], false);
 
 	if ((sci && (scb || es)) || (scb && es))
-		return -EINVAL;
-
-	if (data[IFLA_MACSEC_VALIDATION] &&
-	    nla_get_u8(data[IFLA_MACSEC_VALIDATION]) > MACSEC_VALIDATE_MAX)
 		return -EINVAL;
 
 	if ((data[IFLA_MACSEC_REPLAY_PROTECT] &&

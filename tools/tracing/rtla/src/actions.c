@@ -32,7 +32,9 @@ void
 actions_destroy(struct actions *self)
 {
 	/* Free any action-specific data */
-	for (struct action *action = self->list; action < self->list + self->len; action++) {
+	struct action *action;
+
+	for_each_action(self, action) {
 		if (action->type == ACTION_SHELL)
 			free(action->command);
 		if (action->type == ACTION_TRACE_OUTPUT)
@@ -127,20 +129,22 @@ actions_add_continue(struct actions *self)
  * actions_parse - add an action based on text specification
  */
 int
-actions_parse(struct actions *self, const char *trigger)
+actions_parse(struct actions *self, const char *trigger, const char *tracefn)
 {
 	enum action_type type = ACTION_NONE;
-	char *token;
+	const char *token;
 	char trigger_c[strlen(trigger) + 1];
 
 	/* For ACTION_SIGNAL */
 	int signal = 0, pid = 0;
 
 	/* For ACTION_TRACE_OUTPUT */
-	char *trace_output;
+	const char *trace_output;
 
 	strcpy(trigger_c, trigger);
 	token = strtok(trigger_c, ",");
+	if (!token)
+		return -1;
 
 	if (strcmp(token, "trace") == 0)
 		type = ACTION_TRACE_OUTPUT;
@@ -160,7 +164,7 @@ actions_parse(struct actions *self, const char *trigger)
 	case ACTION_TRACE_OUTPUT:
 		/* Takes no argument */
 		if (token == NULL)
-			trace_output = "timerlat_trace.txt";
+			trace_output = tracefn;
 		else {
 			if (strlen(token) > 5 && strncmp(token, "file=", 5) == 0) {
 				trace_output = token + 5;
@@ -179,12 +183,13 @@ actions_parse(struct actions *self, const char *trigger)
 		/* Takes two arguments, num (signal) and pid */
 		while (token != NULL) {
 			if (strlen(token) > 4 && strncmp(token, "num=", 4) == 0) {
-				signal = atoi(token + 4);
+				if (strtoi(token + 4, &signal))
+					return -1;
 			} else if (strlen(token) > 4 && strncmp(token, "pid=", 4) == 0) {
 				if (strncmp(token + 4, "parent", 7) == 0)
 					pid = -1;
-				else
-					pid = atoi(token + 4);
+				else if (strtoi(token + 4, &pid))
+					return -1;
 			} else {
 				/* Invalid argument */
 				return -1;
@@ -223,7 +228,9 @@ actions_perform(struct actions *self)
 	int pid, retval;
 	const struct action *action;
 
-	for (action = self->list; action < self->list + self->len; action++) {
+	self->continue_flag = false;
+
+	for_each_action(self, action) {
 		switch (action->type) {
 		case ACTION_TRACE_OUTPUT:
 			retval = save_trace_to_file(self->trace_output_inst, action->trace_output);

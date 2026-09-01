@@ -2681,8 +2681,20 @@ scsih_sdev_configure(struct scsi_device *sdev, struct queue_limits *lim)
 				pcie_device->enclosure_level,
 				pcie_device->connector_name);
 
+		/*
+		 * The HBA firmware passes the NVMe drive's MDTS
+		 * (Maximum Data Transfer Size) up to the driver. However,
+		 * the driver hardcodes a 4K buffer size for the PRP list,
+		 * accommodating at most 512 entries. This strictly limits
+		 * the maximum supported NVMe I/O transfer to 2 MiB.
+		 *
+		 * Cap max_hw_sectors to the smaller of the drive's reported
+		 * MDTS or the 2 MiB driver limit to prevent kernel oopses.
+		 */
+		lim->max_hw_sectors = SZ_2M >> SECTOR_SHIFT;
 		if (pcie_device->nvme_mdts)
-			lim->max_hw_sectors = pcie_device->nvme_mdts / 512;
+			lim->max_hw_sectors = min(lim->max_hw_sectors,
+					pcie_device->nvme_mdts >> SECTOR_SHIFT);
 
 		pcie_device_put(pcie_device);
 		spin_unlock_irqrestore(&ioc->pcie_device_lock, flags);
@@ -2754,7 +2766,7 @@ scsih_sdev_configure(struct scsi_device *sdev, struct queue_limits *lim)
 /**
  * scsih_bios_param - fetch head, sector, cylinder info for a disk
  * @sdev: scsi device struct
- * @bdev: pointer to block device context
+ * @unused: pointer to gendisk
  * @capacity: device size (in 512 byte sectors)
  * @params: three element array to place output:
  *              params[0] number of heads (max 255)
@@ -2762,7 +2774,7 @@ scsih_sdev_configure(struct scsi_device *sdev, struct queue_limits *lim)
  *              params[2] number of cylinders
  */
 static int
-scsih_bios_param(struct scsi_device *sdev, struct block_device *bdev,
+scsih_bios_param(struct scsi_device *sdev, struct gendisk *unused,
 	sector_t capacity, int params[])
 {
 	int		heads;

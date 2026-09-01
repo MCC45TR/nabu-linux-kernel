@@ -9,9 +9,10 @@
 
 #include <linux/bug.h>
 #include <linux/module.h>
+#include <linux/uaccess.h>
 #include <asm/cfi.h>
 
-#ifdef CONFIG_CFI_CLANG
+#ifdef CONFIG_CFI
 extern bool cfi_warn;
 
 enum bug_trap_type report_cfi_failure(struct pt_regs *regs, unsigned long addr,
@@ -52,7 +53,7 @@ static inline u32 cfi_get_func_hash(void *func)
 extern u32 cfi_bpf_hash;
 extern u32 cfi_bpf_subprog_hash;
 
-#else /* CONFIG_CFI_CLANG */
+#else /* CONFIG_CFI */
 
 static inline int cfi_get_offset(void) { return 0; }
 static inline u32 cfi_get_func_hash(void *func) { return 0; }
@@ -60,7 +61,7 @@ static inline u32 cfi_get_func_hash(void *func) { return 0; }
 #define cfi_bpf_hash 0U
 #define cfi_bpf_subprog_hash 0U
 
-#endif /* CONFIG_CFI_CLANG */
+#endif /* CONFIG_CFI */
 
 #ifdef CONFIG_ARCH_USES_CFI_TRAPS
 bool is_cfi_trap(unsigned long addr);

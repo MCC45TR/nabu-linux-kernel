@@ -875,9 +875,11 @@ static irqreturn_t veml6030_event_handler(int irq, void *private)
 	else
 		evtdir = IIO_EV_DIR_FALLING;
 
-	iio_push_event(indio_dev, IIO_UNMOD_EVENT_CODE(IIO_INTENSITY,
-					0, IIO_EV_TYPE_THRESH, evtdir),
-					iio_get_time_ns(indio_dev));
+	iio_push_event(indio_dev, IIO_UNMOD_EVENT_CODE(IIO_LIGHT,
+						       0,
+						       IIO_EV_TYPE_THRESH,
+						       evtdir),
+		       iio_get_time_ns(indio_dev));
 
 	return IRQ_HANDLED;
 }
@@ -903,7 +905,7 @@ static irqreturn_t veml6030_trigger_handler(int irq, void *p)
 		scan.chans[i++] = reg;
 	}
 
-	iio_push_to_buffers_with_timestamp(iio, &scan, pf->timestamp);
+	iio_push_to_buffers_with_ts(iio, &scan, sizeof(scan), pf->timestamp);
 
 done:
 	iio_trigger_notify_done(iio->trig);

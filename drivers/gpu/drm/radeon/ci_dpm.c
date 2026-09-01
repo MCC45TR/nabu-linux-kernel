@@ -2457,11 +2457,12 @@ static void ci_register_patching_mc_arb(struct radeon_device *rdev,
 	u32 tmp, tmp2;
 
 	tmp = RREG32(MC_SEQ_MISC0);
-	patch = ((tmp & 0x0000f00) == 0x300) ? true : false;
+	patch = (tmp & 0x0000f00) == 0x300;
 
 	if (patch &&
 	    ((rdev->pdev->device == 0x67B0) ||
-	     (rdev->pdev->device == 0x67B1))) {
+	     (rdev->pdev->device == 0x67B1)) &&
+	    (rdev->pdev->revision == 0)) {
 		if ((memory_clock > 100000) && (memory_clock <= 125000)) {
 			tmp2 = (((0x31 * engine_clock) / 125000) - 1) & 0xff;
 			*dram_timimg2 &= ~0x00ff0000;
@@ -3238,7 +3239,8 @@ static int ci_populate_all_graphic_levels(struct radeon_device *rdev)
 	u32 level_array_size = sizeof(SMU7_Discrete_GraphicsLevel) *
 		SMU7_MAX_LEVELS_GRAPHICS;
 	SMU7_Discrete_GraphicsLevel *levels = pi->smc_state_table.GraphicsLevel;
-	u32 i, ret;
+	int ret;
+	u32 i;
 
 	memset(levels, 0, level_array_size);
 
@@ -3285,7 +3287,8 @@ static int ci_populate_all_memory_levels(struct radeon_device *rdev)
 	u32 level_array_size = sizeof(SMU7_Discrete_MemoryLevel) *
 		SMU7_MAX_LEVELS_MEMORY;
 	SMU7_Discrete_MemoryLevel *levels = pi->smc_state_table.MemoryLevel;
-	u32 i, ret;
+	int ret;
+	u32 i;
 
 	memset(levels, 0, level_array_size);
 
@@ -3302,7 +3305,8 @@ static int ci_populate_all_memory_levels(struct radeon_device *rdev)
 	pi->smc_state_table.MemoryLevel[0].EnabledForActivity = 1;
 
 	if ((dpm_table->mclk_table.count >= 2) &&
-	    ((rdev->pdev->device == 0x67B0) || (rdev->pdev->device == 0x67B1))) {
+	    ((rdev->pdev->device == 0x67B0) || (rdev->pdev->device == 0x67B1)) &&
+	    (rdev->pdev->revision == 0)) {
 		pi->smc_state_table.MemoryLevel[1].MinVddc =
 			pi->smc_state_table.MemoryLevel[0].MinVddc;
 		pi->smc_state_table.MemoryLevel[1].MinVddcPhases =
@@ -3436,7 +3440,7 @@ static int ci_setup_default_dpm_tables(struct radeon_device *rdev)
 			pi->dpm_table.sclk_table.dpm_levels[pi->dpm_table.sclk_table.count].value =
 				allowed_sclk_vddc_table->entries[i].clk;
 			pi->dpm_table.sclk_table.dpm_levels[pi->dpm_table.sclk_table.count].enabled =
-				(i == 0) ? true : false;
+				i == 0;
 			pi->dpm_table.sclk_table.count++;
 		}
 	}
@@ -3449,7 +3453,7 @@ static int ci_setup_default_dpm_tables(struct radeon_device *rdev)
 			pi->dpm_table.mclk_table.dpm_levels[pi->dpm_table.mclk_table.count].value =
 				allowed_mclk_table->entries[i].clk;
 			pi->dpm_table.mclk_table.dpm_levels[pi->dpm_table.mclk_table.count].enabled =
-				(i == 0) ? true : false;
+				i == 0;
 			pi->dpm_table.mclk_table.count++;
 		}
 	}
@@ -4487,11 +4491,12 @@ static int ci_register_patching_mc_seq(struct radeon_device *rdev,
 	bool patch;
 
 	tmp = RREG32(MC_SEQ_MISC0);
-	patch = ((tmp & 0x0000f00) == 0x300) ? true : false;
+	patch = (tmp & 0x0000f00) == 0x300;
 
 	if (patch &&
 	    ((rdev->pdev->device == 0x67B0) ||
-	     (rdev->pdev->device == 0x67B1))) {
+	     (rdev->pdev->device == 0x67B1)) &&
+	    (rdev->pdev->revision == 0)) {
 		for (i = 0; i < table->last; i++) {
 			if (table->last >= SMU7_DISCRETE_MC_REGISTER_ARRAY_SIZE)
 				return -EINVAL;

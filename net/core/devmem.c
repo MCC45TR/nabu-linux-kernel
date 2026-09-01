@@ -17,6 +17,7 @@
 #include <net/page_pool/helpers.h>
 #include <net/page_pool/memory_provider.h>
 #include <net/sock.h>
+#include <net/tcp.h>
 #include <trace/events/page_pool.h>
 
 #include "devmem.h"
@@ -176,6 +177,7 @@ err_close_rxq:
 
 struct net_devmem_dmabuf_binding *
 net_devmem_bind_dmabuf(struct net_device *dev,
+		       struct device *dma_dev,
 		       enum dma_data_direction direction,
 		       unsigned int dmabuf_fd, struct netdev_nl_sock *priv,
 		       struct netlink_ext_ack *extack)
@@ -187,6 +189,11 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 	unsigned int sg_idx, i;
 	unsigned long virtual;
 	int err;
+
+	if (!dma_dev) {
+		NL_SET_ERR_MSG(extack, "Device doesn't support DMA");
+		return ERR_PTR(-EOPNOTSUPP);
+	}
 
 	dmabuf = dma_buf_get(dmabuf_fd);
 	if (IS_ERR(dmabuf))
@@ -209,7 +216,7 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 	binding->dmabuf = dmabuf;
 	binding->direction = direction;
 
-	binding->attachment = dma_buf_attach(binding->dmabuf, dev->dev.parent);
+	binding->attachment = dma_buf_attach(binding->dmabuf, dma_dev);
 	if (IS_ERR(binding->attachment)) {
 		err = PTR_ERR(binding->attachment);
 		NL_SET_ERR_MSG(extack, "Failed to bind dmabuf to device");
@@ -225,6 +232,11 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 	}
 
 	if (direction == DMA_TO_DEVICE) {
+		if (!IS_ALIGNED(dmabuf->size, PAGE_SIZE)) {
+			err = -EINVAL;
+			NL_SET_ERR_MSG(extack, "TX dma-buf size must be a multiple of PAGE_SIZE");
+			goto err_unmap;
+		}
 		binding->tx_vec = kvmalloc_array(dmabuf->size / PAGE_SIZE,
 						 sizeof(struct net_iov *),
 						 GFP_KERNEL);
@@ -251,6 +263,12 @@ net_devmem_bind_dmabuf(struct net_device *dev,
 		struct dmabuf_genpool_chunk_owner *owner;
 		size_t len = sg_dma_len(sg);
 		struct net_iov *niov;
+
+		if (!IS_ALIGNED(len, PAGE_SIZE)) {
+			err = -EINVAL;
+			NL_SET_ERR_MSG(extack, "dma-buf SG length must be PAGE_SIZE aligned");
+			goto err_free_chunks;
+		}
 
 		owner = kzalloc_node(sizeof(*owner), GFP_KERNEL,
 				     dev_to_node(&dev->dev));
@@ -351,7 +369,8 @@ struct net_devmem_dmabuf_binding *net_devmem_get_binding(struct sock *sk,
 							 unsigned int dmabuf_id)
 {
 	struct net_devmem_dmabuf_binding *binding;
-	struct dst_entry *dst = __sk_dst_get(sk);
+	struct net_device *dst_dev;
+	struct dst_entry *dst;
 	int err = 0;
 
 	binding = net_devmem_lookup_dmabuf(dmabuf_id);
@@ -360,16 +379,36 @@ struct net_devmem_dmabuf_binding *net_devmem_get_binding(struct sock *sk,
 		goto out_err;
 	}
 
+	rcu_read_lock();
+	dst = __sk_dst_get(sk);
+	/* If dst is NULL (route expired), attempt to rebuild it. */
+	if (unlikely(!dst)) {
+		if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk)) {
+			err = -EHOSTUNREACH;
+			goto out_unlock;
+		}
+		dst = __sk_dst_get(sk);
+		if (unlikely(!dst)) {
+			err = -ENODEV;
+			goto out_unlock;
+		}
+	}
+
 	/* The dma-addrs in this binding are only reachable to the corresponding
 	 * net_device.
 	 */
-	if (!dst || !dst->dev || dst->dev->ifindex != binding->dev->ifindex) {
+	dst_dev = dst_dev_rcu(dst);
+	if (unlikely(!dst_dev) ||
+	    unlikely(dst_dev != READ_ONCE(binding->dev))) {
 		err = -ENODEV;
-		goto out_err;
+		goto out_unlock;
 	}
 
+	rcu_read_unlock();
 	return binding;
 
+out_unlock:
+	rcu_read_unlock();
 out_err:
 	if (binding)
 		net_devmem_dmabuf_binding_put(binding);
@@ -477,7 +516,8 @@ static void mp_dmabuf_devmem_uninstall(void *mp_priv,
 			xa_erase(&binding->bound_rxqs, xa_idx);
 			if (xa_empty(&binding->bound_rxqs)) {
 				mutex_lock(&binding->lock);
-				binding->dev = NULL;
+				ASSERT_EXCLUSIVE_WRITER(binding->dev);
+				WRITE_ONCE(binding->dev, NULL);
 				mutex_unlock(&binding->lock);
 			}
 			break;

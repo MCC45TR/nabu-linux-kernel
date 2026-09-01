@@ -327,17 +327,13 @@ static int ocfs2_control_install_private(struct file *file)
 		ocfs2_control_this_node = p->op_this_node;
 		running_proto.pv_major = p->op_proto.pv_major;
 		running_proto.pv_minor = p->op_proto.pv_minor;
-	}
-
-out_unlock:
-	mutex_unlock(&ocfs2_control_lock);
-
-	if (!rc && set_p) {
-		/* We set the global values successfully */
 		atomic_inc(&ocfs2_control_opened);
 		ocfs2_control_set_handshake_state(file,
 					OCFS2_CONTROL_HANDSHAKE_VALID);
 	}
+
+out_unlock:
+	mutex_unlock(&ocfs2_control_lock);
 
 	return rc;
 }
@@ -952,7 +948,7 @@ static const struct dlm_lockspace_ops ocfs2_ls_ops = {
 static int user_cluster_disconnect(struct ocfs2_cluster_connection *conn)
 {
 	version_unlock(conn);
-	dlm_release_lockspace(conn->cc_lockspace, 2);
+	dlm_release_lockspace(conn->cc_lockspace, DLM_RELEASE_NORMAL);
 	conn->cc_lockspace = NULL;
 	ocfs2_live_connection_drop(conn->cc_private);
 	conn->cc_private = NULL;
@@ -1011,6 +1007,7 @@ static int user_cluster_connect(struct ocfs2_cluster_connection *conn)
 			printk(KERN_ERR "ocfs2: Could not determine"
 					" locking version\n");
 			user_cluster_disconnect(conn);
+			lc = NULL;
 			goto out;
 		}
 		wait_event(lc->oc_wait, (atomic_read(&lc->oc_this_node) > 0));

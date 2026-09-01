@@ -459,7 +459,7 @@ static bool port_no_link(struct snps_hdmirx_dev *hdmirx_dev)
 	return !tx_5v_power_present(hdmirx_dev);
 }
 
-static int hdmirx_query_dv_timings(struct file *file, void *_fh,
+static int hdmirx_query_dv_timings(struct file *file, void *priv,
 				   struct v4l2_dv_timings *timings)
 {
 	struct hdmirx_stream *stream = video_drvdata(file);
@@ -504,9 +504,9 @@ static void hdmirx_hpd_ctrl(struct snps_hdmirx_dev *hdmirx_dev, bool en)
 	hdmirx_writel(hdmirx_dev, CORE_CONFIG,
 		      hdmirx_dev->hpd_trigger_level_high ? en : !en);
 
-	/* 100ms delay as per HDMI spec */
+	/* 100ms delay as per HDMI spec + extra 50ms to cover internal delay */
 	if (!en)
-		msleep(100);
+		msleep(100 + 50);
 }
 
 static void hdmirx_write_edid_data(struct snps_hdmirx_dev *hdmirx_dev,
@@ -751,7 +751,7 @@ static int hdmirx_dv_timings_cap(struct file *file, void *fh,
 	return 0;
 }
 
-static int hdmirx_enum_dv_timings(struct file *file, void *_fh,
+static int hdmirx_enum_dv_timings(struct file *file, void *priv,
 				  struct v4l2_enum_dv_timings *timings)
 {
 	return v4l2_enum_dv_timings_cap(timings, &hdmirx_timings_cap, NULL, NULL);
@@ -1323,7 +1323,7 @@ static int hdmirx_g_fmt_vid_cap_mplane(struct file *file, void *fh,
 	return 0;
 }
 
-static int hdmirx_g_dv_timings(struct file *file, void *_fh,
+static int hdmirx_g_dv_timings(struct file *file, void *priv,
 			       struct v4l2_dv_timings *timings)
 {
 	struct hdmirx_stream *stream = video_drvdata(file);
@@ -1339,7 +1339,7 @@ static int hdmirx_g_dv_timings(struct file *file, void *_fh,
 	return 0;
 }
 
-static int hdmirx_s_dv_timings(struct file *file, void *_fh,
+static int hdmirx_s_dv_timings(struct file *file, void *priv,
 			       struct v4l2_dv_timings *timings)
 {
 	struct hdmirx_stream *stream = video_drvdata(file);

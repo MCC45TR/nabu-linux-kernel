@@ -739,7 +739,7 @@ static int ttm_bo_alloc_resource(struct ttm_buffer_object *bo,
 		may_evict = (force_space && place->mem_type != TTM_PL_SYSTEM);
 		ret = ttm_resource_alloc(bo, place, res, force_space ? &limit_pool : NULL);
 		if (ret) {
-			if (ret != -ENOSPC && ret != -EAGAIN) {
+			if (ret != -ENOSPC) {
 				dmem_cgroup_pool_state_put(limit_pool);
 				return ret;
 			}
@@ -1283,3 +1283,18 @@ int ttm_bo_populate(struct ttm_buffer_object *bo,
 	return 0;
 }
 EXPORT_SYMBOL(ttm_bo_populate);
+
+int ttm_bo_setup_export(struct ttm_buffer_object *bo,
+			struct ttm_operation_ctx *ctx)
+{
+	int ret;
+
+	ret = ttm_bo_reserve(bo, false, false, NULL);
+	if (ret != 0)
+		return ret;
+
+	ret = ttm_bo_populate(bo, ctx);
+	ttm_bo_unreserve(bo);
+	return ret;
+}
+EXPORT_SYMBOL(ttm_bo_setup_export);

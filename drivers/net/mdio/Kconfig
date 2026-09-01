@@ -3,11 +3,6 @@
 # MDIO Layer Configuration
 #
 
-config MDIO_BUS
-	tristate "MDIO bus consumer layer"
-	help
-	  MDIO bus consumer layer
-
 if PHYLIB
 
 config FWNODE_MDIO
@@ -128,7 +123,8 @@ config MDIO_MVUSB
 
 config MDIO_MSCC_MIIM
 	tristate "Microsemi MIIM interface support"
-	depends on HAS_IOMEM && REGMAP_MMIO
+	depends on HAS_IOMEM
+	select REGMAP_MMIO
 	help
 	  This driver supports the MIIM (MDIO) interface found in the network
 	  switches of the Microsemi SoCs; it is recommended to switch on

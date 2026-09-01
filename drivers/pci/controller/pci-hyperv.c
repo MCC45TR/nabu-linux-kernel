@@ -1680,7 +1680,6 @@ static void hv_int_desc_free(struct hv_pci_dev *hpdev,
 /**
  * hv_msi_free() - Free the MSI.
  * @domain:	The interrupt domain pointer
- * @info:	Extra MSI-related context
  * @irq:	Identifies the IRQ.
  *
  * The Hyper-V parent partition and hypervisor are tracking the
@@ -1688,8 +1687,7 @@ static void hv_int_desc_free(struct hv_pci_dev *hpdev,
  * table up to date.  This callback sends a message that frees
  * the IRT entry and related tracking nonsense.
  */
-static void hv_msi_free(struct irq_domain *domain, struct msi_domain_info *info,
-			unsigned int irq)
+static void hv_msi_free(struct irq_domain *domain, unsigned int irq)
 {
 	struct hv_pcibus_device *hbus;
 	struct hv_pci_dev *hpdev;
@@ -2181,10 +2179,8 @@ static int hv_pcie_domain_alloc(struct irq_domain *d, unsigned int virq, unsigne
 
 static void hv_pcie_domain_free(struct irq_domain *d, unsigned int virq, unsigned int nr_irqs)
 {
-	struct msi_domain_info *info = d->host_data;
-
 	for (int i = 0; i < nr_irqs; i++)
-		hv_msi_free(d, info, virq + i);
+		hv_msi_free(d, virq + i);
 
 	irq_domain_free_irqs_top(d, virq, nr_irqs);
 }
@@ -2489,6 +2485,14 @@ static void hv_pci_assign_numa_node(struct hv_pcibus_device *hbus)
 		hv_dev = get_pcichild_wslot(hbus, devfn_to_wslot(dev->devfn));
 		if (!hv_dev)
 			continue;
+
+		/*
+		 * If the Hyper-V host doesn't provide a NUMA node for the
+		 * device, default to node 0. With NUMA_NO_NODE the kernel
+		 * may spread work across NUMA nodes, which degrades
+		 * performance on Hyper-V.
+		 */
+		set_dev_node(&dev->dev, 0);
 
 		if (hv_dev->desc.flags & HV_PCI_DEVICE_FLAG_NUMA_AFFINITY &&
 		    hv_dev->desc.virtual_numa_node < num_possible_nodes())
