@@ -174,19 +174,19 @@ static long iris_vidioc_default(struct file *file, void *fh, bool valid_prio,
 	return ret;
 }
 
-static void iris_v4l2_fh_init(struct iris_inst *inst)
+static void iris_v4l2_fh_init(struct iris_inst *inst, struct file *filp)
 {
 	if (inst->domain == ENCODER)
 		v4l2_fh_init(&inst->fh, inst->core->vdev_enc);
 	else if (inst->domain == DECODER)
 		v4l2_fh_init(&inst->fh, inst->core->vdev_dec);
 	inst->fh.ctrl_handler = &inst->ctrl_handler;
-	v4l2_fh_add(&inst->fh);
+	v4l2_fh_add(&inst->fh, filp);
 }
 
-static void iris_v4l2_fh_deinit(struct iris_inst *inst)
+static void iris_v4l2_fh_deinit(struct iris_inst *inst, struct file *filp)
 {
-	v4l2_fh_del(&inst->fh);
+	v4l2_fh_del(&inst->fh, filp);
 	inst->fh.ctrl_handler = NULL;
 	v4l2_fh_exit(&inst->fh);
 }
@@ -320,7 +320,7 @@ int iris_open(struct file *filp)
 	init_completion(&inst->completion);
 	init_completion(&inst->flush_completion);
 
-	iris_v4l2_fh_init(inst);
+	iris_v4l2_fh_init(inst, filp);
 
 	inst->m2m_dev = v4l2_m2m_init(&iris_m2m_ops);
 	if (IS_ERR_OR_NULL(inst->m2m_dev)) {
@@ -353,7 +353,7 @@ fail_m2m_ctx_release:
 fail_m2m_release:
 	v4l2_m2m_release(inst->m2m_dev);
 fail_v4l2_fh_deinit:
-	iris_v4l2_fh_deinit(inst);
+	iris_v4l2_fh_deinit(inst, filp);
 	mutex_destroy(&inst->ctx_q_lock);
 	mutex_destroy(&inst->lock);
 	kfree(inst);
@@ -414,7 +414,7 @@ int iris_close(struct file *filp)
 	v4l2_m2m_release(inst->m2m_dev);
 	mutex_lock(&inst->lock);
 	iris_hfi_session_close(inst);
-	iris_v4l2_fh_deinit(inst);
+	iris_v4l2_fh_deinit(inst, filp);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	iris_destroy_all_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
 	iris_check_num_queued_internal_buffers(inst, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
