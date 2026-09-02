@@ -44,7 +44,9 @@ done
 # Prune board-specific modules selected by the generic arm64 defconfig.  The
 # allowlist contains Nabu silicon plus infrastructure required by those
 # drivers.  Generic USB serial/network gadget classes remain available for
-# OTG recovery and log collection.
+# OTG recovery and log collection. Linux 7.2 discovers Nabu's four CS35L41
+# amplifiers as consumers of one shared reset GPIO, so its proxy driver is
+# boot-critical and must not be left to module autoload ordering.
 module_deny='^(ARM_CCI|ARM_CCN|ARM_CMN|ARM_CORESIGHT|ARM_DSU|ARM_SMMU_V3_PMU|ARM_SPE|NVIDIA_CORESIGHT|CORESIGHT|ALTERA_|FPGA_|OF_FPGA|XILINX_|UACCE|CROS_|EC_|GREYBUS|GNSS|GOOGLE_|IPMI_|TCG_|MHI_|ATH11K|BRCMF|BRCMUTIL|MWIFIEX|RSI_|WCN36XX|WL18XX|WLCORE|RTC_DRV_|SENSORS_|IIO_CROS|IIO_ST_|TOUCHSCREEN_|BACKLIGHT_|BATTERY_|CHARGER_|DRM_|CLK_|SM_|SC_|SA_|SDM_|QCS_|QCM_|IPQ_|MSM_MMCC_|PHY_|TYPEC_|UCSI_|REGULATOR_|MFD_|GPIO_|PWM_|VIDEO_|SND_SOC_|BT_)'
 module_allow='^(BACKLIGHT_KTZ8866|ATH10K|ATH10K_SNOC|ATH_COMMON|BT_HCIUART|BT_HIDP|BT_QCA|CHARGER_IDTP9418|CHARGER_LN8000|CHARGER_QCOM_SMB2|SM_CAMCC_8150|DRM_PANEL_NOVATEK_NT36523|GPIO_WCD934X|MFD_WCD934X|TOUCHSCREEN_NT36523_SPI|VIDEO_DEV|VIDEO_CN3927|VIDEO_OV13B10|VIDEO_OV8856|VIDEO_QCOM_CAMSS|VIDEO_QCOM_IRIS|SND_SOC_I2C_AND_SPI|SND_SOC_QCOM.*|SND_SOC_QDSP6.*|SND_SOC_SM8150|SND_SOC_CS35L41.*|SND_SOC_WCD934X|SND_SOC_WCD_COMMON|SND_SOC_WCD_CLASSH|SND_SOC_WCD_MBHC|SND_SOC_WSA881X)$'
 
@@ -82,6 +84,7 @@ done < <(sed -n 's/^CONFIG_\([A-Z0-9_]*\(GCC\|GPUCC\|DISPCC\|VIDEOCC\|CAMCC\|TCS
 
 "$config_tool" --file "$config_file" "${args[@]}" \
 	--module SM_CAMCC_8150 \
+	--enable GPIO_SHARED_PROXY \
 	--enable SECURITY --enable SECURITY_NETWORK --enable SECURITY_SELINUX \
 	--disable VIDEO_QCOM_VENUS \
 	--disable DEBUG_INFO --enable DEBUG_INFO_NONE \
