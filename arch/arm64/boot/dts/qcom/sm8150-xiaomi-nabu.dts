@@ -726,8 +726,11 @@
 &pm8150b_adc {
 	channel@4f {
 		reg = <ADC5_AMUX_THM3_100K_PU>;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
 		qcom,pre-scaling = <1 1>;
 		label = "conn_therm";
+		status = "okay";
 	};
 };
 
@@ -824,6 +827,7 @@
 		vbus-supply = <&pm8150b_vbus>;
 
 		power-role = "dual";
+		try-power-role = "sink";
 		data-role = "dual";
 		self-powered;
 
