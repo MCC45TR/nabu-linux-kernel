@@ -55,6 +55,17 @@ read_files()
 		run timeout 15s monitor-sensor --all
 	fi
 	run busctl --system introspect net.hadess.SensorProxy /net/hadess/SensorProxy
+	printf '\n--- SSC and SAR contract ---\n'
+	run busctl --system introspect org.senemos.Nabu.Sar /org/senemos/Nabu/Sar
+	if command -v ssccli >/dev/null 2>&1; then
+		run ssccli --probe-data-type=proximity
+		run ssccli --probe-data-type=sar_sensor
+		run ssccli --probe-data-type=sar_algo_1
+	fi
+	if command -v timeout >/dev/null 2>&1 && command -v nabu-ssc-probe >/dev/null 2>&1; then
+		run timeout 8s nabu-ssc-probe sar_sensor
+		run timeout 8s nabu-ssc-probe sar_algo_1
+	fi
 
 	printf '\n--- input and wake ---\n'
 	run sh -c 'cat /proc/bus/input/devices'
