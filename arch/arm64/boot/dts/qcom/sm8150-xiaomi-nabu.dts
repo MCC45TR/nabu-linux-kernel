@@ -718,6 +718,11 @@
 	};
 };
 
+&pm8150_rtc {
+	/* Nabu has no firmware-backed wall clock; let Linux persist NTP time. */
+	allow-set-time;
+};
+
 &pm8150b_adc {
 	channel@4f {
 		reg = <ADC5_AMUX_THM3_100K_PU>;
