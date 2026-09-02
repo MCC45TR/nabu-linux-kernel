@@ -61,13 +61,13 @@ static int ssc_cct_write_raw(struct iio_dev *indio_dev,
 {
 	struct ssc_cct_state *state = iio_priv(indio_dev);
 
-	if (mask != IIO_CHAN_INFO_RAW || val2 ||
-	    val < SSC_CCT_MIN_KELVIN || val > SSC_CCT_MAX_KELVIN)
+	if (mask != IIO_CHAN_INFO_RAW || val2 || val < 0 ||
+	    (val && (val < SSC_CCT_MIN_KELVIN || val > SSC_CCT_MAX_KELVIN)))
 		return -EINVAL;
 
 	mutex_lock(&state->lock);
 	state->kelvin = val;
-	state->valid = true;
+	state->valid = val != 0;
 	mutex_unlock(&state->lock);
 	return 0;
 }
