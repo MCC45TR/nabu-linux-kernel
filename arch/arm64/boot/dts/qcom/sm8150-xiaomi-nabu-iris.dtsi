@@ -7,9 +7,9 @@
  */
 
 &{/reserved-memory/ramoops@b0000000} {
-	/* Keep the complete printk console across hard resets. */
+	/* Split the 4 MiB region evenly between printk and persistent ftrace. */
 	record-size = <0>;
-	console-size = <0x400000>;
+	console-size = <0x200000>;
 	ecc-size = <0>;
 };
 
