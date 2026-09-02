@@ -34,6 +34,8 @@
 #define FASTRPC_ALIGN		128
 #define FASTRPC_MAX_FDLIST	16
 #define FASTRPC_MAX_CRCLIST	64
+#define FASTRPC_SDSP_IOVA_BASE	0x80000000ULL
+#define FASTRPC_SDSP_IOVA_SIZE	0x78000000ULL
 #define FASTRPC_CTX_MAX (256)
 #define FASTRPC_INIT_HANDLE	1
 #define FASTRPC_DSP_UTILITIES_HANDLE	2
@@ -319,6 +321,8 @@ struct fastrpc_user {
 /* Extract SMMU PA from consolidated IOVA */
 static inline dma_addr_t fastrpc_ipa_to_dma_addr(struct fastrpc_channel_ctx *cctx, dma_addr_t iova)
 {
+	if (cctx->domain_id == SDSP_DOMAIN_ID)
+		return iova;
 	if (!cctx->soc_data->sid_pos)
 		return 0;
 	return iova & GENMASK_ULL(cctx->soc_data->sid_pos - 1, 0);
@@ -331,6 +335,9 @@ static inline dma_addr_t fastrpc_ipa_to_dma_addr(struct fastrpc_channel_ctx *cct
 static inline u64 fastrpc_sid_offset(struct fastrpc_channel_ctx *cctx,
 				     struct fastrpc_session_ctx *sctx)
 {
+	if (cctx->domain_id == SDSP_DOMAIN_ID)
+		return 0;
+
 	return (u64)sctx->sid << cctx->soc_data->sid_pos;
 }
 
@@ -2274,7 +2281,25 @@ static int fastrpc_cb_probe(struct platform_device *pdev)
 		}
 	}
 	spin_unlock_irqrestore(&cctx->lock, flags);
-	rc = dma_set_mask(dev, DMA_BIT_MASK(dma_bits));
+	if (cctx->domain_id == SDSP_DOMAIN_ID) {
+		u64 iova_start;
+
+		if (sess->sid < 1 || sess->sid > 3) {
+			dev_err(dev, "invalid SDSP context bank ID %d\n", sess->sid);
+			return -EINVAL;
+		}
+
+		/*
+		 * SM8150 SDSP context banks encode the low two SID bits in
+		 * IOVA bits 33:32. The Nabu SLPI firmware requires the DMA
+		 * mapping itself in that window, not a high alias added later.
+		 */
+		iova_start = FASTRPC_SDSP_IOVA_BASE + ((u64)sess->sid << 32);
+		dev->bus_dma_limit = iova_start + FASTRPC_SDSP_IOVA_SIZE - 1;
+		dma_bits = 34;
+	}
+
+	rc = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(dma_bits));
 	if (rc) {
 		dev_err(dev, "%u-bit DMA enable failed\n", dma_bits);
 		return rc;
