@@ -126,5 +126,6 @@ struct iris_core {
 
 int iris_core_init(struct iris_core *core);
 void iris_core_deinit(struct iris_core *core);
+int iris_core_deinit_for_system_suspend(struct iris_core *core);
 
 #endif

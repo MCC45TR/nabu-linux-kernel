@@ -363,11 +363,12 @@ static int __maybe_unused iris_system_suspend(struct device *dev)
 	 * Runtime PM is forbidden on legacy VPU5 until its power-collapse
 	 * handshake is implemented.  pm_runtime_force_suspend() bypasses that
 	 * prohibition and would still call iris_pm_suspend(), whose prepare-PC
-	 * path intentionally returns -EAGAIN.  Keep the controller powered
-	 * across s2idle instead of rejecting every system suspend.
+	 * path intentionally returns -EAGAIN.  A powered controller does not
+	 * retain usable firmware state across Nabu's s2idle, so tear it down
+	 * while the device is still active and let the next open initialize it.
 	 */
 	if (core->iris_platform_data->legacy_vpu5)
-		return 0;
+		return iris_core_deinit_for_system_suspend(core);
 
 	return pm_runtime_force_suspend(dev);
 }

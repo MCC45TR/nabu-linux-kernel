@@ -11,8 +11,19 @@
 #include "iris_state.h"
 #include "iris_vpu_common.h"
 
+static void iris_core_deinit_locked(struct iris_core *core, bool power_off)
+{
+	iris_fw_unload(core);
+	if (power_off)
+		iris_vpu_power_off(core);
+	iris_hfi_queues_deinit(core);
+	core->state = IRIS_CORE_DEINIT;
+}
+
 void iris_core_deinit(struct iris_core *core)
 {
+	int ret;
+
 	/*
 	 * The core starts in DEINIT and remains there while allow_fw_boot is
 	 * disabled.  Do not resume power domains, issue PAS shutdown, or touch
@@ -22,16 +33,34 @@ void iris_core_deinit(struct iris_core *core)
 	if (READ_ONCE(core->state) == IRIS_CORE_DEINIT)
 		return;
 
-	pm_runtime_resume_and_get(core->dev);
+	ret = pm_runtime_resume_and_get(core->dev);
 
 	mutex_lock(&core->lock);
-	iris_fw_unload(core);
-	iris_vpu_power_off(core);
-	iris_hfi_queues_deinit(core);
-	core->state = IRIS_CORE_DEINIT;
+	if (core->state != IRIS_CORE_DEINIT)
+		iris_core_deinit_locked(core, ret >= 0);
 	mutex_unlock(&core->lock);
 
-	pm_runtime_put_sync(core->dev);
+	if (ret >= 0)
+		pm_runtime_put_sync(core->dev);
+}
+
+int iris_core_deinit_for_system_suspend(struct iris_core *core)
+{
+	int ret = 0;
+
+	mutex_lock(&core->lock);
+	if (!list_empty(&core->instances)) {
+		dev_warn(core->dev,
+			 "refusing system suspend with active codec sessions\n");
+		ret = -EBUSY;
+	} else if (core->state != IRIS_CORE_DEINIT) {
+		dev_info(core->dev,
+			 "quiescing legacy VPU5 for system suspend\n");
+		iris_core_deinit_locked(core, true);
+	}
+	mutex_unlock(&core->lock);
+
+	return ret;
 }
 
 static int iris_wait_for_system_response(struct iris_core *core)
@@ -117,6 +146,7 @@ int iris_core_init(struct iris_core *core)
 		goto error_unload_fw;
 
 	dev_info(core->dev, "initializing HFI core\n");
+	reinit_completion(&core->core_init_done);
 	ret = iris_hfi_core_init(core);
 	if (ret)
 		goto error_unload_fw;
