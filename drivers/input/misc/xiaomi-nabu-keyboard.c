@@ -43,8 +43,7 @@ static void nabu_keyboard_publish_state(struct nabu_keyboard *keyboard,
 	}
 
 	keyboard->connected = connected;
-	if (!connected)
-		keyboard->computer_mode = false;
+	keyboard->computer_mode = connected;
 	computer_mode = keyboard->computer_mode;
 	xiaomi_nabu_keyboard_update_mode(keyboard->connected,
 					  computer_mode);
@@ -63,19 +62,19 @@ static void nabu_keyboard_publish_state(struct nabu_keyboard *keyboard,
 static void nabu_keyboard_detect_work(struct work_struct *work)
 {
 	struct nabu_keyboard *keyboard;
-	int value;
+	int connected;
 
 	keyboard = container_of(to_delayed_work(work), struct nabu_keyboard,
 				detect_work);
-	value = gpiod_get_value_cansleep(keyboard->detect);
-	if (value < 0) {
-		dev_err_ratelimited(keyboard->dev,
-				    "failed to read keyboard detect GPIO: %d\n",
-				    value);
+	connected = gpiod_get_value_cansleep(keyboard->detect);
+	if (connected < 0) {
+		dev_warn_ratelimited(keyboard->dev,
+				     "failed to sample keyboard detect GPIO: %d\n",
+				     connected);
 		return;
 	}
 
-	nabu_keyboard_publish_state(keyboard, value, false);
+	nabu_keyboard_publish_state(keyboard, connected, false);
 }
 
 static irqreturn_t nabu_keyboard_detect_irq(int irq, void *data)
@@ -91,7 +90,7 @@ static irqreturn_t nabu_keyboard_detect_irq(int irq, void *data)
 	 */
 	if (READ_ONCE(keyboard->wake_enabled))
 		pm_wakeup_event(keyboard->dev, 500);
-	mod_delayed_work(system_wq, &keyboard->detect_work,
+	mod_delayed_work(system_percpu_wq, &keyboard->detect_work,
 			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
 	return IRQ_HANDLED;
 }
@@ -172,7 +171,6 @@ static int nabu_keyboard_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct nabu_keyboard *keyboard;
-	int connected;
 	int ret;
 
 	keyboard = devm_kzalloc(dev, sizeof(*keyboard), GFP_KERNEL);
@@ -213,20 +211,18 @@ static int nabu_keyboard_probe(struct platform_device *pdev)
 
 	ret = devm_request_threaded_irq(dev, keyboard->irq, NULL,
 					nabu_keyboard_detect_irq,
-					IRQF_TRIGGER_RISING |
-					IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+					IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+					IRQF_ONESHOT,
 					dev_name(dev), keyboard);
 	if (ret)
 		goto err_power_off;
 
 	device_init_wakeup(dev,
 			   of_property_read_bool(dev->of_node, "wakeup-source"));
-	connected = gpiod_get_value_cansleep(keyboard->detect);
-	if (connected < 0) {
-		ret = connected;
+	ret = gpiod_get_value_cansleep(keyboard->detect);
+	if (ret < 0)
 		goto err_power_off;
-	}
-	nabu_keyboard_publish_state(keyboard, connected, true);
+	nabu_keyboard_publish_state(keyboard, ret, true);
 
 	return 0;
 
@@ -249,10 +245,14 @@ static void nabu_keyboard_remove(struct platform_device *pdev)
 static int nabu_keyboard_suspend(struct device *dev)
 {
 	struct nabu_keyboard *keyboard = dev_get_drvdata(dev);
+	bool connected;
 	int ret;
 
 	cancel_delayed_work_sync(&keyboard->detect_work);
-	if (!device_may_wakeup(dev))
+	mutex_lock(&keyboard->lock);
+	connected = keyboard->connected;
+	mutex_unlock(&keyboard->lock);
+	if (!device_may_wakeup(dev) || !connected)
 		return 0;
 
 	ret = enable_irq_wake(keyboard->irq);
@@ -269,8 +269,6 @@ static int nabu_keyboard_resume(struct device *dev)
 		disable_irq_wake(keyboard->irq);
 		WRITE_ONCE(keyboard->wake_enabled, false);
 	}
-	mod_delayed_work(system_wq, &keyboard->detect_work,
-			 msecs_to_jiffies(NABU_KEYBOARD_DEBOUNCE_MS));
 	return 0;
 }
 

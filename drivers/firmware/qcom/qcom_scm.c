@@ -1578,6 +1578,23 @@ int qcom_scm_ice_set_key(u32 index, const u8 *key, u32 key_size,
 }
 EXPORT_SYMBOL_GPL(qcom_scm_ice_set_key);
 
+/**
+ * qcom_scm_has_legacy_wrapped_key_support() - Check legacy wrapped key support
+ *
+ * Legacy Qualcomm platforms use Keymaster to convert a long-term storage key
+ * to an ephemeral wrapped key.  Linux only needs the ICE set/invalidate calls
+ * and the call which derives the software secret used by fscrypt.
+ *
+ * Return: true iff all SCM calls needed to consume such a key are available.
+ */
+bool qcom_scm_has_legacy_wrapped_key_support(void)
+{
+	return qcom_scm_ice_available() &&
+	       __qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_ES,
+					    QCOM_SCM_ES_DERIVE_SW_SECRET);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_has_legacy_wrapped_key_support);
+
 bool qcom_scm_has_wrapped_key_support(void)
 {
 	return __qcom_scm_is_call_available(__scm->dev, QCOM_SCM_SVC_ES,

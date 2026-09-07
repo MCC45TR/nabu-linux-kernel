@@ -2,8 +2,9 @@ What:		/sys/bus/platform/drivers/xiaomi-nabu-keyboard/*/connected
 Date:		August 2026
 Contact:	MCC45TR <mcc45tr@users.noreply.github.com>
 Description:
-		Read-only physical keyboard-cover presence. The value is 1 when
-		the active-low pogo-cover detect GPIO is asserted and 0 otherwise.
+		Read-only physical keyboard-cover presence reported by the pogo
+		controller's rising-edge event protocol. The value starts at 0 and
+		toggles for each debounced attach or detach event.
 
 What:		/sys/bus/platform/drivers/xiaomi-nabu-keyboard/*/computer_mode
 Date:		August 2026

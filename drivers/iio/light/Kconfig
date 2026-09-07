@@ -367,6 +367,19 @@ config JSA1212
 	  To compile this driver as a module, choose M here:
 	  the module will be called jsa1212.
 
+config QCOM_SSC_CCT
+	tristate "Qualcomm SSC userspace colour temperature bridge"
+	depends on IIO_SW_DEVICE
+	help
+	  Register a standard IIO colour-temperature channel for Qualcomm Sensor
+	  Core devices whose FastRPC/QMI transport is managed in userspace. A
+	  privileged sensor service supplies validated Kelvin measurements through
+	  the root-writable in_colortemp_raw attribute.
+
+	  This does not emulate a sensor or decode SSC messages in the kernel. To
+	  compile it as a module, choose M here: the module will be called
+	  qcom-ssc-cct.
+
 config ROHM_BU27034
 	tristate "ROHM BU27034 ambient light sensor"
 	depends on I2C

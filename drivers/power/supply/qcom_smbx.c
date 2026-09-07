@@ -582,7 +582,7 @@ static void smb_status_change_work(struct work_struct *work)
 			WRITE_ONCE(chip->source_voltage_uv, 5000000);
 			WRITE_ONCE(chip->usb_type,
 				   POWER_SUPPLY_USB_TYPE_UNKNOWN);
-			mod_delayed_work(system_wq, &chip->thermal_work, 0);
+			mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 		}
 		return;
 	}
@@ -626,7 +626,7 @@ static void smb_status_change_work(struct work_struct *work)
 		WRITE_ONCE(chip->usb_type, charger_type);
 		WRITE_ONCE(chip->source_current_ua, current_ua);
 		smb_update_input_contract(chip);
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 	} else {
 		smb_set_current_limit(chip, current_ua);
 	}
@@ -1134,7 +1134,7 @@ static void smb_thermal_work(struct work_struct *work)
 		dev_err_ratelimited(chip->dev,
 				    "failed to apply charge policy: %d\n", rc);
 
-	mod_delayed_work(system_wq, &chip->thermal_work,
+	mod_delayed_work(system_percpu_wq, &chip->thermal_work,
 			 msecs_to_jiffies(SMB5_THERMAL_POLL_MS));
 }
 
@@ -1214,7 +1214,7 @@ static int smb_set_property(struct power_supply *psy,
 		if (val->intval <= 0 || val->intval > 4800000)
 			return -EINVAL;
 		WRITE_ONCE(chip->user_icl_ua, val->intval);
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 		return 0;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
 		if (chip->gen != SMB5 || val->intval <= 0 ||
@@ -1222,14 +1222,14 @@ static int smb_set_property(struct power_supply *psy,
 			chip->batt_info->constant_charge_current_max_ua)
 			return -EINVAL;
 		WRITE_ONCE(chip->user_fcc_ua, val->intval);
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		if (chip->gen != SMB5 || val->intval < 0 ||
 		    val->intval >= chip->num_thermal_levels)
 			return -EINVAL;
 		WRITE_ONCE(chip->user_cooling_state, val->intval);
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 		return 0;
 	default:
 		dev_err(chip->dev, "No setter for property: %d\n", psp);
@@ -1269,7 +1269,7 @@ static irqreturn_t smb_handle_batt_overvoltage(int irq, void *data)
 			dev_err_ratelimited(chip->dev,
 					    "failed to disable charging: %d\n", rc);
 		if (chip->gen == SMB5)
-			mod_delayed_work(system_wq, &chip->thermal_work, 0);
+			mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 		power_supply_changed(chip->chg_psy);
 	}
 
@@ -1285,7 +1285,7 @@ static irqreturn_t smb_handle_usb_plugin(int irq, void *data)
 	schedule_delayed_work(&chip->status_change_work,
 			      msecs_to_jiffies(1500));
 	if (chip->gen == SMB5)
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 
 	return IRQ_HANDLED;
 }
@@ -1767,7 +1767,7 @@ static int smb_cooling_set_cur_state(struct thermal_cooling_device *cdev,
 		return 0;
 
 	WRITE_ONCE(chip->thermal_cooling_state, state);
-	mod_delayed_work(system_wq, &chip->thermal_work, 0);
+	mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 	return 0;
 }
 
@@ -1789,7 +1789,7 @@ static int smb_power_supply_notifier(struct notifier_block *nb,
 	    strcmp(psy->desc->name, "qcom-battery"))
 		return NOTIFY_OK;
 
-	mod_delayed_work(system_wq, &chip->thermal_work, 0);
+	mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 	return NOTIFY_OK;
 }
 
@@ -2025,7 +2025,7 @@ static int smb_probe(struct platform_device *pdev)
 	/* Initialise charger state */
 	schedule_delayed_work(&chip->status_change_work, 0);
 	if (chip->gen == SMB5)
-		mod_delayed_work(system_wq, &chip->thermal_work, 0);
+		mod_delayed_work(system_percpu_wq, &chip->thermal_work, 0);
 
 	return 0;
 }

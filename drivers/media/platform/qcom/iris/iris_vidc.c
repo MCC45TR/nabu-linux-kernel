@@ -221,6 +221,37 @@ static void iris_m2m_job_abort(void *priv)
 	v4l2_m2m_job_finish(inst->m2m_dev, m2m_ctx);
 }
 
+static __poll_t iris_poll(struct file *file, struct poll_table_struct *wait)
+{
+	struct iris_inst *inst = iris_get_inst(file, NULL);
+	__poll_t ret;
+
+	ret = v4l2_m2m_fop_poll(file, wait);
+
+	/*
+	 * A stateful decoder starts the OUTPUT queue first and waits for a
+	 * V4L2_EVENT_SOURCE_CHANGE before allocating CAPTURE buffers.  Iris
+	 * firmware can return all queued bitstream buffers while it is still
+	 * preparing that event.  During that short interval the generic M2M
+	 * poll helper reports EPOLLERR because neither queue has a queued
+	 * buffer, even though the asynchronous header parse is still healthy.
+	 *
+	 * Keep waiting only during the initial input-only streaming phase.  An
+	 * event that becomes ready at the same time must also take precedence
+	 * over the generic queue-state error; otherwise userspace observes the
+	 * error before it can dequeue the source-change event.  All errors after
+	 * the first source change and all encoder errors remain untouched.
+	 */
+	if (inst->domain == DECODER && (ret & EPOLLERR) &&
+	    READ_ONCE(inst->state) != IRIS_INST_ERROR &&
+	    ((ret & EPOLLPRI) ||
+	     (READ_ONCE(inst->state) == IRIS_INST_INPUT_STREAMING &&
+	      !(READ_ONCE(inst->sub_state) & IRIS_INST_SUB_FIRST_IPSC))))
+		ret &= ~EPOLLERR;
+
+	return ret;
+}
+
 static const struct v4l2_m2m_ops iris_m2m_ops = {
 	.device_run = iris_m2m_device_run,
 	.job_abort = iris_m2m_job_abort,
@@ -762,7 +793,7 @@ static struct v4l2_file_operations iris_v4l2_file_ops = {
 	.open                           = iris_open,
 	.release                        = iris_close,
 	.unlocked_ioctl                 = video_ioctl2,
-	.poll                           = v4l2_m2m_fop_poll,
+	.poll                           = iris_poll,
 	.mmap                           = v4l2_m2m_fop_mmap,
 };
 

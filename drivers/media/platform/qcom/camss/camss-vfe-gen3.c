@@ -118,18 +118,19 @@ static void vfe_wm_stop(struct vfe_device *vfe, u8 wm)
 	writel(0, vfe->base + VFE_BUS_WM_CFG(wm));
 }
 
-static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
+static void vfe_wm_update(struct vfe_device *vfe, u8 wm, dma_addr_t addr,
 			  struct vfe_line *line)
 {
 	wm = RDI_WM(wm);
 
 	if (IS_VFE_690(vfe))
-		writel(addr, vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
+		writel(lower_32_bits(addr),
+		       vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
 	else
-		writel((addr >> 8), vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
+		writel(lower_32_bits(addr >> 8),
+		       vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
 
-	dev_dbg(vfe->camss->dev, "wm:%d, image buf addr:0x%x\n",
-		wm, addr);
+	dev_dbg(vfe->camss->dev, "wm:%d, image buf addr:%pad\n", wm, &addr);
 }
 
 static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)

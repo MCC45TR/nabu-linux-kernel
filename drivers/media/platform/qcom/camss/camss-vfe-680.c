@@ -144,12 +144,13 @@ static void vfe_disable_irq(struct vfe_device *vfe)
 	writel(0u, vfe->base + VFE_BUS_IRQn_MASK(vfe, 1));
 }
 
-static void vfe_wm_update(struct vfe_device *vfe, u8 rdi, u32 addr,
+static void vfe_wm_update(struct vfe_device *vfe, u8 rdi, dma_addr_t addr,
 			  struct vfe_line *line)
 {
 	u8 wm = RDI_WM(rdi);
 
-	writel(addr, vfe->base + VFE_BUS_IMAGE_ADDR(vfe, wm));
+	writel(lower_32_bits(addr),
+	       vfe->base + VFE_BUS_IMAGE_ADDR(vfe, wm));
 }
 
 static void vfe_wm_start(struct vfe_device *vfe, u8 rdi, struct vfe_line *line)

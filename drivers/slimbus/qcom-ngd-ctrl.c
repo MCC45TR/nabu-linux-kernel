@@ -158,7 +158,7 @@ struct qcom_slim_ngd_ctrl {
 	struct qcom_slim_ngd_dma_desc txdesc[QCOM_SLIM_NGD_DESC_NUM];
 	struct completion reconf;
 	struct work_struct m_work;
-	struct work_struct ngd_up_work;
+	struct delayed_work ngd_up_work;
 	struct workqueue_struct *mwq;
 	bool ngd_ready;
 	struct completion qmi_up;
@@ -1452,8 +1452,10 @@ static void qcom_slim_ngd_up_worker(struct work_struct *work)
 {
 	struct qcom_slim_ngd_ctrl *ctrl;
 	long wait_ret;
+	int ret = 0;
 
-	ctrl = container_of(work, struct qcom_slim_ngd_ctrl, ngd_up_work);
+	ctrl = container_of(to_delayed_work(work),
+			    struct qcom_slim_ngd_ctrl, ngd_up_work);
 
 	/* SSR, PDR and probe reconciliation can report the same UP transition. */
 	mutex_lock(&ctrl->ssr_lock);
@@ -1471,13 +1473,29 @@ static void qcom_slim_ngd_up_worker(struct work_struct *work)
 			dev_dbg(ctrl->dev, "QMI wait interrupted: %ld\n", wait_ret);
 		else
 			dev_err(ctrl->dev, "QMI wait timeout\n");
-		return;
+		goto retry;
 	}
 
 	mutex_lock(&ctrl->ssr_lock);
 	if (ctrl->state == QCOM_SLIM_NGD_CTRL_DOWN)
-		qcom_slim_ngd_enable(ctrl, true);
+		ret = qcom_slim_ngd_enable(ctrl, true);
 	mutex_unlock(&ctrl->ssr_lock);
+
+	if (!ret)
+		return;
+
+retry:
+	/*
+	 * The ADSP can advertise its QMI endpoint before the audio service is
+	 * ready to accept the select-instance transaction.  A single timeout
+	 * used to leave the controller DOWN until the next subsystem restart,
+	 * which permanently removed the sound card after suspend.  Retry only
+	 * while the child is live and the controller still needs recovery.
+	 */
+	if (READ_ONCE(ctrl->ngd_ready) &&
+	    READ_ONCE(ctrl->state) == QCOM_SLIM_NGD_CTRL_DOWN)
+		mod_delayed_work(system_dfl_wq, &ctrl->ngd_up_work,
+				 msecs_to_jiffies(MSEC_PER_SEC));
 }
 
 static int qcom_slim_ngd_ssr_pdr_notify(struct qcom_slim_ngd_ctrl *ctrl,
@@ -1499,7 +1517,7 @@ static int qcom_slim_ngd_ssr_pdr_notify(struct qcom_slim_ngd_ctrl *ctrl,
 		break;
 	case QCOM_SSR_AFTER_POWERUP:
 	case SERVREG_SERVICE_STATE_UP:
-		schedule_work(&ctrl->ngd_up_work);
+		mod_delayed_work(system_dfl_wq, &ctrl->ngd_up_work, 0);
 		break;
 	default:
 		break;
@@ -1607,7 +1625,7 @@ static int qcom_slim_ngd_probe(struct platform_device *pdev)
 
 	WRITE_ONCE(ctrl->ngd_ready, true);
 	/* Reconcile an UP notification which may have arrived during probe. */
-	schedule_work(&ctrl->ngd_up_work);
+	mod_delayed_work(system_dfl_wq, &ctrl->ngd_up_work, 0);
 
 	return 0;
 }
@@ -1661,7 +1679,7 @@ static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
 	init_completion(&ctrl->qmi_up);
 
 	INIT_WORK(&ctrl->m_work, qcom_slim_ngd_master_worker);
-	INIT_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
+	INIT_DELAYED_WORK(&ctrl->ngd_up_work, qcom_slim_ngd_up_worker);
 
 	ctrl->mwq = create_singlethread_workqueue("ngd_master");
 	if (!ctrl->mwq)
@@ -1721,7 +1739,7 @@ static void qcom_slim_ngd_remove(struct platform_device *pdev)
 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
 
 	WRITE_ONCE(ctrl->ngd_ready, false);
-	cancel_work_sync(&ctrl->ngd_up_work);
+	cancel_delayed_work_sync(&ctrl->ngd_up_work);
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
 	qcom_slim_ngd_enable(ctrl, false);

@@ -1219,6 +1219,7 @@ static int csiphy_init(struct csiphy_device *csiphy)
 
 	switch (csiphy->camss->res->version) {
 	case CAMSS_845:
+	case CAMSS_8150:
 		regs->lane_regs = &lane_regs_sdm845[0];
 		regs->lane_array_size = ARRAY_SIZE(lane_regs_sdm845);
 		break;

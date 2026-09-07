@@ -102,7 +102,7 @@ union crypto_cfg {
 static bool qcom_ice_use_wrapped_keys;
 module_param_named(use_wrapped_keys, qcom_ice_use_wrapped_keys, bool, 0660);
 MODULE_PARM_DESC(use_wrapped_keys,
-		 "Support wrapped keys instead of raw keys, if available on the platform");
+		 "Support HWKM or legacy Keymaster wrapped keys instead of raw keys, if available");
 
 struct qcom_ice {
 	struct device *dev;
@@ -111,6 +111,7 @@ struct qcom_ice {
 	struct clk *core_clk;
 	struct clk *iface_clk;
 	bool use_hwkm;
+	bool use_legacy_wrapped_keys;
 	bool hwkm_init_complete;
 	u8 hwkm_version;
 };
@@ -176,17 +177,18 @@ static bool qcom_ice_check_supported(struct qcom_ice *ice)
 	 * advertise support for raw keys or wrapped keys, HWKM cannot be used
 	 * unconditionally.  A module parameter is used to opt into using it.
 	 */
-	if (ice->hwkm_version && qcom_scm_has_wrapped_key_support()) {
-		if (qcom_ice_use_wrapped_keys) {
+	if (qcom_ice_use_wrapped_keys) {
+		if (ice->hwkm_version && qcom_scm_has_wrapped_key_support()) {
 			dev_info(dev, "Using HWKM. Supporting wrapped keys only.\n");
 			ice->use_hwkm = true;
+		} else if (qcom_scm_has_legacy_wrapped_key_support()) {
+			dev_info(dev, "Using legacy Keymaster wrapped-key mode. Supporting wrapped keys only.\n");
+			ice->use_legacy_wrapped_keys = true;
 		} else {
-			dev_info(dev, "Not using HWKM. Supporting raw keys only.\n");
+			dev_warn(dev, "No supported wrapped-key interface is present. Supporting raw keys only.\n");
 		}
-	} else if (qcom_ice_use_wrapped_keys) {
-		dev_warn(dev, "A supported HWKM is not present. Ignoring qcom_ice.use_wrapped_keys=1.\n");
 	} else {
-		dev_info(dev, "A supported HWKM is not present. Supporting raw keys only.\n");
+		dev_info(dev, "Wrapped keys not requested. Supporting raw keys only.\n");
 	}
 	return true;
 }
@@ -357,14 +359,24 @@ static int qcom_ice_program_wrapped_key(struct qcom_ice *ice, unsigned int slot,
 	};
 	int err;
 
-	if (!ice->use_hwkm) {
-		dev_err_ratelimited(dev, "Got wrapped key when not using HWKM\n");
+	if (!ice->use_hwkm && !ice->use_legacy_wrapped_keys) {
+		dev_err_ratelimited(dev, "Got wrapped key when wrapped-key mode is disabled\n");
 		return -EINVAL;
 	}
-	if (!ice->hwkm_init_complete) {
+	if (ice->use_hwkm && !ice->hwkm_init_complete) {
 		dev_err_ratelimited(dev, "HWKM not yet initialized\n");
 		return -EINVAL;
 	}
+
+	/*
+	 * On pre-HWKM platforms Keymaster already converted the long-term blob
+	 * into the ephemeral key accepted by the legacy ICE SCM interface.  That
+	 * call programs the complete legacy slot, just as it does for raw keys;
+	 * unlike HWKM, no slot translation or HWKM CFGE write is required.
+	 */
+	if (ice->use_legacy_wrapped_keys)
+		return qcom_scm_ice_set_key(slot, bkey->bytes, bkey->size,
+					    cfg.capidx, cfg.dusize);
 
 	/* Clear CFGE before programming the key. */
 	qcom_ice_writel(ice, 0x0, QCOM_ICE_REG_CRYPTOCFG(slot));
@@ -407,8 +419,8 @@ int qcom_ice_program_key(struct qcom_ice *ice, unsigned int slot,
 	if (blk_key->crypto_cfg.key_type == BLK_CRYPTO_KEY_TYPE_HW_WRAPPED)
 		return qcom_ice_program_wrapped_key(ice, slot, blk_key);
 
-	if (ice->use_hwkm) {
-		dev_err_ratelimited(dev, "Got raw key when using HWKM\n");
+	if (ice->use_hwkm || ice->use_legacy_wrapped_keys) {
+		dev_err_ratelimited(dev, "Got raw key when using wrapped-key mode\n");
 		return -EINVAL;
 	}
 
@@ -450,7 +462,7 @@ EXPORT_SYMBOL_GPL(qcom_ice_evict_key);
  */
 enum blk_crypto_key_type qcom_ice_get_supported_key_type(struct qcom_ice *ice)
 {
-	if (ice->use_hwkm)
+	if (ice->use_hwkm || ice->use_legacy_wrapped_keys)
 		return BLK_CRYPTO_KEY_TYPE_HW_WRAPPED;
 	return BLK_CRYPTO_KEY_TYPE_RAW;
 }
@@ -473,9 +485,13 @@ int qcom_ice_derive_sw_secret(struct qcom_ice *ice,
 			      const u8 *eph_key, size_t eph_key_size,
 			      u8 sw_secret[BLK_CRYPTO_SW_SECRET_SIZE])
 {
-	int err = qcom_scm_derive_sw_secret(eph_key, eph_key_size,
-					    sw_secret,
-					    BLK_CRYPTO_SW_SECRET_SIZE);
+	int err;
+
+	if (!ice->use_hwkm && !ice->use_legacy_wrapped_keys)
+		return -EOPNOTSUPP;
+
+	err = qcom_scm_derive_sw_secret(eph_key, eph_key_size, sw_secret,
+					BLK_CRYPTO_SW_SECRET_SIZE);
 	if (err == -EIO || err == -EINVAL)
 		err = -EBADMSG; /* probably invalid key */
 	return err;
@@ -495,6 +511,9 @@ int qcom_ice_generate_key(struct qcom_ice *ice,
 			  u8 lt_key[BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE])
 {
 	int err;
+
+	if (!ice->use_hwkm)
+		return -EOPNOTSUPP;
 
 	err = qcom_scm_generate_ice_key(lt_key,
 					QCOM_ICE_HWKM_WRAPPED_KEY_SIZE(ice->hwkm_version));
@@ -523,6 +542,9 @@ int qcom_ice_prepare_key(struct qcom_ice *ice,
 {
 	int err;
 
+	if (!ice->use_hwkm)
+		return -EOPNOTSUPP;
+
 	err = qcom_scm_prepare_ice_key(lt_key, lt_key_size,
 				       eph_key, QCOM_ICE_HWKM_WRAPPED_KEY_SIZE(ice->hwkm_version));
 	if (err == -EIO || err == -EINVAL)
@@ -550,6 +572,9 @@ int qcom_ice_import_key(struct qcom_ice *ice,
 			u8 lt_key[BLK_CRYPTO_MAX_HW_WRAPPED_KEY_SIZE])
 {
 	int err;
+
+	if (!ice->use_hwkm)
+		return -EOPNOTSUPP;
 
 	err = qcom_scm_import_ice_key(raw_key, raw_key_size,
 				      lt_key, QCOM_ICE_HWKM_WRAPPED_KEY_SIZE(ice->hwkm_version));

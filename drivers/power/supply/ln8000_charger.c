@@ -1118,8 +1118,8 @@ static void psy_chg_get_ti_alarm_status(struct work_struct *work)
 	ln_info("st:0x%x:0x%x:0x%x:0x%x\n", val[0], val[1], val[2], val[3]);
 
 	if (info->chg_en)
-		schedule_delayed_work(&info->charge_work,
-				      msecs_to_jiffies(1000));
+		queue_delayed_work(system_percpu_wq, &info->charge_work,
+				   msecs_to_jiffies(1000));
 
 	return;
 
@@ -1583,7 +1583,7 @@ out_disable:
 			psy_chg_set_charging_enable(chip, false);
 		}
 		if (enable)
-			mod_delayed_work(system_wq, &chip->charge_work, 0);
+			mod_delayed_work(system_percpu_wq, &chip->charge_work, 0);
 		else
 			cancel_delayed_work(&chip->charge_work);
 	}
@@ -1599,7 +1599,7 @@ static int ln8000_notifier_call(struct notifier_block *nb, unsigned long val,
 
 	if ((psy == chip->typec_psy || psy == chip->switching_psy) &&
 	    !READ_ONCE(chip->suspended))
-		mod_delayed_work(system_wq, &chip->status_changed_work,
+		mod_delayed_work(system_percpu_wq, &chip->status_changed_work,
 				 msecs_to_jiffies(100));
 
 	return NOTIFY_OK;
@@ -1720,7 +1720,7 @@ static int ln8000_probe(struct i2c_client *client)
 			"failed to register power-supply notifier\n");
 	}
 	info->notifier_registered = true;
-	mod_delayed_work(system_wq, &info->status_changed_work, 0);
+	mod_delayed_work(system_percpu_wq, &info->status_changed_work, 0);
 
 	return 0;
 }
@@ -1762,7 +1762,7 @@ static int ln8000_suspend(struct device *dev)
 	ret = psy_chg_set_charging_enable(info, false);
 	if (ret) {
 		WRITE_ONCE(info->suspended, false);
-		mod_delayed_work(system_wq, &info->status_changed_work, 0);
+		mod_delayed_work(system_percpu_wq, &info->status_changed_work, 0);
 		return dev_err_probe(dev, ret,
 				     "failed to enter safe suspend state\n");
 	}
@@ -1787,7 +1787,7 @@ static int ln8000_resume(struct device *dev)
 		info->irq_wake_enabled = false;
 	}
 	WRITE_ONCE(info->suspended, false);
-	mod_delayed_work(system_wq, &info->status_changed_work, 0);
+	mod_delayed_work(system_percpu_wq, &info->status_changed_work, 0);
 
 	return 0;
 }

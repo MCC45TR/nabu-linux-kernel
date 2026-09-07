@@ -133,11 +133,12 @@ static void vfe_wm_stop(struct vfe_device *vfe, u8 wm)
 	writel_relaxed(0, vfe->base + VFE_BUS_WM_CFG(wm));
 }
 
-static void vfe_wm_update(struct vfe_device *vfe, u8 wm, u32 addr,
+static void vfe_wm_update(struct vfe_device *vfe, u8 wm, dma_addr_t addr,
 			  struct vfe_line *line)
 {
 	wm = RDI_WM(wm); /* map to actual WM used (from wm=RDI index) */
-	writel_relaxed(addr, vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
+	writel_relaxed(lower_32_bits(addr),
+		       vfe->base + VFE_BUS_WM_IMAGE_ADDR(wm));
 }
 
 static void vfe_reg_update(struct vfe_device *vfe, enum vfe_line_id line_id)
