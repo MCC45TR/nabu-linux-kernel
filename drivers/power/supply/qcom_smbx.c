@@ -1171,13 +1171,15 @@ static int smb_get_property(struct power_supply *psy,
 		return smb_get_iio_chan(chip, chip->usb_in_i_chan,
 					 &val->intval);
 	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
-		ret = smb_get_iio_chan(chip, chip->usb_in_v_chan,
-					 &val->intval);
-		if (!ret) {
-			if (chip->gen == SMB5)
-				val->intval *= 16;
-		}
-		return ret;
+		/*
+		 * ADC5_USB_IN_V_16 describes the hardware divider.  The ADC5 IIO
+		 * provider applies that channel's 1/16 prescale while producing its
+		 * processed value, so the consumer already receives microvolts at
+		 * the connector.  Scaling it again here reports a value 16 times too
+		 * high (for example, 5 V as roughly 80 V).
+		 */
+		return smb_get_iio_chan(chip, chip->usb_in_v_chan,
+					&val->intval);
 	case POWER_SUPPLY_PROP_ONLINE:
 		return smb_get_prop_usb_online(chip, &val->intval);
 	case POWER_SUPPLY_PROP_STATUS:
