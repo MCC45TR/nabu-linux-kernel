@@ -203,6 +203,39 @@
 		vin-supply = <&vph_pwr>;
 	};
 
+	camera_dvdd_1p2: camera-dvdd-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_dvdd_1p2";
+		regulator-min-microvolt = <1200000>;
+		regulator-max-microvolt = <1200000>;
+		regulator-enable-ramp-delay = <135>;
+		gpio = <&pm8150l_gpios 3 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vreg_s4a_1p8>;
+	};
+
+	camera_rear_avdd_3p0: camera-rear-avdd-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_rear_avdd_3p0";
+		regulator-min-microvolt = <3008000>;
+		regulator-max-microvolt = <3008000>;
+		regulator-enable-ramp-delay = <135>;
+		gpio = <&tlmm 11 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vreg_bob>;
+	};
+
+	camera_front_avdd_3p0: camera-front-avdd-regulator {
+		compatible = "regulator-fixed";
+		regulator-name = "camera_front_avdd_3p0";
+		regulator-min-microvolt = <3008000>;
+		regulator-max-microvolt = <3008000>;
+		regulator-enable-ramp-delay = <135>;
+		gpio = <&tlmm 31 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		vin-supply = <&vreg_bob>;
+	};
+
 	gpio_keys: gpio-keys {
 		compatible = "gpio-keys";
 
@@ -477,6 +510,123 @@
 
 &gpi_dma2 {
 	status = "okay";
+};
+
+&camss {
+	status = "okay";
+
+	vdda-phy-supply = <&vreg_l5a_0p8>;
+	vdda-pll-supply = <&vreg_l3c_1p2>;
+
+	ports {
+		port@0 {
+			reg = <0>;
+
+			camss_csiphy0_in: endpoint {
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&ov13b10_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+
+			camss_csiphy1_in: endpoint {
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				remote-endpoint = <&ov8856_out>;
+			};
+		};
+	};
+};
+
+&cci0 {
+	status = "okay";
+};
+
+&cci0_i2c0 {
+	clock-frequency = <400000>;
+
+	rear_camera_eeprom: eeprom@51 {
+		compatible = "belling,bl24sa64", "atmel,24c64";
+		reg = <0x51>;
+		vcc-supply = <&vreg_l1c_1p8>;
+		read-only;
+	};
+
+	rear_camera: camera@36 {
+		compatible = "ovti,ov13b10";
+		reg = <0x36>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&camera_mclk0_default &camera_rear_reset_default>;
+
+		clocks = <&camcc CAM_CC_MCLK0_CLK>;
+		assigned-clocks = <&camcc CAM_CC_MCLK0_CLK_SRC>;
+		assigned-clock-rates = <19200000>;
+		clock-frequency = <19200000>;
+
+		reset-gpios = <&tlmm 28 GPIO_ACTIVE_LOW>;
+		avdd-supply = <&camera_rear_avdd_3p0>;
+		dvdd-supply = <&camera_dvdd_1p2>;
+		dovdd-supply = <&vreg_l1c_1p8>;
+		flash-leds = <&flash_white &flash_yellow>;
+
+		orientation = <1>;
+		rotation = <90>;
+
+		port {
+			ov13b10_out: endpoint {
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <560000000>;
+				remote-endpoint = <&camss_csiphy0_in>;
+			};
+		};
+	};
+};
+
+&cci0_i2c1 {
+	clock-frequency = <400000>;
+
+	front_camera_eeprom: eeprom@50 {
+		compatible = "puya,p24c64f", "atmel,24c64";
+		reg = <0x50>;
+		vcc-supply = <&vreg_l1c_1p8>;
+		read-only;
+	};
+
+	front_camera: camera@10 {
+		compatible = "ovti,ov8856";
+		reg = <0x10>;
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&camera_mclk1_default &camera_front_reset_default>;
+
+		clocks = <&camcc CAM_CC_MCLK1_CLK>;
+		clock-names = "xvclk";
+		assigned-clocks = <&camcc CAM_CC_MCLK1_CLK_SRC>;
+		assigned-clock-rates = <19200000>;
+		clock-frequency = <19200000>;
+
+		reset-gpios = <&tlmm 30 GPIO_ACTIVE_LOW>;
+		avdd-supply = <&camera_front_avdd_3p0>;
+		dvdd-supply = <&camera_dvdd_1p2>;
+		dovdd-supply = <&vreg_l1c_1p8>;
+
+		orientation = <0>;
+		rotation = <270>;
+
+		port {
+			ov8856_out: endpoint {
+				clock-lanes = <0>;
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <360000000 180000000>;
+				remote-endpoint = <&camss_csiphy1_in>;
+			};
+		};
+	};
 };
 
 &gmu {
@@ -868,7 +1018,7 @@
 &pm8150l_flash {
 	status = "okay";
 
-	led-0 {
+	flash_white: led-0 {
 		function = LED_FUNCTION_FLASH;
 		color = <LED_COLOR_ID_WHITE>;
 		led-sources = <1>;
@@ -877,7 +1027,7 @@
 		flash-max-timeout-us = <1280000>;
 	};
 
-	led-1 {
+	flash_yellow: led-1 {
 		function = LED_FUNCTION_FLASH;
 		color = <LED_COLOR_ID_YELLOW>;
 		led-sources = <2>;
@@ -1050,6 +1200,34 @@
 
 &tlmm {
 	gpio-reserved-ranges = <126 4>;
+
+	camera_mclk0_default: camera-mclk0-default-state {
+		pins = "gpio13";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	camera_mclk1_default: camera-mclk1-default-state {
+		pins = "gpio14";
+		function = "cam_mclk";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	camera_rear_reset_default: camera-rear-reset-default-state {
+		pins = "gpio28";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	camera_front_reset_default: camera-front-reset-default-state {
+		pins = "gpio30";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
 
 	quat_tdm_active: quat-tdm-active-state {
 		pins = "gpio137", "gpio138";

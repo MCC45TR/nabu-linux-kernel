@@ -7,7 +7,9 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
+#include <linux/regulator/consumer.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-fwnode.h>
@@ -707,6 +709,8 @@ struct ov13b10 {
 
 	struct clk *img_clk;
 	struct regulator *avdd;
+	struct regulator_bulk_data supplies[3];
+	bool use_bulk_supplies;
 	struct gpio_desc *reset;
 
 	/* V4L2 Controls */
@@ -1196,7 +1200,10 @@ static int ov13b10_power_off(struct device *dev)
 
 	gpiod_set_value_cansleep(ov13b10->reset, 1);
 
-	if (ov13b10->avdd)
+	if (ov13b10->use_bulk_supplies)
+		regulator_bulk_disable(ARRAY_SIZE(ov13b10->supplies),
+				       ov13b10->supplies);
+	else if (ov13b10->avdd)
 		regulator_disable(ov13b10->avdd);
 
 	clk_disable_unprepare(ov13b10->img_clk);
@@ -1210,13 +1217,24 @@ static int ov13b10_power_on(struct device *dev)
 	struct ov13b10 *ov13b10 = to_ov13b10(sd);
 	int ret;
 
+	/* Keep XSHUTDOWN asserted until clocks and all supplies are stable. */
+	gpiod_set_value_cansleep(ov13b10->reset, 1);
+
 	ret = clk_prepare_enable(ov13b10->img_clk);
 	if (ret < 0) {
 		dev_err(dev, "failed to enable imaging clock: %d", ret);
 		return ret;
 	}
 
-	if (ov13b10->avdd) {
+	if (ov13b10->use_bulk_supplies) {
+		ret = regulator_bulk_enable(ARRAY_SIZE(ov13b10->supplies),
+					    ov13b10->supplies);
+		if (ret < 0) {
+			dev_err(dev, "failed to enable regulators: %d", ret);
+			clk_disable_unprepare(ov13b10->img_clk);
+			return ret;
+		}
+	} else if (ov13b10->avdd) {
 		ret = regulator_enable(ov13b10->avdd);
 		if (ret < 0) {
 			dev_err(dev, "failed to enable avdd: %d", ret);
@@ -1490,6 +1508,22 @@ static int ov13b10_get_pm_resources(struct device *dev)
 		return dev_err_probe(dev, PTR_ERR(ov13b->img_clk),
 				     "failed to get imaging clock\n");
 
+	if (dev_of_node(dev)) {
+		ov13b->supplies[0].supply = "dovdd";
+		ov13b->supplies[1].supply = "avdd";
+		ov13b->supplies[2].supply = "dvdd";
+
+		ret = devm_regulator_bulk_get(dev,
+					      ARRAY_SIZE(ov13b->supplies),
+					      ov13b->supplies);
+		if (ret)
+			return dev_err_probe(dev, ret,
+					     "failed to get regulators\n");
+
+		ov13b->use_bulk_supplies = true;
+		return 0;
+	}
+
 	ov13b->avdd = devm_regulator_get_optional(dev, "avdd");
 	if (IS_ERR(ov13b->avdd)) {
 		ret = PTR_ERR(ov13b->avdd);
@@ -1709,11 +1743,18 @@ static const struct acpi_device_id ov13b10_acpi_ids[] = {
 MODULE_DEVICE_TABLE(acpi, ov13b10_acpi_ids);
 #endif
 
+static const struct of_device_id ov13b10_of_match[] = {
+	{ .compatible = "ovti,ov13b10" },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, ov13b10_of_match);
+
 static struct i2c_driver ov13b10_i2c_driver = {
 	.driver = {
 		.name = "ov13b10",
 		.pm = pm_ptr(&ov13b10_pm_ops),
 		.acpi_match_table = ACPI_PTR(ov13b10_acpi_ids),
+		.of_match_table = ov13b10_of_match,
 	},
 	.probe = ov13b10_probe,
 	.remove = ov13b10_remove,

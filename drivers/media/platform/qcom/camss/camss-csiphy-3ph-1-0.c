@@ -748,6 +748,7 @@ static bool csiphy_is_gen2(u32 version)
 	case CAMSS_8250:
 	case CAMSS_8280XP:
 	case CAMSS_845:
+	case CAMSS_8150:
 	case CAMSS_8550:
 	case CAMSS_X1E80100:
 		ret = true;
@@ -828,6 +829,16 @@ static int csiphy_init(struct csiphy_device *csiphy)
 	case CAMSS_845:
 		regs->lane_regs = &lane_regs_sdm845[0];
 		regs->lane_array_size = ARRAY_SIZE(lane_regs_sdm845);
+		break;
+	/*
+	 * SM8150 carries a v1.1 PHY, which the published vendor kernel states
+	 * outright and whose register table matches sc8280xp's entry for entry.
+	 * Driving it with sdm845's v1.0 sequence leaves the receiver latching
+	 * errors and decoding nothing.
+	 */
+	case CAMSS_8150:
+		regs->lane_regs = &lane_regs_sc8280xp[0];
+		regs->lane_array_size = ARRAY_SIZE(lane_regs_sc8280xp);
 		break;
 	case CAMSS_7280:
 	case CAMSS_8250:
